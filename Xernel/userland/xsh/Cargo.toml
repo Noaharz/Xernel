@@ -1,0 +1,15 @@
+[package]
+name = "xsh"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Xernel's native shell — phase 5/6"
+
+[[bin]]
+name = "xsh"
+path = "src/main.rs"
+
+[dependencies]
+xabi = { path = "../../libs/xabi" }
+xstd = { path = "../../libs/xstd" }

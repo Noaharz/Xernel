@@ -1,0 +1,208 @@
+================================================================================
+0.3.1 — PHASE 0: DER KERNEL BOOTET BIS "HELLO, XERNEL"
+================================================================================
+
+Ziel dieses Schritts:
+  Aus dem Scaffold (kompiliert gerade so, hat nie gebootet) ein Image bauen, das
+  in QEMU startet und auf der seriellen Konsole "hello, xernel" ausgibt — und
+  das Ganze als reproduzierbaren, automatisierten Test.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 0 — IST DIE UMGEBUNG ÜBERHAUPT BEREIT?
+--------------------------------------------------------------------------------
+
+Bevor irgendetwas gebaut wird, wurde geprüft, was vorhanden ist:
+
+    rustup toolchain list
+    cargo --version
+    which qemu-system-x86_64 xorriso
+    rustup component list --toolchain nightly-2026-05-01-aarch64-apple-darwin \
+        | grep -E "rust-src|llvm-tools"
+    rustup target list --toolchain nightly-2026-05-01-... --installed
+
+Ergebnis:
+  - Host ist Apple Silicon, aktive Toolchain nightly-2026-05-01.
+  - rust-src + llvm-tools-preview installiert.
+  - Target x86_64-unknown-none installiert.
+  - qemu-system-x86_64 und xorriso vorhanden (Homebrew).
+
+Lehre: Erst Umgebung verifizieren, dann bauen. Spart das Raten bei Fehlern.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 1 — DER ERSTE BUILD-VERSUCH UND EIN FEHLENDES FLAG
+--------------------------------------------------------------------------------
+
+Erster Versuch, den Kernel gegen das eigene Target zu bauen:
+
+    cargo build --package kernel --target targets/x86_64-xernel.json \
+        -Z build-std=core,compiler_builtins,alloc \
+        -Z build-std-features=compiler-builtins-mem
+
+Fehler:
+
+    error: `.json` target specs require -Zjson-target-spec to be added to
+           the cargo invocation
+
+Im verwendeten nightly verlangt cargo für JSON-Target-Dateien zusätzlich das
+Flag "-Z json-target-spec". Nach dem Hinzufügen kompilierte der Kernel auf
+Anhieb (eine Warnung über ein ungenutztes Feature, sonst sauber).
+
+Konsequenz: Das Flag wurde dauerhaft verdrahtet — in den Cargo-Aliasen
+(.cargo/config.toml: kbuild/kcheck) und im xtask. Niemand muss es mehr von Hand
+mitgeben.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 2 — EIN AUTOMATISIERTER BOOT-TEST STATT "AUGE DRAUF"
+--------------------------------------------------------------------------------
+
+Problem: Ein Kernel, der in QEMU bootet, LÄUFT EWIG. Man kann nicht in einem
+Skript fragen "hat er funktioniert?". Lösung: das QEMU-Gerät "isa-debug-exit".
+Schreibt der Kernel einen Wert v auf I/O-Port 0xf4, beendet QEMU sich mit dem
+Exit-Status (v << 1) | 1. Damit wird "bootet" zu einem echten Pass/Fail.
+
+Dafür entstand:
+
+  kernel/src/arch/x86_64/qemu.rs
+      ExitCode::Success = 0x10, ExitCode::Failed = 0x11. Schreibt den Code auf
+      Port 0xf4. Auf echter Hardware ohne dieses Gerät ist der Schreibzugriff
+      ein No-op, deshalb fällt die Funktion danach auf halt_forever() zurück.
+
+  Cargo-Feature "boot-test" (kernel/Cargo.toml)
+      Nur wenn dieses Feature gesetzt ist, führt der Kernel seine Selbsttests
+      aus und ruft am Ende arch::exit(true) (-> QEMU beendet mit Erfolg).
+      Ohne das Feature idlet der Kernel normal weiter.
+
+  xtask "run --test"
+      Baut mit --features boot-test, hängt an QEMU
+      "-device isa-debug-exit,iobase=0xf4,iosize=0x04" und "-display none" an,
+      und übersetzt den QEMU-Exit-Code zurück:
+          Exit-Code 33  == (0x10 << 1) | 1  -> "boot-test PASSED"
+          alles andere                       -> "boot-test FAILED"
+
+  Panic-Handler gehärtet (kernel/src/panic.rs)
+      Im boot-test-Build beendet ein Panic QEMU mit Fehler-Status, statt ewig zu
+      hängen. So schlägt ein kaputter Test fehl, statt den Testlauf einzufrieren.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 3 — DER ERSTE ECHTE BOOT-VERSUCH: STILLE (BUG!)
+--------------------------------------------------------------------------------
+
+Limine holen und ISO bauen lief, dann QEMU starten:
+
+    cargo xtask fetch-limine     # holt Limine v7.x-binary nach boot/limine/
+    cargo xtask run --test
+
+QEMU-Ausgabe:
+
+    limine: Loading kernel `boot:///boot/xernel.elf`...
+    (... Stille, nichts mehr, QEMU hängt ...)
+
+Limine LUD den Kernel — danach absolute Stille. Kein "hello", kein Panic. Das
+heißt: der Kernel crasht im Handoff, BEVOR die serielle Ausgabe überhaupt
+funktioniert.
+
+Diagnose: In arch::init() lief die Prüfung der Limine-"Base Revision" GANZ AM
+ANFANG, noch VOR serial::init(). Schlug sie fehl, gab es keinen Weg, das zu
+melden — lautloser Tod.
+
+Erste Korrektur: serial::init() ZUERST. Danach kam endlich eine Fehlermeldung
+auf die serielle Konsole:
+
+    [xernel] FATAL: Limine base revision not supported by this bootloader
+
+Damit war klar: Es ist KEIN Crash, sondern eine bewusst nicht unterstützte
+Anfrage. Jetzt konnte der eigentliche Bug gefunden werden.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 4 — DER LIMINE-BASE-REVISION-BUG (DIE ZENTRALE ERKENNTNIS)
+--------------------------------------------------------------------------------
+
+Was ist die "Base Revision"?
+  Das Limine-Boot-Protokoll hat versionierte Semantik. Der Kernel teilt dem
+  Bootloader über eine Magic-Struktur mit, welche Protokoll-Revision er erwartet.
+  Unterstützt der Bootloader sie nicht, antwortet er "nicht unterstützt".
+
+Der Fehler:
+  Die verwendete Rust-Crate "limine" 0.6.3 setzt mit BaseRevision::new()
+  automatisch die HÖCHSTE ihr bekannte Revision: 6. Die mitgelieferten
+  Limine-BINARIES sind aber Branch v7.x-binary, und die unterstützen Revision 6
+  nicht. Ergebnis: "nicht unterstützt" -> FATAL.
+
+Untersucht wurde das direkt im Crate-Quelltext:
+    ~/.cargo/registry/src/.../limine-0.6.3/src/lib.rs
+      MAX_SUPPORTED = 6
+      new() == with_revision(6)
+      with_revision(rev) schreibt Magic + rev
+      is_supported() prüft, ob der Bootloader auf 0 gesetzt hat
+
+Die Lösung (kernel/src/arch/x86_64/mod.rs):
+  Statt new() (==6) explizit Revision 2 anfordern:
+
+      static BASE_REVISION: BaseRevision = BaseRevision::with_revision(2);
+
+  Warum genau 2? Revision 2 ist die "klassische" Limine-Semantik, bei der
+  Bootloader-Antworten HÖHERHALB-VIRTUELLE (HHDM-) Adressen verwenden. Genau das
+  braucht unser Paging-/Frame-Code in Phase 1. Die neueren Revisionen (3, 4, 6)
+  liefern teils PHYSISCHE Adressen und hätten den Code unnötig verkompliziert.
+
+  Zusätzlich wurde die FATAL-Meldung aussagekräftiger gemacht: sie druckt jetzt
+  die tatsächlich angebotene Revision via BASE_REVISION.actual_revision().
+
+
+--------------------------------------------------------------------------------
+SCHRITT 5 — ES BOOTET
+--------------------------------------------------------------------------------
+
+Nach dem Pinnen auf Revision 2:
+
+    cargo xtask run --test
+
+    limine: Loading kernel `boot:///boot/xernel.elf`...
+    [xernel] hello, xernel — arch=x86_64, build=debug
+    [xernel] boot-test: ok
+    xtask: boot-test PASSED
+
+Phase 0 ist verifiziert: der Kernel bootet real, schreibt auf Serial und
+beendet den Test deterministisch mit Erfolg.
+
+
+--------------------------------------------------------------------------------
+WIE DER BOOT TECHNISCH ABLÄUFT (FÜR SPÄTERES NACHSCHLAGEN)
+--------------------------------------------------------------------------------
+
+  1. QEMU startet das ISO. Limine (El-Torito-CD-Boot) lädt den Bootloader.
+  2. Limine liest boot/limine.cfg, findet boot:///boot/xernel.elf, bringt die
+     CPU in den 64-Bit-Long-Mode, mappt den Kernel in die obere Hälfte und
+     springt zu kmain (definiert in kernel/src/main.rs).
+  3. kmain() ruft arch::init():
+       - serial::init()          -> 16550-UART auf COM1 (Port 0x3F8) bereit
+       - Base-Revision-Prüfung   -> bei Fehlschlag FATAL + halt
+       - (Phase 1 ab hier: gdt, idt, paging — siehe 0.3.2)
+  4. kmain druckt "hello, xernel ...".
+  5. Im boot-test-Build: Selbsttests, dann arch::exit(true) -> QEMU endet.
+     Im Normal-Build: arch::halt_forever() bzw. der Scheduler (siehe 0.3.3).
+
+Beteiligte Dateien in diesem Schritt:
+  kernel/src/main.rs                  Entry kmain, Boot-Reihenfolge
+  kernel/src/arch/x86_64/mod.rs       Limine-Requests, init(), Revision-Pin
+  kernel/src/arch/x86_64/serial.rs    16550-UART-Treiber
+  kernel/src/arch/x86_64/qemu.rs      isa-debug-exit
+  kernel/src/serial.rs                println!/print!-Makros
+  kernel/src/panic.rs                 Panic-Handler
+  xtask/src/main.rs                   build/iso/run/--test/fetch-limine
+  boot/limine.cfg                     Bootloader-Konfiguration
+
+
+--------------------------------------------------------------------------------
+ZUM SELBST-NACHBAUEN
+--------------------------------------------------------------------------------
+
+  cd Xernel
+  cargo xtask fetch-limine     # einmalig, holt die Bootloader-Binaries
+  cargo xtask run              # interaktiv (QEMU-Fenster/Serial), Ctrl-C beendet
+  cargo xtask run --test       # headless, automatischer Pass/Fail

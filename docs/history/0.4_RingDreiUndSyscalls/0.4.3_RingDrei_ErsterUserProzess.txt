@@ -1,0 +1,130 @@
+================================================================================
+0.4.3 — RING 3: DER ERSTE USER-PROZESS
+================================================================================
+
+Ziel dieses Schritts:
+  Tatsächlich nach Ring 3 springen, dort ein Programm ausführen lassen, das den
+  in 0.4.2 gebauten Syscall-Weg benutzt — und damit den vollen Round-Trip
+  Ring 0 -> Ring 3 -> syscall -> Ring 0 beweisen.
+
+
+--------------------------------------------------------------------------------
+SCHRITT A — TSS RSP0: DER STACK FÜR INTERRUPTS AUS RING 3
+--------------------------------------------------------------------------------
+
+Sobald User-Code mit eingeschalteten Interrupts läuft, FEUERT IRGENDWANN DER
+LAPIC-TIMER. Bei einem Interrupt aus Ring 3 wechselt die CPU automatisch auf den
+Stack in TSS.privilege_stack_table[0] (RSP0). Ist der nicht gesetzt -> der erste
+Timer-Tick im User-Mode triple-faultet.
+
+Deshalb wurde gdt.rs erweitert:
+  - ein eigener RSP0_STACK (statisch),
+  - tss.privilege_stack_table[0] = rsp0() in gdt::init() gesetzt,
+  - die GDT speichert jetzt ALLE Selektoren (kernel_code/data, user_code/data,
+    tss) und gibt sie über gdt::selectors() heraus (von syscall::init genutzt).
+
+WICHTIG: Die GDT-Reihenfolge ist jetzt fix:
+  kernel_code, kernel_data, user_data, user_code, tss
+Genau diese Reihenfolge braucht syscall/sysret (siehe 0.4.2).
+
+
+--------------------------------------------------------------------------------
+SCHRITT B — USER-ZUGÄNGLICHE SEITEN   (paging::map_user)
+--------------------------------------------------------------------------------
+
+Ring-3-Code darf nur auf Seiten zugreifen, deren Page-Table-Einträge das
+Flag USER_ACCESSIBLE tragen. Neu in arch/x86_64/paging.rs:
+
+  map_user(virt, phys, writable, executable):
+      PRESENT | USER_ACCESSIBLE
+      + WRITABLE   wenn writable
+      + NO_EXECUTE wenn NICHT executable   (W^X: Code ist nicht schreibbar,
+                                            Stack ist nicht ausführbar)
+
+  Weil map_to die USER_ACCESSIBLE-Flag auch an die Zwischen-Tabellen weitergibt,
+  ist der ganze Walk von Ring 3 erreichbar.
+
+
+--------------------------------------------------------------------------------
+SCHRITT C — DER ERSTE USER-CODE (HAND-ASSEMBLIERT)   (kernel/src/user.rs)
+--------------------------------------------------------------------------------
+
+Statt eines ELF-Loaders (kommt in Phase 3) wird hier ein winziger, von Hand
+assemblierter Maschinencode-Blob benutzt — robust und genau nachvollziehbar:
+
+    mov rax, 1          ; SYS_DEBUG          48 C7 C0 01 00 00 00
+    mov rdi, 0xABCD     ;                    48 C7 C7 CD AB 00 00
+    syscall             ; Kernel druckt 0xABCD   0F 05
+    mov rax, 2          ; SYS_EXIT           48 C7 C0 02 00 00 00
+    xor edi, edi        ; exit code 0        31 FF
+    syscall             ; kehrt nie zurück       0F 05
+    jmp $               ; Sicherheitsnetz        EB FE
+
+WARUM nur Register, keine Speicherzugriffe? Damit der Kernel-Handler für die
+Demo keinen User-Pointer dereferenzieren muss — der reine Register-Round-Trip
+genügt als Beweis. (SYS_DEBUG nimmt den Wert direkt in rdi.)
+
+
+--------------------------------------------------------------------------------
+SCHRITT D — LADEN UND SPRINGEN   (user::run)
+--------------------------------------------------------------------------------
+
+  1. arch::init_syscalls()                  MSRs + PerCpu (aus 0.4.2)
+  2. Code-Frame allokieren, Blob über die HHDM (phys+offset) hineinkopieren,
+     bei 0x40_0000 user-lesbar+ausführbar mappen.
+  3. Stack-Frame allokieren, bei 0x80_0000 user-lesbar+schreibbar mappen.
+  4. arch::enter_user(0x40_0000, stack_top):
+        mov rsp, stack_top
+        ; rcx = entry, r11 = 0x202 (IF gesetzt -> Interrupts im User an)
+        sysretq
+
+  Kein swapgs vor sysretq: im Kernel ist GS.base bereits 0 (der User-Wert),
+  KERNEL_GS_BASE zeigt auf PerCpu — exakt der Zustand, den User-Code haben soll.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — DER BEWEIS
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+    [xernel] entering ring 3 at 0x400000     <- wir verlassen Ring 0
+    [user] syscall SYS_DEBUG: 0xabcd         <- Ring-3-Code ruft den Kernel,
+                                                Argument korrekt übergeben
+    [user] exit(0)                           <- zweiter Syscall
+    [xernel] boot-test: ok
+    xtask: boot-test PASSED
+
+Jede Zeile beweist einen Teil:
+  - "entering ring 3"  : sysretq hat funktioniert, CPL ist 3.
+  - "SYS_DEBUG: 0xabcd": die syscall-Instruktion aus Ring 3 hat den Kernel-
+    Entry getroffen, swapgs + Stack-Wechsel + Dispatch liefen, das Argument kam
+    unverfälscht an.
+  - "exit(0)"          : der User-Code lief nach dem ersten Syscall weiter
+    (sysretq kehrte korrekt nach Ring 3 zurück) und rief den zweiten Syscall.
+
+
+--------------------------------------------------------------------------------
+EINSCHRÄNKUNG, DIE BEIM BAUEN AUFFIEL
+--------------------------------------------------------------------------------
+
+Der kooperative Scheduler aus 0.3.3 (sched::start) GIBT DEN BOOT-KONTEXT AUF und
+kehrt nie zu kmain zurück. Deshalb können IPC-Demo (Meilenstein 2.0) und
+User-Prozess NICHT im selben Boot nacheinander laufen. Für diese Phase startet
+kmain den User-Prozess; die IPC-Demo wird eigenständig getestet. Ein echter
+Scheduler, der Kernel- UND User-Threads verwaltet, löst das in einer späteren
+Phase auf.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN IN DIESER PHASE (0.4)
+--------------------------------------------------------------------------------
+
+  kernel/src/cap.rs                     Capability-Strukturen + Selbsttest
+  kernel/src/syscall.rs                 generischer Syscall-Dispatch
+  kernel/src/user.rs                    erster User-Prozess (Blob, Mapping, Sprung)
+  kernel/src/arch/x86_64/syscall.rs     MSRs, Entry-Stub, enter_user
+  kernel/src/arch/x86_64/gdt.rs         RSP0, User-Selektoren exportiert
+  kernel/src/arch/x86_64/paging.rs      map_user (USER_ACCESSIBLE, W^X)
+  kernel/src/main.rs                    Boot-Reihenfolge, Selbsttests, user::run()
+  kernel/Cargo.toml                     xabi als Dependency

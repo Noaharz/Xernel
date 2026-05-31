@@ -1,0 +1,78 @@
+================================================================================
+0.8.4 — ELF-LOADER-FIX: SEGMENTE, DIE SICH EINE PAGE TEILEN (MapFailed)
+================================================================================
+
+Aufgedeckt durch: XOS-Boot-Mitschnitt 1 (siehe 0.8.3) —
+    [xernel] init module: 6632 bytes
+    [xernel] PANIC: failed to load init ELF: MapFailed
+
+
+--------------------------------------------------------------------------------
+DER BUG
+--------------------------------------------------------------------------------
+
+Der alte Loader (aus Phase 0.5) verarbeitete jedes PT_LOAD-Segment einzeln und
+mappte dessen Pages eine nach der anderen. Annahme: zwei Segmente teilen sich
+nie eine Page.
+
+Bei kleinen Binaries stimmt das aber nicht: wenn der Linker die Sektionen NICHT
+auf Page-Grenzen ausrichtet, können z.B. das ausführbare (RX) und das
+beschreibbare (RW) Segment in DERSELBEN 4-KiB-Page liegen. Dann versuchte der
+Loader, dieselbe Page ein zweites Mal zu mappen -> map_to lieferte
+PageAlreadyMapped -> unser Loader meldete MapFailed -> Panic.
+
+(Unser eigenes init und spätere XOS-Builds nutzen page-ausrichtende
+Linker-Scripts und waren daher nicht betroffen — der frühe 6632-Byte-XOS-Build
+schon.)
+
+
+--------------------------------------------------------------------------------
+DER FIX — DREI PASSES   (kernel/src/elf.rs)
+--------------------------------------------------------------------------------
+
+Der Loader sammelt zuerst alle PT_LOAD-Segmente und arbeitet dann in Phasen:
+
+  Pass 1 — Pages planen:
+    Über alle Segmente laufen und für JEDE abgedeckte Page die Rechte sammeln
+    (Vereinigung: writable, falls irgendein Segment dort W will; executable,
+    falls irgendeins X will). Ergebnis: eine Map page -> (writable, executable),
+    in der jede Page genau EINMAL vorkommt.
+
+  Pass 2 — Pages anlegen:
+    Für jede geplante Page einen Frame allokieren, ihn (über die HHDM) nullen
+    und EINMAL user-zugänglich mappen — mit den vereinigten Rechten. Die
+    physische Adresse pro Page merken.
+
+  Pass 3 — Bytes kopieren:
+    Für jedes Segment seine Datei-Bytes seitenweise in die bereits gemappten
+    Pages kopieren (über phys+hhdm).
+
+Weil jede Page nur einmal gemappt wird, kann der MapFailed-Fall gar nicht mehr
+auftreten — egal wie die Segmente liegen.
+
+
+--------------------------------------------------------------------------------
+KLEINE EHRLICHE EINSCHRÄNKUNG (W^X)
+--------------------------------------------------------------------------------
+
+Teilen sich ein RX- und ein RW-Segment eine Page, bekommt diese Page die
+VEREINIGTEN Rechte (also W UND X). Das lockert das strikte "W^X" für genau diese
+geteilte Page auf. Das passiert nur bei Binaries mit nicht page-ausgerichtetem
+Linker-Script; sauber gelinkte Programme (eigenes Linker-Script mit
+ALIGN(0x1000), wie unser userland/init) sind nicht betroffen. Funktionierende
+Ausführung hat hier Vorrang vor strikter Trennung; ein strengerer Modus käme
+später.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION (REGRESSION)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test                 -> boot-test PASSED (eigenes init)
+    cargo xtask run --init <xos-init>      -> XOS lädt + startet Ring 3, Shell,
+                                              kein MapFailed, kein #UD
+
+  Beides läuft mit dem neuen Loader unverändert. Der ursprüngliche
+  6632-Byte-Fehlerfall lässt sich mit dem heutigen XOS-Binary nicht mehr
+  reproduzieren (Layout geändert), ist durch das Einmal-pro-Page-Mappen aber
+  strukturell ausgeschlossen.

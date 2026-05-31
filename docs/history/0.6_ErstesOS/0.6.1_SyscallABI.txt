@@ -1,0 +1,98 @@
+================================================================================
+0.6.1 — DIE SYSCALL-ABI (REFERENZ FÜR USERLAND-PROGRAMME)
+================================================================================
+
+Dies ist der verbindliche Vertrag zwischen einem User-Programm (Ring 3) und dem
+Xernel-Kernel. Wer ein Programm für Xernel schreibt, programmiert gegen genau
+diese Schnittstelle.
+
+
+--------------------------------------------------------------------------------
+AUFRUF-KONVENTION
+--------------------------------------------------------------------------------
+
+  Instruktion : syscall
+  Nummer      : rax
+  Argumente   : rdi, rsi, rdx, r10, r8, r9   (Arg 1..6)
+  Rückgabe    : rax
+  Zerstört    : rcx und r11 (durch die syscall-Instruktion selbst)
+
+  Hinweis: das 4. Argument ist r10 (nicht rcx), weil syscall rcx überschreibt.
+
+
+--------------------------------------------------------------------------------
+SYSCALL-TABELLE
+--------------------------------------------------------------------------------
+
+  nr  Name           Argumente               Rückgabe       Wirkung
+  --  -------------  ----------------------  -------------  -----------------------
+   1  SYS_WRITE      fd, ptr, len            #bytes (oder    Schreibt len Bytes ab
+                                             u64::MAX)       User-Adresse ptr auf
+                                                             die Konsole. fd 1/2
+                                                             (stdout/stderr) -> seriell.
+   2  SYS_EXIT       code                    (kehrt nie)    Beendet das Programm.
+   3  SYS_DEBUG      value                   0              Druckt value als Hex
+                                                             (Register-Debugging).
+   4  SYS_GET_TICKS  -                       ticks          Timer-Ticks seit Boot
+                                                             (grobe Uptime/Uhr).
+   5  SYS_SYSINFO    which                   wert (oder      Systemwert abfragen:
+                                             u64::MAX)       which 0 = RAM gesamt (Bytes)
+                                                                   1 = RAM benutzt (Bytes)
+                                                                   2 = Frame-Größe (Bytes)
+
+  Unbekannte Nummern liefern u64::MAX und drucken eine Warnung.
+
+
+--------------------------------------------------------------------------------
+SYS_WRITE — POINTER-REGELN
+--------------------------------------------------------------------------------
+
+  Der Kernel liest den Puffer direkt aus dem (gemeinsamen) Adressraum. Validiert
+  wird:
+    - len == 0           -> ok, 0 Bytes
+    - ptr != 0
+    - len <= 1 MiB
+    - ptr und ptr+len liegen in der unteren kanonischen Hälfte
+      (< 0x0000_8000_0000_0000)
+  Sonst Rückgabe u64::MAX (nichts geschrieben). Bytes werden als UTF-8 (lossy)
+  ausgegeben; reine ASCII/UTF-8-Strings sind unproblematisch.
+
+  WICHTIG: ptr muss eine im User-Programm gemappte Adresse sein (z.B. ein
+  &[u8] aus dem eigenen .rodata/.data oder Stack). Ein gültiger Bereich, aber
+  NICHT gemappt, kann einen Fault auslösen (SMAP ist nicht aktiv).
+
+
+--------------------------------------------------------------------------------
+MINIMALER RUST-WRAPPER (KOPIERVORLAGE)
+--------------------------------------------------------------------------------
+
+    use core::arch::asm;
+    #[inline]
+    fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+        let ret: u64;
+        unsafe {
+            asm!("syscall",
+                 inlateout("rax") nr => ret,
+                 in("rdi") a1, in("rsi") a2, in("rdx") a3,
+                 lateout("rcx") _, lateout("r11") _,
+                 options(nostack));
+        }
+        ret
+    }
+    fn write(s: &[u8])     { syscall3(1, 1, s.as_ptr() as u64, s.len() as u64); }
+    fn exit(code: u64)->!  { syscall3(2, code, 0, 0); loop {} }
+    fn ticks() -> u64      { syscall3(4, 0, 0, 0) }
+    fn sysinfo(w: u64)->u64{ syscall3(5, w, 0, 0) }
+
+
+--------------------------------------------------------------------------------
+LAUFZEIT-UMGEBUNG DES PROGRAMMS
+--------------------------------------------------------------------------------
+
+  - Architektur : x86_64, Ring 3, Interrupts an (der Timer tickt im Hintergrund)
+  - Geladen ab  : der ELF-Entry (Linker-Script-Basis 0x400000)
+  - Stack       : 64 KiB, Top bei 0x810000 (16 Pages ab 0x800000)
+  - KEIN std, KEIN alloc/Heap, KEINE FPU/SSE (soft-float)
+  - KEIN Input, KEINE Dateien, KEIN Netz (noch nicht)
+  - Adressraum  : unteres Halb (User-Code/Daten/Stack); das obere Halb gehört
+                  dem Kernel und ist für Ring 3 gesperrt.

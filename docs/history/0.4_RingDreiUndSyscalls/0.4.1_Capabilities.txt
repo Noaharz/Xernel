@@ -1,0 +1,96 @@
+================================================================================
+0.4.1 — CAPABILITIES: XERNELS SICHERHEITSMODELL ALS DATENSTRUKTUR
+================================================================================
+
+Ziel dieses Schritts:
+  Die In-Kernel-Grundlage für das capability-basierte Sicherheitsmodell legen —
+  die Datenstrukturen, auf denen die Syscalls später operieren werden.
+
+WAS IST EINE CAPABILITY (KURZ)?
+  Eine unfälschbare Referenz auf ein Kernel-Objekt PLUS die Rechte, damit etwas
+  zu tun. Statt "Root darf alles" hält ein Thread nur die Capabilities, die er
+  bekommen hat, und kann nur die kopieren/verschieben/löschen, die er schon
+  besitzt. Es gibt keine globalen Privilegien. (Vorbild: seL4.)
+
+  Threads benennen eine Capability über einen INDEX in eine Capability-Tabelle
+  (CNode) — nicht über einen Zeiger. Der Kernel allein interpretiert den Inhalt.
+
+
+--------------------------------------------------------------------------------
+GEMEINSAME ABI: DIE CRATE "xabi"
+--------------------------------------------------------------------------------
+
+Kernel UND Userspace teilen sich die Definition der Capability-Typen. Diese
+liegen in der Workspace-Crate libs/xabi (no_std, keine Abhängigkeiten):
+
+  xabi::cap::CapType
+      Null, Untyped, CNode, Frame, PageTable, Thread, VSpace, Endpoint,
+      Notification, IrqHandler, IoPort  (numerische Werte sind Teil der ABI,
+      nur anhängen, nie umsortieren).
+  xabi::errno::CapError
+      Ok, InvalidCap, InvalidArg, NoMem, NotPermitted, WouldBlock, BadOp,
+      Faulted.
+
+Dafür wurde xabi als Dependency in kernel/Cargo.toml aufgenommen:
+
+      xabi = { path = "../libs/xabi" }
+
+WARUM gemeinsam? Damit die Bedeutung eines Cap-Typs/Fehlercodes auf beiden
+Seiten der Grenze EXAKT dieselbe ist — das ist der Sinn einer ABI-Crate.
+
+
+--------------------------------------------------------------------------------
+DIE KERNEL-STRUKTUREN   (kernel/src/cap.rs)
+--------------------------------------------------------------------------------
+
+CapEntry — eine einzelne Capability:
+      cap_type : CapType   (worauf zeigt sie?)
+      object   : u64       (Referenz aufs Objekt; Bedeutung je nach Typ:
+                            physische Adresse, Objekt-ID, ...)
+      badge    : u64       (vom Halter NICHT änderbar; identifiziert z.B. den
+                            Absender an einem Endpoint)
+
+CNode — eine Capability-Tabelle:
+      Eine feste Zahl von Slots, jeder leer oder mit genau einer Capability.
+      Adressierung per Index. Operationen:
+        new(len)            leere Tabelle mit len Slots
+        get(i)              Capability in Slot i lesen (InvalidCap wenn leer/
+                            außerhalb)
+        insert(i, cap)      in LEEREN Slot legen — überschreibt NIE (sonst
+                            NotPermitted)
+        copy(src, dst)      Capability von src in leeren dst kopieren
+        delete(i)           Capability entnehmen und zurückgeben
+
+  Designprinzip, das hier schon sichtbar ist: Capabilities werden nie still
+  überschrieben, und ein ungültiger Index ist ein FEHLER (Result), kein Absturz.
+  Das ist die Grundlage für die spätere Robustheit ("Crash eines Treibers !=
+  Kernel-Panic").
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION   (cap::selftest)
+--------------------------------------------------------------------------------
+
+cap::selftest() prüft die ganze Kette und gibt Result<(), CapError> zurück:
+  - leerer Slot liest als InvalidCap
+  - insert + get liefert dieselbe Capability zurück
+  - insert in belegten Slot -> NotPermitted
+  - copy in leeren Slot -> beide Slots gleich
+  - delete -> Slot wieder leer, Kopie unberührt
+  - Index außerhalb -> InvalidCap (kein Panic)
+
+Aufgerufen im Boot-Test (kernel/src/main.rs), Ausgabe:
+
+      [xernel] cap: self-test ok
+
+
+--------------------------------------------------------------------------------
+WAS NOCH NICHT DA IST (BEWUSST)
+--------------------------------------------------------------------------------
+
+  - Untyped-Retyping (aus rohem Speicher typisierte Objekte erzeugen)
+  - Die Anbindung an die Syscall-Oberfläche als invoke(cap, method, args)
+  - Pro-Prozess-CNodes und Übergabe von Caps an Kinder
+
+Die Strukturen hier sind so geschnitten, dass diese Schritte ADDITIV sind —
+sie kommen in Phase 0.5 dazu, ohne das Bestehende umzubauen.

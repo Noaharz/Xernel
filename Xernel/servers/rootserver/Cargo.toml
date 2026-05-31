@@ -1,0 +1,15 @@
+[package]
+name = "rootserver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "PID 1 of Xernel — receives all Untyped caps from the kernel, bootstraps the system"
+
+[[bin]]
+name = "rootserver"
+path = "src/main.rs"
+
+[dependencies]
+xabi = { path = "../../libs/xabi" }
+xstd = { path = "../../libs/xstd" }

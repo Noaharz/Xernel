@@ -1,0 +1,67 @@
+================================================================================
+0.8.1 — SSE/FPU AKTIVIEREN UND NON-BLOCKING READ
+================================================================================
+
+Zwei XOS-Beschwerden direkt umgesetzt.
+
+
+--------------------------------------------------------------------------------
+A) SSE/FPU FÜR RING 3 AKTIVIEREN   (kernel/src/arch/x86_64/cpu.rs)
+--------------------------------------------------------------------------------
+
+Problem (XOS-Beschwerde #1): Der Kernel hatte SSE/FPU für Ring 3 nicht
+eingerichtet. Die System-V-x86_64-ABI übergibt Floats in XMM-Registern, und der
+Compiler emittiert SSE-Instruktionen recht freizügig (sogar für simple
+Speicher-Moves). Ohne CR4.OSFXSR löst eine SSE-Instruktion eine #UD-Exception
+aus. XOS musste deshalb mit soft-float kompilieren — eine massive Einschränkung.
+
+Das hat sich in der Praxis bestätigt: XOS' erster SSE-Build crashte mit
+"#UD invalid opcode" mitten im Banner (siehe 0.8.3).
+
+Fix — cpu::enable_sse(), aufgerufen in arch::init():
+   - CR0: EMULATE_COPROCESSOR löschen (keine FPU-Emulation),
+          MONITOR_COPROCESSOR setzen.
+   - CR4: OSFXSR setzen (FXSAVE/FXRSTOR-Zustand + SSE erlaubt),
+          OSXMMEXCPT_ENABLE setzen (saubere SIMD-Exceptions).
+
+Damit läuft SSE in Ring 0 UND Ring 3. Der Kernel selbst bleibt soft-float gebaut
+und fasst XMM nie an — er kann den XMM-Zustand des User-Programms über Syscalls
+also nicht zerstören.
+
+WICHTIGER HINWEIS FÜR SPÄTER: Sobald es MEHRERE User-Threads/Prozesse mit
+Preemption gibt, muss der Kontextwechsel den XMM-Zustand mit sichern/
+wiederherstellen (FXSAVE/FXRSTOR). Bei einem einzelnen Prozess ist das noch
+nicht nötig.
+
+
+--------------------------------------------------------------------------------
+B) NON-BLOCKING READ   (SYS_READ_NB = 7)
+--------------------------------------------------------------------------------
+
+Problem (XOS-Beschwerde #4): SYS_READ blockiert komplett, bis eine Taste kommt.
+Für Animationen/Idle-Loops, die nebenbei auf Eingabe schauen wollen, unbrauchbar.
+
+Fix:
+   - keyboard::read_nb(buf): entleert den Ring-Puffer sofort (auch leer ->
+     gibt 0 zurück), blockiert nie. Nutzt without_interrupts beim Puffer-Zugriff
+     wie das blockierende read.
+   - Neuer Syscall SYS_READ_NB (Nr. 7), args fd/ptr/len, gibt die Anzahl sofort
+     verfügbarer Bytes zurück (0 wenn nichts da).
+
+Userland-Wrapper:
+   fn read_nb(buf: &mut [u8]) -> u64 {
+       syscall3(7, 0, buf.as_mut_ptr() as u64, buf.len() as u64)
+   }
+
+  Typische Animations-Schleife: SYS_READ_NB pollen; wenn 0, einen Frame zeichnen
+  und weiter; wenn >0, Eingabe verarbeiten.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/cpu.rs          NEU: enable_sse (CR0/CR4)
+  kernel/src/arch/x86_64/mod.rs          cpu::enable_sse in init; keyboard_read_nb
+  kernel/src/arch/x86_64/keyboard.rs     read_nb (non-blocking)
+  kernel/src/syscall.rs                  SYS_READ_NB=7, sys_read_nb

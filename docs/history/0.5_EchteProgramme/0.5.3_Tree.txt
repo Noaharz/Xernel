@@ -1,0 +1,55 @@
+================================================================================
+0.5.3 — VERZEICHNISBAUM NACH PHASE 0.5 (ECHTE PROGRAMME / ELF-LOADER)
+================================================================================
+
+Snapshot der relevanten Bäume nach Abschluss von Phase 0.5.
+Erzeugt mit:  tree -I 'target|limine|.git' Xernel/kernel Xernel/userland Xernel/targets
+
+NEU gegenüber 0.4.4_Tree.txt:
+  kernel/src/elf.rs                     minimaler ELF64-Loader
+  userland/init/                        erstes echtes User-Programm (Crate +
+                                        Linker-Script)
+  targets/x86_64-xernel-user.json       Build-Target für User-Programme
+  (kernel/src/user.rs lädt jetzt die ELF statt eines Byte-Blobs;
+   boot/limine.cfg hat eine MODULE_PATH-Zeile; xtask baut init mit.)
+
+--------------------------------------------------------------------------------
+
+Xernel/kernel
+└── src
+    ├── arch
+    │   └── x86_64
+    │       ├── apic.rs
+    │       ├── context.rs
+    │       ├── gdt.rs
+    │       ├── idt.rs
+    │       ├── mod.rs
+    │       ├── paging.rs
+    │       ├── qemu.rs
+    │       ├── serial.rs
+    │       └── syscall.rs
+    ├── cap.rs
+    ├── demo.rs
+    ├── elf.rs              <- NEU (ELF-Loader)
+    ├── ipc.rs
+    ├── main.rs
+    ├── mm/ (frame.rs, paging.rs)
+    ├── mm.rs
+    ├── panic.rs
+    ├── sched.rs
+    ├── serial.rs
+    ├── syscall.rs
+    └── user.rs             <- lädt jetzt die ELF
+
+Xernel/userland
+├── init                    <- NEU (erstes echtes User-Programm)
+│   ├── Cargo.toml
+│   ├── linker.ld
+│   └── src
+│       └── main.rs
+└── xsh
+    └── ... (Platzhalter)
+
+Xernel/targets
+├── x86_64-xernel-user.json  <- NEU (User-Build-Target)
+└── x86_64-xernel.json

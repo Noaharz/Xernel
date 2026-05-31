@@ -1,0 +1,57 @@
+================================================================================
+0.4.4 — VERZEICHNISBAUM NACH PHASE 0.4 (RING 3 UND SYSCALLS)
+================================================================================
+
+Snapshot des kernel/-Quellbaums nach Abschluss von Phase 0.4.
+Erzeugt mit:  tree -I 'target|limine|.git' Xernel/kernel
+
+NEU gegenüber 0.3.4_Tree.txt:
+  kernel/src/arch/x86_64/syscall.rs   syscall/sysret-Maschinerie (MSRs, Entry-Stub)
+  kernel/src/user.rs                  erster Ring-3-User-Prozess
+  kernel/src/cap.rs                   jetzt ECHT implementiert (CNode/CapEntry +
+                                      Selbsttest; vorher Platzhalter)
+  kernel/src/syscall.rs               jetzt ECHT implementiert (Dispatch;
+                                      vorher Platzhalter)
+  kernel/Cargo.toml                   neue Dependency: xabi (gemeinsame ABI)
+  gdt.rs / paging.rs                  erweitert (RSP0 + User-Selektoren;
+                                      map_user)
+
+--------------------------------------------------------------------------------
+
+Xernel/kernel
+├── Cargo.toml
+├── linker-x86_64.ld
+└── src
+    ├── arch
+    │   ├── aarch64
+    │   │   └── mod.rs
+    │   ├── mod.rs
+    │   ├── riscv64
+    │   │   └── mod.rs
+    │   └── x86_64
+    │       ├── apic.rs
+    │       ├── context.rs
+    │       ├── gdt.rs
+    │       ├── idt.rs
+    │       ├── mod.rs
+    │       ├── paging.rs
+    │       ├── qemu.rs
+    │       ├── serial.rs
+    │       └── syscall.rs        <- NEU
+    ├── cap.rs                    <- jetzt implementiert
+    ├── demo.rs
+    ├── ipc.rs
+    ├── main.rs
+    ├── mm
+    │   ├── frame.rs
+    │   └── paging.rs
+    ├── mm.rs
+    ├── panic.rs
+    ├── sched.rs
+    ├── serial.rs
+    ├── syscall.rs                <- jetzt implementiert
+    └── user.rs                   <- NEU
+
+Hinweis: Die Userland-Crates unter Xernel/libs, Xernel/servers, Xernel/drivers
+und Xernel/userland sind unverändert Platzhalter aus dem Scaffold (0.2) — bis
+auf libs/xabi, das jetzt vom Kernel als gemeinsame ABI genutzt wird.

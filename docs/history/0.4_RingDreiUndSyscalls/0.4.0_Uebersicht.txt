@@ -1,0 +1,102 @@
+================================================================================
+0.4 — RING 3 UND SYSCALLS: AUS DEM KERNEL WIRD EINE PLATTFORM
+================================================================================
+
+Zeitraum:      2026-05-29
+Ausgangspunkt: das Kernel-Fundament aus 0.3 (bootet, Speicher, Interrupts,
+               Timer, Kernel-Threads + IPC) — aber ALLES lief in Ring 0.
+Ergebnis:      Der Kernel führt ein echtes Programm in RING 3 (User-Mode) aus,
+               das über die syscall-Instruktion mit dem Kernel spricht. Damit
+               existiert erstmals eine Grenze zwischen Kernel und Programm —
+               die Voraussetzung dafür, "ein OS drauf zu bauen".
+
+WARUM DAS DER ENTSCHEIDENDE SCHRITT IST:
+  Solange aller Code in Ring 0 läuft, ist jedes "Programm" nur Kernel-Code. Erst
+  mit dem Ring-3-Übergang und einem Syscall-Mechanismus gibt es eine ABI
+  (Application Binary Interface), gegen die man Anwendungen schreiben kann, ohne
+  Teil des Kernels zu sein. Genau das wurde in dieser Phase erreicht und in QEMU
+  bewiesen.
+
+
+--------------------------------------------------------------------------------
+DIE SCHRITTE DIESER PHASE
+--------------------------------------------------------------------------------
+
+  0.4.1_Capabilities.txt
+      Die Capability-Datenstrukturen (CNode, CapEntry) — Xernels Sicherheits-
+      modell als In-Kernel-Grundlage. Mit Selbsttest.
+      (Roadmap: Konzept Phase 2, Capability-System)
+
+  0.4.2_SyscallEntry.txt
+      syscall/sysret: MSR-Setup (EFER/STAR/LSTAR/SFMASK), der Assembler-Entry-
+      Stub mit swapgs + Stack-Wechsel, der Dispatch.
+      (Roadmap: Konzept Phase 2/3, Syscall-Oberfläche)
+
+  0.4.3_RingDrei_ErsterUserProzess.txt
+      GDT-RSP0, user-zugängliche Pages, der erste User-Code-Blob, der Sprung
+      nach Ring 3 via sysretq und der bewiesene Round-Trip.
+      (Roadmap: Konzept Phase 3, erster User-Prozess)
+
+  0.4.4_Tree.txt
+      Verzeichnisbaum nach dieser Phase.
+
+
+--------------------------------------------------------------------------------
+WAS AM ENDE DIESER PHASE NACHWEISBAR FUNKTIONIERT
+--------------------------------------------------------------------------------
+
+    cd Xernel
+    cargo xtask run --test
+
+Ausgabe (gekürzt):
+
+    [xernel] hello, xernel — arch=x86_64, build=debug
+    [xernel] phys: 501 MiB usable (128477 frames, 3 in use)
+    [xernel] timer: 5 ticks
+    [xernel] cap: self-test ok                 <- Capability-Strukturen ok
+    [xernel] entering ring 3 at 0x400000       <- Sprung in den User-Mode
+    [user] syscall SYS_DEBUG: 0xabcd           <- User-Code ruft den Kernel
+    [user] exit(0)                             <- zweiter Syscall
+    [xernel] boot-test: ok
+    xtask: boot-test PASSED
+
+Der "Round-Trip" Ring 0 -> Ring 3 -> syscall -> Ring 0 ist damit verifiziert.
+
+
+--------------------------------------------------------------------------------
+WIE EIN SYSCALL IN XERNEL ABLÄUFT (ÜBERBLICK, DETAILS IN 0.4.2)
+--------------------------------------------------------------------------------
+
+  1. User-Code (Ring 3) legt die Syscall-Nummer in rax und Argumente in
+     rdi/rsi/rdx/r10/r8/r9 und führt die Instruktion "syscall" aus.
+  2. Die CPU springt zum Kernel-Entry (LSTAR-MSR), CPL wird 0. rcx hält die
+     Rücksprung-Adresse, r11 die alten Flags.
+  3. Der Entry-Stub (Assembler) wechselt per swapgs auf den Kernel-Kontext,
+     schaltet auf den Kernel-Stack, sichert die Register und ruft den
+     Rust-Dispatcher.
+  4. Der Dispatcher (kernel/src/syscall.rs) führt die Aktion aus und legt den
+     Rückgabewert in rax.
+  5. Der Stub stellt die Register wieder her, schaltet per swapgs und sysretq
+     zurück nach Ring 3 — der User-Code läuft hinter seiner syscall-Instruktion
+     weiter.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG — WAS NOCH FEHLT
+--------------------------------------------------------------------------------
+
+Erreicht: ein User-Programm läuft in Ring 3 und kann den Kernel rufen. Aber:
+
+  - Der "Loader" ist noch ein In-Kernel-Trick: ein hand-assemblierter Byte-Blob
+    wird in Frames kopiert und gemappt. Ein ECHTER ELF-Loader (im Root-Server,
+    Phase 3) kommt noch.
+  - Die Syscalls sind ein fixer Mini-Satz (SYS_DEBUG, SYS_EXIT). Das Zielmodell
+    ist "jeder Syscall ist eine Capability-Invocation" invoke(cap, method,
+    args). Die Capability-Strukturen dafür stehen jetzt (0.4.1), die Verdrahtung
+    an die Syscall-Oberfläche ist der nächste Schritt.
+  - Nur EIN User-Prozess, kein Scheduling von User-Threads, keine Adressraum-
+    Trennung zwischen mehreren Prozessen.
+
+Nächste Phase (0.5, geplant): Capabilities an die Syscalls binden, echte
+Endpoint-IPC zwischen User-Prozessen, ELF-Loader, Root-Server als erster
+echter User-Space-Dienst.

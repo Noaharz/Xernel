@@ -1,0 +1,90 @@
+================================================================================
+0.8.3 — XOS-BOOT-PROTOKOLL: ZWEI BUGS UND DIE ERSTE ECHTE SESSION
+================================================================================
+
+Quelle: zwei Boot-Mitschnitte vom 29. Mai 2026 (vom XOS-Setup, das den Kernel
+über ein eigenes boot.sh in ein ISO packt und in QEMU startet). Sie halten den
+realen Integrations-Verlauf fest — inklusive zweier Kernel-Probleme, die XOS
+beim Booten aufgedeckt hat. (Inhaltlich übernommen aus den Mitschnitten 1.txt
+und 2.txt.)
+
+
+--------------------------------------------------------------------------------
+MITSCHNITT 1 — ZWEI FEHLSCHLÄGE
+--------------------------------------------------------------------------------
+
+Versuch A (init module: 6632 bytes):
+
+    [xernel] init module: 6632 bytes
+    [xernel] PANIC: panicked at kernel/src/user.rs:27:19:
+    failed to load init ELF: MapFailed
+
+  -> Der ELF-Loader scheiterte mit MapFailed. Ursache: zwei PT_LOAD-Segmente
+     dieses (kleinen) Binaries teilten sich eine 4-KiB-Page. Unser Loader mappte
+     jede Page pro Segment einzeln und nahm an, dass Segmente sich keine Page
+     teilen. Die zweite Abbildung derselben Page schlug fehl (PageAlreadyMapped)
+     -> MapFailed. ECHTER LOADER-BUG. (Fix in 0.8.4.)
+
+Versuch B (nach Neukompilieren, init module: anderes Layout):
+
+    [xernel] entering ring 3: entry=0x400134
+    ... XOS-Banner ...
+    [xernel] PANIC: #UD invalid opcode
+       instruction_pointer: 0x4001d1
+       code_segment: index 4, rpl Ring3      <- wir waren in Ring 3
+       cpu_flags: ... INTERRUPT_FLAG ...
+
+  -> Jetzt lud die ELF, XOS startete in Ring 3 und druckte sein Banner — dann
+     #UD an einer Ring-3-Adresse. Ursache: eine SSE-Instruktion bei nicht
+     aktiviertem SSE (CR4.OSFXSR fehlte). Das ist genau XOS-Beschwerde #1.
+     BEHOBEN in 0.8.1 (cpu::enable_sse).
+
+
+--------------------------------------------------------------------------------
+MITSCHNITT 2 — DIE ERSTE ECHTE INTERAKTIVE SESSION
+--------------------------------------------------------------------------------
+
+Mit einem soft-float-Build von XOS (umging das damals noch offene SSE-Problem)
+lief die Shell vollständig und interaktiv:
+
+    [xernel] init module: 9368 bytes
+    [xernel] entering ring 3: entry=0x400122
+
+    ==============================================
+      ... XOS-Banner ...
+              XOS INTERACTIVE SHELL
+              (Phase 0.7 - SYS_READ)
+
+    xos> info
+    RAM: 112 KiB / 509 MiB
+    xos> help
+    Available commands: help, info, ticks, clear, exit
+    xos> ticks
+    Uptime: 1102 ticks
+    xos> clear
+    (Bildschirm geleert)
+    xos> help
+    Available commands: help, info, ticks, clear, exit
+    xos> exit
+    Goodbye!
+    [user] exit(0)
+    [xernel] first user process exited; halting.
+
+  -> Das ist der erste vollständige Beweis eines INTERAKTIVEN OS auf Xernel:
+     echte Tastatureingabe (SYS_READ), mehrere Befehle mit korrekten Antworten
+     (info nutzt SYS_SYSINFO, ticks nutzt SYS_GET_TICKS), sauberes Beenden
+     (SYS_EXIT). Die ganze Syscall-ABI 1-6 in Aktion, vom Nutzer getippt.
+
+
+--------------------------------------------------------------------------------
+WAS DIESE MITSCHNITTE FÜR DEN KERNEL BEDEUTETEN
+--------------------------------------------------------------------------------
+
+  - Bug 1 (MapFailed): ELF-Loader muss Segmente vertragen, die sich Pages
+    teilen. -> Fix 0.8.4.
+  - Bug 2 (#UD): SSE/FPU für Ring 3 einrichten. -> Fix 0.8.1.
+  - Bestätigung: Die Syscall-ABI trägt einen echten interaktiven Shell-Workload.
+
+  Beide Probleme kamen NICHT aus XOS-Code, sondern waren Lücken in der Plattform,
+  die erst ein echtes Userland-Programm sichtbar gemacht hat. Genau dafür ist die
+  Zusammenarbeit gut.

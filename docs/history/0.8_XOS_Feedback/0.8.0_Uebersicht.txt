@@ -1,0 +1,85 @@
+================================================================================
+0.8 — XOS-FEEDBACK: SSE, NON-BLOCKING READ, EXTERNES BOOTEN
+================================================================================
+
+Zeitraum:      2026-05-30
+Kontext:       XOS (ein separates Userland-OS, gebaut von einem zweiten Agenten
+               im XOS-Ordner) läuft auf Xernel und hat ein
+               strukturiertes Feedback-Dokument geliefert (XOS/Xernel.txt):
+               Anforderungen an die Plattform, OHNE den Kernel anzufassen.
+Ergebnis:      Die zwei dringendsten Punkte umgesetzt + ein xtask-Schalter, mit
+               dem XOS' externe ELF gebootet wird, ohne den Kernel-Baum zu
+               berühren. XOS bootet damit voll (Banner + interaktive Shell).
+
+ARBEITSWEISE (WICHTIG, FESTGEHALTEN):
+  Userland (XOS) ändert NIE den Kernel. Es meldet Anforderungen; der Kernel wird
+  separat angepasst. Genau wie bei echten Betriebssystemen baut man gegen die
+  Syscall-ABI, nicht in den Kernel hinein.
+
+
+--------------------------------------------------------------------------------
+XOS-FEEDBACK (XOS/Xernel.txt) UND WAS DAVON ERLEDIGT IST
+--------------------------------------------------------------------------------
+
+  Beschwerden:
+   1. SSE/FPU nicht initialisiert -> Compiler muss soft-float, sonst #UD.
+      => ERLEDIGT (0.8.1). Kernel aktiviert SSE für Ring 3.
+   2. Kein SYS_MMAP/SYS_SBRK -> kein dynamischer Speicher (Heap).
+      => OFFEN (Phase 0.9 geplant: User-Heap-Syscall).
+   3. Keine Timer-Frequenz -> Ticks ohne Hz sind keine echte Zeit.
+      => OFFEN (Phase 0.9 geplant: LAPIC-Kalibrierung + Hz über SYSINFO).
+   4. SYS_READ blockiert komplett -> Peek/non-blocking gewünscht.
+      => ERLEDIGT (0.8.1). Neuer SYS_READ_NB.
+
+  Wünsche (0.9+): Framebuffer/LFB (GUI), Dateisystem-API, fork/exec.
+  => OFFEN, als Roadmap notiert.
+
+
+--------------------------------------------------------------------------------
+DIE SCHRITTE DIESER PHASE
+--------------------------------------------------------------------------------
+
+  0.8.1_SSE_und_NonBlockingRead.txt
+      SSE/FPU-Aktivierung (CR0/CR4) und der non-blocking SYS_READ_NB.
+
+  0.8.2_xtask_init_override.txt
+      `cargo xtask run --init <pfad>`: externe Userland-ELF als Boot-Modul,
+      ohne den Kernel-Baum anzufassen. Plus der verifizierte XOS-Boot.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — XOS BOOTET
+--------------------------------------------------------------------------------
+
+    cargo xtask run --init <XOS>/target/x86_64-xernel-user/release/xos-init
+
+    limine: Loading module `boot:///boot/init.elf`...
+    [xernel] init module: 9368 bytes
+    [xernel] entering ring 3: entry=0x400122
+    [2J[H===========================================
+      ... XOS-Banner ...
+              XOS INTERACTIVE SHELL
+    xos> _            <- wartet auf Tastatureingabe
+
+  Das beweist: XOS' mit SSE kompiliertes Binary läuft OHNE #UD (SSE-Fix wirkt),
+  die externe ELF wird ohne Kernel-Eingriff gebootet, und die interaktive Shell
+  startet. (Echte Eingabe: im QEMU-Grafikfenster tippen; headless gibt es keine
+  Tastatur.)
+
+
+--------------------------------------------------------------------------------
+ARTEFAKTE IM REPO-ROOT
+--------------------------------------------------------------------------------
+
+  xernel-kernel.elf  reiner SSE-fähiger Release-Kernel
+  xernel.iso         bootbar, enthält das Demo-init
+  xos.iso            bootbar, enthält XOS als init (interaktive Shell)
+
+
+--------------------------------------------------------------------------------
+VOLLE SYSCALL-ABI NACH 0.8
+--------------------------------------------------------------------------------
+
+  1 WRITE(fd,ptr,len)    4 GET_TICKS()        7 READ_NB(fd,ptr,len)  [NEU]
+  2 EXIT(code)           5 SYSINFO(which)
+  3 DEBUG(value)         6 READ(fd,ptr,len)
