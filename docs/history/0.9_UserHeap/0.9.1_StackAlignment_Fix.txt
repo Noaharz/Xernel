@@ -1,0 +1,72 @@
+================================================================================
+0.9.1 — BUGFIX: USER-STACK-ALIGNMENT BEIM RING-3-EINTRITT (#GP mit SSE)
+================================================================================
+
+Aufgedeckt durch: XOS (mit SSE kompiliert). Befehl `set version 0.8/alpha`
+crashte:
+    [xernel] PANIC: CPU exception: #GP general protection fault (error 0x0)
+       instruction_pointer: 0x400e9e  (Ring 3)
+(neofetch und andere Befehle liefen — der Crash trat nur bei bestimmten
+String-/SSE-lastigen Pfaden auf.)
+
+
+--------------------------------------------------------------------------------
+DIE URSACHE
+--------------------------------------------------------------------------------
+
+Die SysV-AMD64-ABI garantiert: beim Eintritt in eine Funktion gilt
+    rsp % 16 == 8
+(weil der Aufrufer bei rsp % 16 == 0 ein `call` macht, das 8 Bytes
+Rücksprungadresse pusht). Funktionen richten ihre 16-Byte-Stack-Locals an dieser
+Annahme aus.
+
+Unser Kernel sprang per sysretq aber mit rsp = 0x810000 (rsp % 16 == 0) direkt in
+_start. Der Versatz von 8 Bytes pflanzt sich durch den ganzen Aufruf-Baum fort.
+
+Solange das Userland soft-float ist (kein SSE), fällt das nicht auf. MIT SSE
+benutzt der Compiler aber `movaps` (verlangt 16-Byte-Alignment) für
+Stack-Locals. Durch den Versatz ist so ein Zugriff misaligned -> #GP. Genau das
+trat bei XOS' SSE-Build im `set`-Befehl auf.
+
+(Hängt direkt mit 0.8.1 zusammen: erst nachdem SSE aktiviert wurde, konnte
+dieser latente Alignment-Fehler überhaupt zuschlagen.)
+
+
+--------------------------------------------------------------------------------
+DER FIX   (kernel/src/user.rs)
+--------------------------------------------------------------------------------
+
+    // 16-Byte-ausgerichteten Stack-Top um 8 versetzen, damit _start die
+    // ABI-Annahme rsp % 16 == 8 vorfindet.
+    let user_stack_top = (USER_STACK_VA + USER_STACK_PAGES * PAGE) - 8;
+
+Eine Zeile, korrekt nach ABI. Gilt für jedes User-Programm, nicht nur XOS.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION (END-TO-END AM ECHTEN XOS-BINARY)
+--------------------------------------------------------------------------------
+
+Der genau crashende Befehl wurde headless über den QEMU-Monitor (sendkey) in die
+laufende XOS-Shell eingespeist:
+
+    xos> set version 0.8/alpha
+    xos>
+
+  Kein #GP mehr — der Befehl wird verarbeitet, ein neuer Prompt erscheint.
+  Zusätzlich: boot-test (eigenes init) weiter PASSED, keine Regression.
+
+  (Verifikations-Technik fürs Protokoll: QEMU mit
+   -monitor unix:/tmp/qmon,server,nowait starten, auf "xos>" im Serial-Log
+   warten, dann die Tasten per `sendkey`-Kommandos über eine nc-Verbindung zum
+   Socket schicken. So lässt sich interaktive Tastatureingabe auch ohne
+   QEMU-Fenster automatisiert testen.)
+
+
+--------------------------------------------------------------------------------
+LEHRE
+--------------------------------------------------------------------------------
+
+Beim direkten Sprung in User-Code (ohne echtes `call`) muss der Kernel die
+ABI-Stack-Invariante selbst herstellen. Dasselbe gilt später für jeden neu
+erzeugten Thread/Prozess: der initiale rsp muss rsp % 16 == 8 erfüllen.

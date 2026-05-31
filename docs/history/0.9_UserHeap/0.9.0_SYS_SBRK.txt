@@ -1,0 +1,110 @@
+================================================================================
+0.9 — USER-HEAP: DYNAMISCHER SPEICHER (SYS_SBRK)
+================================================================================
+
+Zeitraum:      2026-05-30
+Auslöser:      XOS-Feedback #2 — kein SYS_MMAP/SYS_SBRK, also kein dynamischer
+               Speicher. XOS musste alles statisch kompilieren (feste Puffer,
+               kein Vec/String/Box).
+Ergebnis:      Ein wachsender User-Heap per SYS_SBRK. Userland kann jetzt einen
+               eigenen Allocator darauf bauen und Vec/String/Box/BTreeMap usw.
+               nutzen.
+
+
+--------------------------------------------------------------------------------
+DIE IDEE (UNIX-sbrk)
+--------------------------------------------------------------------------------
+
+Jedes Programm hat einen "Program Break" — die obere Grenze seines Heaps.
+SYS_SBRK(delta) verschiebt diese Grenze und gibt den ALTEN Break zurück. Ein
+Userland-Allocator ruft sbrk, um sich Speicher zu holen, und verwaltet ihn dann
+selbst.
+
+    let start = sbrk(4096);   // 4 KiB anfordern -> Adresse des neuen Bereichs
+    // [start, start+4096) ist jetzt beschreibbarer Heap-Speicher
+
+
+--------------------------------------------------------------------------------
+DER SYSCALL   (SYS_SBRK = 8)
+--------------------------------------------------------------------------------
+
+  Arg 0 : delta (als i64 interpretiert)
+  Rückgabe:
+    - delta > 0 : alter Break; der Heap wächst um delta Bytes
+    - delta = 0 : aktueller Break (Abfrage)
+    - delta < 0 : alter Break; der Heap schrumpft (Pages bleiben gemappt)
+    - Fehler    : u64::MAX (z.B. Heap-Limit erreicht oder kein Frame frei)
+
+  Userland-Wrapper:
+    fn sbrk(delta: i64) -> u64 {
+        syscall3(8, delta as u64, 0, 0)
+    }
+
+
+--------------------------------------------------------------------------------
+DIE KERNEL-SEITE   (kernel/src/user.rs, sbrk)
+--------------------------------------------------------------------------------
+
+  Heap-Region (fest, für den einen Prozess):
+    HEAP_START = 0x1000_0000  (256 MiB)   — klar über Code (4 MiB) und Stack (8 MiB)
+    HEAP_MAX   = 0x2000_0000  (512 MiB)   — Adress-Obergrenze (echte Größe durch
+                                            verfügbare Frames begrenzt)
+    HEAP_BREAK : aktueller Break (startet bei HEAP_START)
+
+  Beim Wachsen werden die NEU abgedeckten Pages — [page_up(alt), page_up(neu)) —
+  lazy gemappt:
+    - frame::alloc() holt eine physische Page,
+    - über die HHDM auf 0 gesetzt (Userland sieht nie alte Daten),
+    - arch::map_user(page, frame, writable=true, executable=false) — RW, NX.
+
+  Nur die tatsächlich angefassten Pages kosten echten Speicher (lazy). Schrumpfen
+  senkt nur den Break (kein Unmap — einfach und sicher; ein echter
+  Speicher-Rückgeber käme später).
+
+  Hinweis: Aktuell EIN globaler Break, weil es einen Prozess gibt. Mit mehreren
+  Prozessen wird das pro Prozess (eigener Adressraum + eigener Break).
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION   (Heap-Test in init, läuft im Boot-Test)
+--------------------------------------------------------------------------------
+
+init fordert 8 KiB an, schreibt ein Byte-Muster über den ganzen Bereich, liest
+es zurück und prüft es:
+
+    cargo xtask run --test
+
+     RAM total : 497 MiB
+     RAM used  : 136 KiB
+     uptime    : 5 ticks
+     heap      : 8 KiB ok          <- sbrk + map + write + read-back ok
+    [xernel] boot-test: ok
+    xtask: boot-test PASSED
+
+
+--------------------------------------------------------------------------------
+WAS XOS JETZT TUN KANN
+--------------------------------------------------------------------------------
+
+Einen #[global_allocator] implementieren, der über sbrk Speicher holt (z.B. ein
+einfacher Bump- oder Linked-List-Allocator). Damit funktionieren alloc-Typen:
+Vec, String, Box, BTreeMap, ... — echte dynamische Datenstrukturen statt fester
+Puffer (Command-History, Parser, virtuelles FS im RAM usw.).
+
+
+--------------------------------------------------------------------------------
+VOLLE SYSCALL-ABI NACH 0.9
+--------------------------------------------------------------------------------
+
+  1 WRITE(fd,ptr,len)   4 GET_TICKS()       7 READ_NB(fd,ptr,len)
+  2 EXIT(code)          5 SYSINFO(which)     8 SBRK(delta)          [NEU]
+  3 DEBUG(value)        6 READ(fd,ptr,len)
+
+
+--------------------------------------------------------------------------------
+NOCH OFFEN AUS XOS-FEEDBACK
+--------------------------------------------------------------------------------
+
+  - Timer-Frequenz/Hz (LAPIC kalibrieren) — #3
+  - Framebuffer/LFB (GUI)
+  - Dateisystem-API, fork/exec

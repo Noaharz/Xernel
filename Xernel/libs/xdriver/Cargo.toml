@@ -1,0 +1,14 @@
+[package]
+name = "xdriver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "User-space driver framework: DMA buffers, MMIO frames, IRQ notifications"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+xabi = { path = "../xabi" }
+xstd = { path = "../xstd" }

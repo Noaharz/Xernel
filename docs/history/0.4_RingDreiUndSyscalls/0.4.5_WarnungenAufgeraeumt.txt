@@ -1,0 +1,100 @@
+================================================================================
+0.4.5 — WARNUNGEN AUFGERÄUMT: 38 -> 0
+================================================================================
+
+Zeitraum:      2026-05-29 (direkt nach 0.4.3)
+Auslöser:      `cargo xtask run` gab einen sauberen Boot aus, ABER davor eine
+               Wand von 38 Compiler-Warnungen. Unsauber und irreführend.
+Ergebnis:      0 Warnungen im Produktions- UND im boot-test-Build. Der Boot
+               selbst war nie betroffen — es ging rein um Hygiene.
+
+
+--------------------------------------------------------------------------------
+DIE DREI URSACHEN DER WARNUNGEN
+--------------------------------------------------------------------------------
+
+1) DEAD-CODE (die große Mehrheit, ~35 Warnungen)
+   Viele Bausteine sind ABSICHTLICH vor ihrem ersten Aufrufer gebaut:
+     - cap.rs           (CNode/CapEntry) — nur im boot-test gerufen
+     - sched.rs/ipc.rs/demo.rs — die Meilenstein-2.0-Demo, läuft aktuell nicht
+       im selben Boot wie der User-Prozess (siehe 0.4.3)
+     - paging::selftest, timer_ticks, paging_selftest, qemu::exit/ExitCode,
+       apic::ticks — nur unter dem `boot-test`-Feature erreichbar
+     - frame::free, paging::map, context::* — reservierte HAL-Oberfläche
+   Das ist normal für einen jungen Kernel: die API entsteht, bevor der erste
+   Aufrufer existiert.
+
+2) UNUSED IMPORTS (3 Warnungen)
+   Der HAL-Re-Export in kernel/src/arch/mod.rs exportiert die gesamte
+   arch-Oberfläche (exit, paging_selftest, timer_ticks, ...). In einem
+   BINARY-Crate warnt Rust, wenn ein re-exportierter Name nirgends im Crate
+   benutzt wird — anders als in einer Library, wo `pub use` die öffentliche
+   Schnittstelle wäre.
+
+3) EIN ECHTER LINT-HINWEIS (1 Warnung) — der einzige, der ein Code-Problem war
+   function_casts_as_integer in arch/x86_64/syscall.rs:
+       LStar::write(VirtAddr::new(syscall_entry as usize as u64));
+   Ein Funktionszeiger direkt nach Integer zu casten ist unsauber. Korrekt ist
+   der Umweg über einen Pointer.
+
+
+--------------------------------------------------------------------------------
+WAS GEÄNDERT WURDE
+--------------------------------------------------------------------------------
+
+ECHTER FIX (Code), arch/x86_64/syscall.rs:
+       - syscall_entry as usize as u64
+       + syscall_entry as *const () as u64
+   Liefert exakt denselben Adresswert, ist aber die vom Compiler empfohlene,
+   typkorrekte Schreibweise.
+
+HYGIENE (kein Verhalten geändert), kernel/src/main.rs — crate-weit:
+       #![allow(dead_code)]
+       #![allow(unused_imports)]
+   MIT erklärendem Kommentar darüber, WARUM (frühe Phase: API vor Aufrufer,
+   boot-test-only Pfade, reservierte Demo) und dem Hinweis, dass dieses `allow`
+   wieder ENTFERNT werden soll, sobald jeder Baustein einen echten Aufrufer hat.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG — WARUM `allow` UND NICHT "RICHTIG FIXEN"?
+--------------------------------------------------------------------------------
+
+Ein crate-weites #![allow(dead_code)] ist ein bewusster KOMPROMISS, kein
+Idealzustand: es versteckt auch echten toten Code, der später aus Versehen
+entstehen könnte. Die saubere Alternative wäre, jede einzelne boot-test-only
+Funktion mit #[cfg(feature = "boot-test")] bzw. #[allow(dead_code)] einzeln zu
+markieren — aber bei ~35 Stellen, die in der nächsten Phase ohnehin echte
+Aufrufer bekommen (Capabilities an Syscalls, Scheduler für User-Threads), wäre
+das jetzt verfrühte Mehrarbeit.
+
+PLAN: Sobald Phase 0.5 die meisten dieser APIs tatsächlich aufruft, fliegt das
+crate-weite `allow` raus und wird durch gezielte Markierungen an den wenigen
+verbleibenden boot-test-only Stellen ersetzt. Der Kommentar im Code erinnert
+daran.
+
+
+--------------------------------------------------------------------------------
+NICHT UNSERE WARNUNGEN: xorriso
+--------------------------------------------------------------------------------
+
+Beim ISO-Bauen erscheinen weiterhin zwei Zeilen:
+       xorriso : WARNING : EFI boot equipment is provided but no directory
+                           /EFI/BOOT ...
+Die kommen vom ISO-Werkzeug xorriso, NICHT vom Kernel. Sie bedeuten nur, dass
+im ISO kein /EFI/BOOT-Baum liegt (eine Methode zur USB-Stick-Vorbereitung unter
+Windows). Für den QEMU-CD-Boot irrelevant. Bei Bedarf später behebbar, indem
+das xtask einen /EFI/BOOT-Baum ins iso_root legt.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+       cargo xtask run          -> sauberer Boot, 0 Kernel-Warnungen
+       cargo xtask run --test   -> boot-test PASSED, 0 Kernel-Warnungen
+
+Der Ring-3-Round-Trip (0.4.3) läuft unverändert:
+       [xernel] entering ring 3 at 0x400000
+       [user] syscall SYS_DEBUG: 0xabcd
+       [user] exit(0)

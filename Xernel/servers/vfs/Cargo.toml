@@ -1,0 +1,15 @@
+[package]
+name = "vfs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Virtual File System server — mount namespace, dispatches I/O to FS servers"
+
+[[bin]]
+name = "vfs"
+path = "src/main.rs"
+
+[dependencies]
+xabi = { path = "../../libs/xabi" }
+xstd = { path = "../../libs/xstd" }

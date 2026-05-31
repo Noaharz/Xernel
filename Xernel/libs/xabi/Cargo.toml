@@ -1,0 +1,11 @@
+[package]
+name = "xabi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Xernel raw syscall and capability ABI (shared kernel<->userspace)"
+
+[lib]
+name = "xabi"
+path = "src/lib.rs"

@@ -1,0 +1,81 @@
+================================================================================
+0.6.2 — GRÖSSERER USER-STACK UND DAS init-DEMO-OS
+================================================================================
+
+--------------------------------------------------------------------------------
+A) GRÖSSERER USER-STACK   (kernel/src/user.rs)
+--------------------------------------------------------------------------------
+
+Vorher bekam das User-Programm genau EINE Stack-Page (4 KiB). Für ein echtes
+Programm mit Funktionsaufrufen und Puffern ist das zu wenig. Jetzt mappt der
+Kernel 16 Pages = 64 KiB:
+
+    USER_STACK_VA   = 0x80_0000          (8 MiB, klar vom init-Image @ 4 MiB)
+    USER_STACK_PAGES = 16                (64 KiB)
+    -> Stack-Top = 0x80_0000 + 16*4096 = 0x81_0000
+
+Jede Page wird einzeln allokiert und user-lesbar/-schreibbar, nicht ausführbar
+(W^X) gemappt. Der Stack-Top kommt beim Ring-3-Eintritt nach rsp (sysretq).
+
+
+--------------------------------------------------------------------------------
+B) DAS init-DEMO-OS   (userland/init/src/main.rs)
+--------------------------------------------------------------------------------
+
+init ist jetzt ein kleines, ausgabe-getriebenes OS-Programm. Es nutzt
+ausschließlich die Syscall-ABI aus 0.6.1.
+
+Was es tut:
+  1. Druckt einen ASCII-Banner ("Xernel OS / first userland").
+  2. Fragt per SYS_SYSINFO RAM gesamt und benutzt ab, druckt sie (MiB/KiB).
+  3. Fragt per SYS_GET_TICKS die Uptime ab, druckt sie.
+  4. Druckt eine Abschlusszeile und ruft SYS_EXIT(0).
+
+Technische Punkte (weil no_std OHNE alloc):
+  - Textausgabe: write(&[u8]) -> SYS_WRITE. print(&str) ruft write(s.as_bytes()).
+  - Zahlen: print_u64() formatiert ohne Allokation in einen Stack-Puffer
+    ([u8; 20], Ziffern von hinten nach vorne) und schreibt den belegten
+    Teil-Slice. Das ist das Muster für jede Zahlenausgabe ohne Heap.
+
+Das beweist: ein Programm kann beliebigen Text ausgeben und echten Systemzustand
+anzeigen — die Bausteine eines ersten OS.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run        (und cargo xtask run --test -> boot-test PASSED)
+
+    [xernel] entering ring 3: entry=0x400010
+      __  __                    _
+     |  \/  | ___ _ __ _ __  ___| |
+     | |\/| |/ _ \ '__| '_ \/ -_) |   Xernel OS
+     |_|  |_|\___/_|  |_| |_\___|_|   first userland
+
+     RAM total : 497 MiB
+     RAM used  : 124 KiB
+     uptime    : 5 ticks
+
+     booted successfully. halting userland.
+    [user] exit(0)
+
+Der Entry 0x400010 (statt 0x400000) zeigt nebenbei, dass der Loader den
+ELF-Entrypoint (e_entry) verwendet und nicht eine fest verdrahtete Adresse.
+
+
+--------------------------------------------------------------------------------
+SO BAUST DU DEIN EIGENES PROGRAMM
+--------------------------------------------------------------------------------
+
+  Einfachster Weg: userland/init/src/main.rs ändern (oder ersetzen) und
+
+    cargo xtask run
+
+  ausführen. Der xtask baut init mit dem User-Target + Linker-Script und legt es
+  als Limine-Modul ins ISO; der Kernel lädt und startet es.
+
+  Eigenständiger Weg (Programm in einem fremden Ordner): als statische x86_64-
+  ELF bauen (Entry _start, Basis 0x400000, no_std, freestanding) und die ELF als
+  Boot-Modul "init.elf" einsetzen. Details: targets/x86_64-xernel-user.json und
+  userland/init/linker.ld dienen als Vorlage.

@@ -1,0 +1,90 @@
+================================================================================
+0.5 — ECHTE PROGRAMME: DER ELF-LOADER
+================================================================================
+
+Zeitraum:      2026-05-29
+Ausgangspunkt: Phase 0.4 — ein Ring-3-Programm lief, aber als hand-assemblierter
+               Byte-Blob, direkt im Kernel einkompiliert.
+Ergebnis:      Der Kernel lädt ein SEPARAT KOMPILIERTES Programm (eine echte
+               ELF-Datei), das als Limine-Modul mitgeliefert wird, parst es,
+               mappt seine Segmente nach Ring 3 und startet es. Ab hier sind
+               User-Programme echte, eigenständige Build-Artefakte.
+
+WARUM DAS WICHTIG IST:
+  Ein Byte-Blob im Kernel ist kein Programm, das man "schreibt" — es ist Teil
+  des Kernels. Mit einem ELF-Loader kannst du ein Programm in einer eigenen
+  Crate schreiben, mit cargo kompilieren, und der Kernel führt es aus, ohne es
+  zu kennen. Das ist die Grundlage für alles Weitere (Shell, Dienste, eigene
+  Apps).
+
+
+--------------------------------------------------------------------------------
+DIE SCHRITTE DIESER PHASE
+--------------------------------------------------------------------------------
+
+  0.5.1_InitProgramm.txt
+      Das erste echte User-Programm "init" als eigene Crate: no_std, eigenes
+      User-Target, eigenes Linker-Script, raw syscalls.
+
+  0.5.2_ElfLoaderUndModul.txt
+      Wie init als Limine-Modul ins ISO kommt (xtask) und wie der Kernel das
+      Modul findet, die ELF parst und die Segmente nach Ring 3 lädt.
+
+  0.5.3_Tree.txt
+      Verzeichnisbaum nach dieser Phase.
+
+
+--------------------------------------------------------------------------------
+WAS AM ENDE DIESER PHASE NACHWEISBAR FUNKTIONIERT
+--------------------------------------------------------------------------------
+
+    cd Xernel
+    cargo xtask run        (oder: cargo xtask run --test)
+
+Ausgabe (gekürzt):
+
+    limine: Loading kernel `boot:///boot/xernel.elf`...
+    limine: Loading module `boot:///boot/init.elf`...     <- Modul wird geladen
+    [xernel] hello, xernel — arch=x86_64, build=debug
+    [xernel] init module: 1617136 bytes                   <- Kernel sieht die ELF
+    [xernel] entering ring 3: entry=0x400000              <- Sprung an den
+                                                             ELF-Entrypoint
+    [user] syscall SYS_DEBUG: 0x1111                      <- echtes Programm läuft
+    [user] syscall SYS_DEBUG: 0x2222
+    [user] exit(0)
+
+Der Unterschied zu Phase 0.4: die Werte 0x1111/0x2222 kommen aus einem
+KOMPILIERTEN Rust-Programm (userland/init), nicht aus einem im Kernel
+verdrahteten Blob.
+
+
+--------------------------------------------------------------------------------
+DER WEG EINES PROGRAMMS, VON QUELLE BIS RING 3 (ÜBERBLICK)
+--------------------------------------------------------------------------------
+
+  1. userland/init/src/main.rs  — Rust-Quelle, _start, raw syscalls.
+  2. cargo (via xtask) baut init gegen targets/x86_64-xernel-user.json mit dem
+     User-Linker-Script -> statische ELF mit Entry bei 0x400000.
+  3. xtask kopiert die ELF nach iso_root/boot/init.elf; boot/limine.cfg hat
+     MODULE_PATH=boot:///boot/init.elf.
+  4. Limine lädt die ELF beim Boot als Modul in den Speicher.
+  5. Kernel: arch::init_module() findet die Modul-Bytes, elf::load() parst sie
+     und mappt die PT_LOAD-Segmente nach Ring 3, user::run() springt an e_entry.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG — WAS NOCH FEHLT
+--------------------------------------------------------------------------------
+
+  - Der Loader sitzt noch IM KERNEL. Das Zielmodell (Phase 3) ist ein
+    Root-Server im User-Space, der Programme lädt — der Kernel selbst soll
+    irgendwann keinen ELF-Loader mehr brauchen.
+  - Nur EIN Programm, kein Nachladen, keine Trennung mehrerer Adressräume.
+  - Die init-ELF ist ~1.6 MB groß, weil sie Debug-Infos enthält; geladen werden
+    aber nur die echten Segmente (~52 Byte Code). Strippen ist spätere Politur.
+  - Die Syscalls sind weiter ein fixer Mini-Satz; die Bindung an Capabilities
+    (invoke(cap, method, args)) steht noch aus.
+
+Nächste sinnvolle Schritte: Capabilities an die Syscalls binden, mehrere
+User-Prozesse + Adressraum-Trennung, und der Umzug des Loaders in einen
+Root-Server.

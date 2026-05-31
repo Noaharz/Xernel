@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "kernel",
+    "libs/xabi",
+    "libs/xstd",
+    "libs/xdriver",
+    "libs/xlibc",
+    "servers/rootserver",
+    "servers/vfs",
+    "servers/netstack",
+    "servers/disp",
+    "servers/pm",
+    "drivers/virtio",
+    "userland/init",
+    "userland/xsh",
+]
+exclude = []
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+authors = ["Noah"]
+license = "TBD"
+repository = "https://github.com/noahschwarz0011/xernel"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+overflow-checks = true
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+overflow-checks = false
+strip = "symbols"
+
+# Kernel & no_std crates must not pull in std-dependent panic strategies.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release.package."*"]
+opt-level = 3

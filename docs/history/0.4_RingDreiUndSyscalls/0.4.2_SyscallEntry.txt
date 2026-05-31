@@ -1,0 +1,129 @@
+================================================================================
+0.4.2 — SYSCALL-ENTRY: DIE schnelle SYSTEMAUFRUF-MASCHINERIE (syscall/sysret)
+================================================================================
+
+Ziel dieses Schritts:
+  Den Mechanismus bauen, mit dem Ring-3-Code in den Kernel ruft und sauber
+  zurückkehrt — über die x86_64-Instruktionen "syscall" und "sysretq".
+
+DIE AUFRUF-KONVENTION VON XERNEL (USER-SEITE):
+      rax            = Syscall-Nummer
+      rdi,rsi,rdx,
+      r10,r8,r9      = Argumente 1..6
+      Rückgabe       = rax
+  Wichtig: r10 statt rcx fürs 4. Argument, weil "syscall" rcx mit der
+  Rücksprung-Adresse überschreibt.
+
+
+--------------------------------------------------------------------------------
+WAS "syscall" / "sysretq" DIE HARDWARE TUN LÄSST
+--------------------------------------------------------------------------------
+
+  syscall (in Ring 3 ausgeführt):
+    - speichert die Rücksprung-RIP in rcx und RFLAGS in r11
+    - maskiert RFLAGS mit dem SFMASK-MSR
+    - lädt CS/SS aus dem STAR-MSR, CPL wird 0
+    - springt zur Adresse im LSTAR-MSR
+    - WECHSELT NICHT den Stack — das müssen wir selbst tun.
+
+  sysretq (in Ring 0 ausgeführt):
+    - lädt RIP aus rcx, RFLAGS aus r11
+    - lädt CS/SS (Ring 3) aus STAR
+    - setzt RSP NICHT — das müssen wir vorher selbst setzen.
+
+
+--------------------------------------------------------------------------------
+SCHRITT A — DIE MSRs SETZEN   (kernel/src/arch/x86_64/syscall.rs, init())
+--------------------------------------------------------------------------------
+
+  EFER.SCE       Bit "System Call Extensions" einschalten -> syscall/sysret
+                 überhaupt verfügbar.
+  STAR           die Segment-Selektoren für den Ring-Wechsel. Über write_raw:
+                   syscall-Feld = kernel_code   (CS Ring0, SS = +8 = kernel_data)
+                   sysret-Feld  = user_code - 16 (CS Ring3 = +16, SS = +8 =
+                                                  user_data)
+                 Das funktioniert nur, weil die GDT in genau der Reihenfolge
+                 kernel_code, kernel_data, user_data, user_code angelegt ist
+                 (siehe 0.4.3 / gdt.rs). Eine debug_assert prüft das Layout.
+  LSTAR          Adresse unseres Entry-Stubs syscall_entry.
+  SFMASK         RFLAGS-Bits, die beim Eintritt gelöscht werden: IF (Interrupts
+                 aus während des Übergangs), DF, TF.
+  KERNEL_GS_BASE zeigt auf einen Per-CPU-Scratch (PerCpu). Siehe Schritt B.
+
+
+--------------------------------------------------------------------------------
+SCHRITT B — DER STACK-WECHSEL ÜBER swapgs UND gs
+--------------------------------------------------------------------------------
+
+Problem: Bei "syscall" sind kaum Register frei (rcx=RIP, r11=RFLAGS sind
+belegt, rax=Nummer, Args in rdi/rsi/...). Wie kommt man an einen Kernel-Stack,
+ohne ein Register zu zerstören? Antwort: das gs-Segment + swapgs.
+
+  PerCpu-Struktur (fester Offset, Teil der ABI mit dem Assembler):
+      offset 0: kernel_rsp   (Top des Syscall-Kernel-Stacks, 16-aligned)
+      offset 8: user_rsp     (hier wird der User-Stack zwischengelagert)
+
+  KERNEL_GS_BASE zeigt auf diese Struktur. Im Kernel läuft GS.base = 0 (der
+  User-Wert); erst "swapgs" im Entry tauscht GS.base <-> KERNEL_GS_BASE, sodass
+  gs:[0] / gs:[8] auf die PerCpu-Felder zeigen. Der Kernel nutzt gs sonst
+  nirgends, deshalb ist das für eine CPU sicher.
+
+
+--------------------------------------------------------------------------------
+SCHRITT C — DER ENTRY-STUB (Assembler, naked)   syscall_entry
+--------------------------------------------------------------------------------
+
+Ablauf (gekürzt, vollständig im Quelltext):
+
+    swapgs                     ; GS.base -> PerCpu
+    mov gs:[8], rsp            ; User-RSP sichern
+    mov rsp, gs:[0]            ; auf Kernel-Stack umschalten
+    push r11/rcx/rax/rdi/      ; Register in der Reihenfolge von SyscallFrame
+         rsi/rdx/r10/r8/r9     ; ablegen
+    mov rdi, rsp              ; &SyscallFrame als 1. C-Argument
+    sub rsp, 8               ; auf 16 Byte ausrichten (ABI für "call")
+    call dispatch            ; Rust-Dispatcher
+    add rsp, 8
+    pop ... (umgekehrt)      ; Register zurück, rax = Rückgabewert
+    mov rsp, gs:[8]          ; User-RSP zurück
+    swapgs
+    sysretq                  ; zurück nach Ring 3
+
+  SyscallFrame ist ein #[repr(C)]-Struct, dessen Feldreihenfolge GENAU der
+  push/pop-Reihenfolge entspricht. Der Rust-Teil:
+
+    dispatch(frame) {
+        frame.rax = crate::syscall::dispatch(frame.rax,
+                        [rdi, rsi, rdx, r10, r8, r9]);
+    }
+
+  Die Alignment-Korrektur (sub/add rsp, 8) ist nötig, weil 9 Pushes den Stack
+  auf %16==8 bringen, "call" aber %16==0 erwartet.
+
+
+--------------------------------------------------------------------------------
+SCHRITT D — DER DISPATCHER   (kernel/src/syscall.rs)
+--------------------------------------------------------------------------------
+
+Architektur-unabhängig. Aktuell ein Mini-Satz (Zielmodell: Cap-Invocation):
+
+    SYS_DEBUG = 1   -> druckt args[0] auf Serial, gibt 0 zurück
+    SYS_EXIT  = 2   -> beendet das User-Programm (im boot-test: QEMU-Exit)
+    sonst           -> "unknown", gibt u64::MAX zurück
+
+  Die Trennung ist Absicht: arch/.../syscall.rs kümmert sich um die HARDWARE
+  (Instruktion, Stack, Register), kernel/src/syscall.rs um die BEDEUTUNG der
+  Syscalls. Letzteres ist portabel.
+
+
+--------------------------------------------------------------------------------
+BEKANNTE VEREINFACHUNGEN (FÜR SPÄTER EHRLICH NOTIERT)
+--------------------------------------------------------------------------------
+
+  - Eine CPU. Der PerCpu-Scratch ist global; für SMP braucht es echte
+    Per-CPU-Bereiche.
+  - Der klassische "swapgs-Race" (Interrupt exakt an der Ring-Grenze) ist hier
+    nicht abgesichert — für den kontrollierten Ein-Prozess-Test unkritisch.
+  - Es werden nur die für sysretq nötigen Register (rcx/r11) plus die Arg-/
+    Rückgaberegister behandelt; ein vollständiger Kontext (für Preemption von
+    User-Threads) kommt mit dem User-Scheduler.

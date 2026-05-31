@@ -1,0 +1,108 @@
+================================================================================
+0.5.1 — DAS ERSTE ECHTE USER-PROGRAMM: "init"
+================================================================================
+
+Ziel dieses Schritts:
+  Ein eigenständiges, kompilierbares User-Programm anlegen — getrennt vom
+  Kernel, mit eigenem Build-Target und Linker-Script.
+
+
+--------------------------------------------------------------------------------
+DIE CRATE   (userland/init/)
+--------------------------------------------------------------------------------
+
+  Cargo.toml     ein no_std-Binary namens "init", keine Abhängigkeiten.
+                 Zum Workspace hinzugefügt (Xernel/Cargo.toml members).
+  src/main.rs    das Programm.
+  linker.ld      das Linker-Script (siehe unten).
+
+src/main.rs — das Programm (sinngemäß):
+
+    #![no_std]
+    #![no_main]
+
+    const SYS_DEBUG: u64 = 1;
+    const SYS_EXIT:  u64 = 2;
+
+    fn syscall1(nr, arg1) -> u64 {
+        asm!("syscall",
+             inlateout("rax") nr => ret,
+             in("rdi") arg1,
+             lateout("rcx") _, lateout("r11") _,   // syscall zerstört rcx/r11
+             options(nostack));
+        ret
+    }
+
+    #[no_mangle] pub extern "C" fn _start() -> ! {
+        syscall1(SYS_DEBUG, 0x1111);
+        syscall1(SYS_DEBUG, 0x2222);
+        syscall1(SYS_EXIT, 0);
+        loop { spin_loop() }   // Sicherheitsnetz; SYS_EXIT kehrt nie zurück
+    }
+
+    #[panic_handler] fn panic(_) -> ! { loop { spin_loop() } }
+
+  Zwei verschiedene Debug-Werte (0x1111/0x2222) machen sichtbar, dass das
+  KOMPILIERTE Programm läuft und zwischen den Syscalls in den User-Mode
+  zurückkehrt.
+
+
+--------------------------------------------------------------------------------
+DAS USER-TARGET   (targets/x86_64-xernel-user.json)
+--------------------------------------------------------------------------------
+
+  Wie das Kernel-Target, aber für ein User-Programm im NIEDRIGEN Adressbereich:
+    - code-model: "small"        (nicht "kernel" — wir liegen bei 0x400000)
+    - relocation-model: "static" (keine Relocations -> Loader kann simpel mappen)
+    - position-independent-executables: false
+    - soft-float / kein SSE (keine FPU-Einrichtung im Mini-Programm nötig)
+
+  ZWEI STOLPERSTEINE beim Anlegen des Targets (beide gegen das Kernel-Target
+  abgeglichen):
+    1. target-pointer-width / target-c-int-width müssen ZAHLEN sein (64, 32),
+       nicht Strings ("64") — sonst:
+         error: target-pointer-width: invalid type: string "64", expected u16
+    2. data-layout muss EXAKT dem LLVM-Default für x86_64-unknown-none
+       entsprechen, inklusive "i128:128" — sonst:
+         error: data-layout differs from LLVM target's default layout
+       Den korrekten String nennt der Compiler in der Fehlermeldung; er wurde
+       1:1 übernommen.
+
+
+--------------------------------------------------------------------------------
+DAS LINKER-SCRIPT   (userland/init/linker.ld)
+--------------------------------------------------------------------------------
+
+    ENTRY(_start)
+    SECTIONS {
+        . = 0x400000;                 // fester Basis-Adresse (low half)
+        .text   : { *(.text .text.*) }
+        . = ALIGN(0x1000); .rodata : { *(.rodata .rodata.*) }
+        . = ALIGN(0x1000); .data   : { *(.data .data.*) }
+        .bss    : { *(COMMON) *(.bss .bss.*) }
+        /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
+    }
+
+  WARUM fest bei 0x400000 + statisch? Dann muss der Kernel-Loader nichts
+  relozieren — er mappt jedes Segment einfach an seine p_vaddr.
+  WARUM ALIGN(0x1000) zwischen den Sektionen? Damit das ausführbare (RX) und das
+  beschreibbare (RW) Segment nie dieselbe Page teilen — das hält das W^X-Mapping
+  im Loader einfach (eine Page ist entweder ausführbar ODER schreibbar).
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION (NUR DER BUILD)
+--------------------------------------------------------------------------------
+
+  Mit dem Linker-Script via RUSTFLAGS gebaut:
+    RUSTFLAGS="-C link-arg=-T.../userland/init/linker.ld" \
+      cargo build -p init --target targets/x86_64-xernel-user.json \
+        -Z json-target-spec -Z build-std=core,compiler_builtins ...
+
+  Prüfung mit llvm-readobj:
+    Type:  Executable
+    Entry: 0x400000                 <- wie vom Linker-Script vorgegeben
+    ein PT_LOAD-Segment, Flags R+X, page-aligned
+
+  (Das eigentliche Ausführen passiert erst, wenn der Kernel-Loader steht —
+  siehe 0.5.2.)

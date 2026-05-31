@@ -1,0 +1,16 @@
+[package]
+name = "virtio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "virtio-blk / virtio-net / virtio-gpu drivers (phase 4) — first hardware in user space"
+
+[[bin]]
+name = "virtio"
+path = "src/main.rs"
+
+[dependencies]
+xabi    = { path = "../../libs/xabi" }
+xstd    = { path = "../../libs/xstd" }
+xdriver = { path = "../../libs/xdriver" }

@@ -1,0 +1,133 @@
+================================================================================
+0.5.2 — VOM MODUL ZUM LAUFENDEN PROGRAMM: ELF-LOADER
+================================================================================
+
+Ziel dieses Schritts:
+  Die kompilierte init-ELF (aus 0.5.1) beim Boot mitliefern, im Kernel finden,
+  parsen und nach Ring 3 laden.
+
+
+--------------------------------------------------------------------------------
+SCHRITT A — init ALS LIMINE-MODUL INS ISO   (xtask + limine.cfg)
+--------------------------------------------------------------------------------
+
+Limine kann neben dem Kernel beliebige "Module" (Dateien) in den Speicher laden
+und dem Kernel deren Adresse/Größe mitteilen. Das nutzen wir, um init
+mitzuliefern — ohne es in den Kernel einzukompilieren.
+
+  boot/limine.cfg — eine Zeile ergänzt:
+        MODULE_PATH=boot:///boot/init.elf
+
+  xtask (build_init):
+    - baut init gegen das User-Target, das Linker-Script via RUSTFLAGS
+      (-C link-arg=-T<absoluter Pfad>) — absoluter Pfad, damit es unabhängig
+      vom Arbeitsverzeichnis eindeutig ist.
+    - build-std=core,compiler_builtins (kein alloc nötig).
+  xtask (build_iso):
+    - kopiert die init-ELF zusätzlich nach iso_root/boot/init.elf.
+
+  So landet init.elf neben xernel.elf im ISO, und Limine lädt es beim Boot:
+        limine: Loading module `boot:///boot/init.elf`...
+
+
+--------------------------------------------------------------------------------
+SCHRITT B — DAS MODUL IM KERNEL FINDEN   (arch/x86_64/mod.rs)
+--------------------------------------------------------------------------------
+
+  Neue Limine-Anfrage:
+        static MODULES: ModulesRequest = ModulesRequest::new();
+
+  Neue HAL-Funktion:
+        arch::init_module() -> Option<&'static [u8]>
+            sucht unter den geladenen Modulen das mit Pfad-Endung "init.elf"
+            (sonst das erste) und liefert dessen Bytes (File::data()).
+
+  Die Modul-Bytes liegen bereits im Speicher (Limine hat sie geladen) und sind
+  über die HHDM erreichbar — der Kernel muss nichts von Platte lesen.
+
+
+--------------------------------------------------------------------------------
+SCHRITT C — DER ELF-LOADER   (kernel/src/elf.rs)
+--------------------------------------------------------------------------------
+
+Ein bewusst MINIMALER ELF64-Loader — genau so viel, wie init braucht:
+
+  elf::load(image: &[u8]) -> Result<u64 /*entry*/, ElfError>
+
+  Ablauf:
+    1. Header prüfen: Magic "\x7fELF", ELFCLASS64 (64-bit), ELFDATA2LSB
+       (little-endian).
+    2. e_entry, e_phoff, e_phentsize, e_phnum aus dem Header lesen.
+    3. Über alle Program-Header iterieren; nur PT_LOAD (Typ 1) interessiert.
+    4. Für jedes PT_LOAD-Segment load_segment() aufrufen.
+    5. e_entry zurückgeben.
+
+  Alle Felder werden mit expliziten Little-Endian-Byte-Reads gelesen
+  (from_le_bytes) — keine Alignment-Annahmen über das Modul-Image, kein casten
+  von Structs.
+
+  load_segment(image, p_offset, p_vaddr, p_filesz, p_memsz, p_flags):
+    - Rechte aus p_flags: PF_W -> writable, PF_X -> executable.
+    - Seite für Seite über [p_vaddr, p_vaddr+p_memsz):
+        * frame::alloc() holt eine physische Page,
+        * die ganze Page über die HHDM mit 0 füllen (deckt den .bss-Schwanz ab),
+        * den Teil der Datei-Bytes, der in diese Page fällt, hineinkopieren
+          (ebenfalls über die HHDM — geht unabhängig von den späteren
+          User-Rechten der Page),
+        * arch::map_user(page, frame, writable, executable) mappt die Page mit
+          USER_ACCESSIBLE und W^X.
+    - Bytes jenseits p_filesz bleiben 0 (das ist das .bss-Verhalten).
+
+  WARUM über die HHDM schreiben statt über die User-Mapping-Adresse? Weil das
+  Code-Segment user-RO gemappt wird — der Kernel könnte da nicht hineinschreiben.
+  Über pa+hhdm_offset hat der Kernel immer Schreibzugriff auf die rohe Page.
+
+
+--------------------------------------------------------------------------------
+SCHRITT D — LADEN UND STARTEN   (kernel/src/user.rs)
+--------------------------------------------------------------------------------
+
+  user::run():
+    1. arch::init_syscalls()                       (MSRs, aus Phase 0.4)
+    2. module = arch::init_module()                Modul-Bytes holen
+    3. entry  = elf::load(module)                  Segmente nach Ring 3 mappen
+    4. User-Stack-Frame allokieren + map_user(...) (RW, NX)
+    5. arch::enter_user(entry, stack_top)          sysretq nach Ring 3
+
+  Der frühere Byte-Blob ist damit ersetzt.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — DER BEWEIS
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test     (und cargo xtask run)
+
+    limine: Loading module `boot:///boot/init.elf`...
+    [xernel] init module: 1617136 bytes
+    [xernel] entering ring 3: entry=0x400000
+    [user] syscall SYS_DEBUG: 0x1111
+    [user] syscall SYS_DEBUG: 0x2222
+    [user] exit(0)
+    xtask: boot-test PASSED
+
+  Jede Zeile beweist einen Teil:
+    - "Loading module" : Limine hat init.elf geladen.
+    - "init module: N bytes" : der Kernel hat das Modul gefunden und sieht es.
+    - "entering ring 3: entry=0x400000" : die ELF wurde geparst, der Entrypoint
+      stimmt mit dem Linker-Script überein, die Segmente sind gemappt.
+    - "SYS_DEBUG 0x1111 / 0x2222" : das KOMPILIERTE Programm läuft in Ring 3 und
+      ruft den Kernel — mit den Werten aus seiner Quelle, nicht aus dem Kernel.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN IN DIESER PHASE (0.5)
+--------------------------------------------------------------------------------
+
+  userland/init/{Cargo.toml,src/main.rs,linker.ld}   das Programm
+  targets/x86_64-xernel-user.json                    das User-Build-Target
+  boot/limine.cfg                                     MODULE_PATH-Zeile
+  xtask/src/main.rs                                   build_init + ISO-Einbau
+  kernel/src/arch/x86_64/mod.rs                       ModulesRequest, init_module
+  kernel/src/elf.rs                                   der ELF-Loader (NEU)
+  kernel/src/user.rs                                  lädt jetzt die ELF

@@ -1,0 +1,113 @@
+================================================================================
+0.10 — FRAMEBUFFER: GRAFIK FÜR DEN USER-SPACE
+================================================================================
+
+Zeitraum:      2026-05-31
+Auslöser:      XOS-Wunschliste — Framebuffer-Zugriff für eine echte GUI.
+Ergebnis:      Ein User-Programm kann den Bildschirm-Framebuffer per Syscall
+               anfordern und direkt Pixel schreiben. Verifiziert mit einem
+               1280x800-Farbverlauf, von einem Ring-3-Programm gezeichnet und
+               per QEMU-Screenshot bestätigt.
+
+Das ist der Sprung von "nur Text über Serial" zu echter Grafik.
+
+
+--------------------------------------------------------------------------------
+DAS PROBLEM
+--------------------------------------------------------------------------------
+
+Limine richtet einen linearen Framebuffer ein und mappt ihn in die OBERE
+Speicherhälfte (kernel-only). Ring 3 darf da nicht zugreifen. Damit ein
+User-Programm zeichnen kann, muss der Kernel dieselben physischen Pages auch in
+die UNTERE (User-)Hälfte mappen.
+
+
+--------------------------------------------------------------------------------
+DIE KERNEL-SEITE   (kernel/src/arch/x86_64/framebuffer.rs)
+--------------------------------------------------------------------------------
+
+  - FramebufferRequest (Limine) holt Adresse, Breite, Höhe, Pitch, bpp.
+  - Limine gibt eine HHDM-virtuelle Adresse; physisch = virt - hhdm_offset.
+  - Auf erste Anfrage (lazy, Once) werden alle abgedeckten physischen Pages in
+    den User-Bereich gemappt: feste virtuelle Basis FB_USER_VA = 0x3000_0000
+    (768 MiB, klar von Code/Stack/Heap), UNCACHED + user + RW + NX
+    (paging::map_user_device — Device-Memory, damit Schreibzugriffe das
+    Scanout erreichen).
+  - Rückgabe: [user_addr, width, height, pitch, bpp].
+
+  Neue Paging-Funktion: map_user_device(virt, phys)
+    PRESENT | USER_ACCESSIBLE | WRITABLE | NO_CACHE | WRITE_THROUGH | NO_EXECUTE
+
+
+--------------------------------------------------------------------------------
+DER SYSCALL   (SYS_FB_INFO = 9)
+--------------------------------------------------------------------------------
+
+  Arg 0 : Zeiger auf ein [u64; 5] im User-Speicher.
+  Wirkung: mappt den Framebuffer (einmalig) und schreibt
+           [addr, width, height, pitch, bpp] in den Puffer.
+  Rückgabe: 0 ok, u64::MAX wenn kein Framebuffer / Puffer ungültig.
+
+  Userland-Wrapper:
+    fn fb_info(out: &mut [u64; 5]) -> u64 {
+        syscall3(9, out.as_mut_ptr() as u64, 0, 0)
+    }
+
+  Pixel zeichnen (32 bpp, 0x00RRGGBB):
+    let stride = pitch / 4;                  // Pixel pro Zeile
+    let fb = addr as *mut u32;
+    *fb.add(y * stride + x) = (r << 16) | (g << 8) | b;
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — VISUELL
+--------------------------------------------------------------------------------
+
+init (userland/init) ruft nach Banner/Heap-Check fb_demo():
+  - SYS_FB_INFO holen,
+  - über den ganzen Schirm einen Farbverlauf zeichnen
+    (rot = x-Anteil, grün = y-Anteil, blau konstant),
+  - "fb: 1280x800 ok" drucken.
+
+Automatisch (boot-test):
+    fb        : 1280x800 ok
+    xtask: boot-test PASSED
+
+Visuell: QEMU mit -monitor unix:socket starten, nach "halting" im Serial-Log
+einen Screenshot ziehen:
+    printf 'screendump /tmp/fb.png -f png\n' | nc -U /tmp/fbmon
+-> Das PNG zeigt den erwarteten Farbverlauf über die volle Auflösung. Ein
+Ring-3-Programm hat also wirklich auf den Bildschirm gezeichnet.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/framebuffer.rs   NEU: Limine-FB, User-Mapping, Geometrie
+  kernel/src/arch/x86_64/paging.rs        map_user_device (user + uncached)
+  kernel/src/arch/x86_64/mod.rs           framebuffer::info; framebuffer_info()
+  kernel/src/syscall.rs                   SYS_FB_INFO=9, sys_fb_info
+  userland/init/src/main.rs               fb_demo (Verlauf zeichnen)
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG
+--------------------------------------------------------------------------------
+
+  - Annahme 32 bpp im Demo (Limine liefert auf QEMU 32 bpp). Echte Programme
+    sollten bpp/Pitch aus SYS_FB_INFO lesen.
+  - Mapping ist uncached — korrekt, aber langsam beim pixelweisen Schreiben.
+    Write-Combining (statt uncached) wäre die spätere Performance-Optimierung.
+  - Kein Double-Buffering, kein Maus-Input, keine Fenster — das ist die rohe
+    Pixel-Fläche. Alles Weitere (GUI-Toolkit) baut das Userland darauf.
+
+Damit ist Geminis Framebuffer/GUI-Wunsch auf Kernel-Seite erfüllt.
+
+
+--------------------------------------------------------------------------------
+SYSCALL-ABI NACH 0.10
+--------------------------------------------------------------------------------
+
+  1 WRITE   2 EXIT     3 DEBUG   4 GET_TICKS   5 SYSINFO
+  6 READ    7 READ_NB  8 SBRK    9 FB_INFO [NEU]

@@ -1,0 +1,15 @@
+[package]
+name = "pm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Process Manager — spawns, supervises, and hot-restarts user processes"
+
+[[bin]]
+name = "pm"
+path = "src/main.rs"
+
+[dependencies]
+xabi = { path = "../../libs/xabi" }
+xstd = { path = "../../libs/xstd" }

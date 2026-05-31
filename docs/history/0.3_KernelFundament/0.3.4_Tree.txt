@@ -1,0 +1,148 @@
+================================================================================
+0.3.4 — VERZEICHNISBAUM NACH PHASE 0.3 (KERNEL-FUNDAMENT)
+================================================================================
+
+Snapshot des Repos nach Abschluss von Phase 0 + Phase 1 + Meilenstein 2.0.
+Erzeugt mit:  tree -I 'target|limine|.git' Xernel docs
+(target/, boot/limine/ und .git/ sind ausgeblendet — Build-Artefakte bzw.
+heruntergeladene Bootloader-Binaries.)
+
+NEU gegenüber 0.2.2_Tree.txt (dem Scaffold-Snapshot):
+  kernel/src/arch/x86_64/context.rs   Context-Switch (naked asm)
+  kernel/src/arch/x86_64/qemu.rs      isa-debug-exit (Boot-Test)
+  kernel/src/mm/frame.rs              physischer Frame-Allocator
+  kernel/src/mm/paging.rs             (Platzhalter; aktiver Code in arch/.../paging.rs)
+  kernel/src/demo.rs                  Zwei-Thread-IPC-Demo (Meilenstein 2.0)
+  apic.rs / gdt.rs / idt.rs / paging.rs in arch/x86_64/ sind jetzt ECHT
+    implementiert (im Scaffold waren es leere Platzhalter).
+
+--------------------------------------------------------------------------------
+
+Xernel
+├── Cargo.lock
+├── Cargo.toml
+├── README.md
+├── boot
+│   ├── README.md
+│   └── limine.cfg
+├── drivers
+│   └── virtio
+│       ├── Cargo.toml
+│       └── src
+│           └── main.rs
+├── kernel
+│   ├── Cargo.toml
+│   ├── linker-x86_64.ld
+│   └── src
+│       ├── arch
+│       │   ├── aarch64
+│       │   │   └── mod.rs
+│       │   ├── mod.rs
+│       │   ├── riscv64
+│       │   │   └── mod.rs
+│       │   └── x86_64
+│       │       ├── apic.rs
+│       │       ├── context.rs
+│       │       ├── gdt.rs
+│       │       ├── idt.rs
+│       │       ├── mod.rs
+│       │       ├── paging.rs
+│       │       ├── qemu.rs
+│       │       └── serial.rs
+│       ├── cap.rs
+│       ├── demo.rs
+│       ├── ipc.rs
+│       ├── main.rs
+│       ├── mm
+│       │   ├── frame.rs
+│       │   └── paging.rs
+│       ├── mm.rs
+│       ├── panic.rs
+│       ├── sched.rs
+│       ├── serial.rs
+│       └── syscall.rs
+├── libs
+│   ├── xabi
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       ├── cap.rs
+│   │       ├── errno.rs
+│   │       ├── lib.rs
+│   │       └── syscall.rs
+│   ├── xdriver
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── lib.rs
+│   ├── xlibc
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── lib.rs
+│   └── xstd
+│       ├── Cargo.toml
+│       └── src
+│           └── lib.rs
+├── rust-toolchain.toml
+├── servers
+│   ├── disp
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── main.rs
+│   ├── netstack
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── main.rs
+│   ├── pm
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── main.rs
+│   ├── rootserver
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── main.rs
+│   └── vfs
+│       ├── Cargo.toml
+│       └── src
+│           └── main.rs
+├── targets
+│   └── x86_64-xernel.json
+├── tests
+│   └── README.md
+├── userland
+│   └── xsh
+│       ├── Cargo.toml
+│       └── src
+│           └── main.rs
+└── xtask
+    ├── Cargo.toml
+    └── src
+        └── main.rs
+docs
+├── README.md
+├── book
+│   ├── book.toml
+│   └── src
+│       ├── SUMMARY.md
+│       ├── intro.md
+│       ├── layout.md
+│       ├── phase-0.md
+│       └── vision.md
+├── design
+│   ├── 0001-architecture-decisions.md
+│   └── README.md
+└── history
+    ├── 0.0_Recherche
+    │   ├── 0.0.1_BesterKernel.png
+    │   └── 0.0.1_Gemini.txt
+    ├── 0.1_KernelPlanen
+    │   ├── 0.1.1_XernelPlanen.png
+    │   ├── 0.1.2_Xernel_Konzept_v0.1.md
+    │   └── 0.1.3_ClaudeCodeLisstSicheEin.png
+    ├── 0.2_AnfangDesCodens
+    │   ├── 0.2.1_ClaudeCodeBeginnt.png
+    │   └── 0.2.2_Tree.txt
+    └── 0.3_KernelFundament
+        ├── 0.3.0_Uebersicht.txt
+        ├── 0.3.1_Phase0_Boot.txt
+        ├── 0.3.2_Phase1_SpeicherUndInterrupts.txt
+        ├── 0.3.3_Meilenstein2_SchedulerUndIPC.txt
+        └── 0.3.4_Tree.txt
