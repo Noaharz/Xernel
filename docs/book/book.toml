@@ -1,0 +1,12 @@
+[book]
+title = "The Xernel Book"
+authors = ["Noah"]
+language = "de"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = ""
+edit-url-template = ""

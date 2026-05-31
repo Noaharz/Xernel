@@ -1,0 +1,79 @@
+================================================================================
+0.7 — TASTATUR-INPUT: XERNEL WIRD INTERAKTIV
+================================================================================
+
+Zeitraum:      2026-05-29
+Ausgangspunkt: Phase 0.6 — ein User-Programm konnte Text ausgeben und den
+               Systemzustand abfragen, aber NICHTS einlesen. Reines Ausgabe-OS.
+Ergebnis:      Ein PS/2-Tastatur-Treiber (IRQ 1 über die IO-APIC) plus ein
+               blockierender SYS_READ-Syscall. Ein User-Programm kann jetzt
+               Tasteneingaben lesen — damit ist ein INTERAKTIVES OS möglich
+               (echter Prompt / Shell statt nur Ausgabe).
+
+WARUM DIESER SCHRITT:
+  Ohne Eingabe ist ein "OS" nur ein Anzeige-Programm. Mit Tastatur-Input kann
+  ein Programm auf den Nutzer reagieren — die Grundlage für eine Shell, Menüs,
+  Editoren. Das war der größte fehlende Baustein für ein erstes echtes OS.
+
+
+--------------------------------------------------------------------------------
+DIE SCHRITTE DIESER PHASE
+--------------------------------------------------------------------------------
+
+  0.7.1_PS2_Keyboard_und_SysRead.txt
+      Der PS/2-Treiber (IO-APIC-Routing, IRQ-Handler, Scancode-Übersetzung,
+      Ring-Puffer, blockierendes Lesen) und der SYS_READ-Syscall.
+
+
+--------------------------------------------------------------------------------
+DIE ERWEITERTE SYSCALL-ABI
+--------------------------------------------------------------------------------
+
+  Neu hinzugekommen (additiv, ändert nichts Bestehendes):
+
+    nr  Name       Argumente      Rückgabe              Wirkung
+    --  ---------  -------------  --------------------  ------------------------
+     6  SYS_READ   fd, ptr, len   #bytes (oder u64::MAX) blockiert, bis mind. 1
+                                                         Byte da ist; füllt den
+                                                         User-Puffer mit
+                                                         Tastatureingabe.
+
+  Damit umfasst die ABI jetzt: WRITE(1), EXIT(2), DEBUG(3), GET_TICKS(4),
+  SYSINFO(5), READ(6). Die Referenz in 0.6.1_SyscallABI.txt gilt weiter, ergänzt
+  um SYS_READ.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+    [xernel] cap: self-test ok
+    [xernel] kbd: self-test ok          <- Scancode-Decode + Ring-Puffer + Lesen
+    ...
+    xtask: boot-test PASSED
+
+  Hinweis zur Verifikation: Echte Tastendrücke lassen sich im headless
+  Boot-Test nicht einspeisen. Deshalb prüft ein In-Kernel-Selbsttest die
+  Decode-/Puffer-/Lese-Logik mit synthetischen Scancodes ("hi\n"). Die echte
+  IRQ-Zustellung (IO-APIC -> LAPIC -> Handler) wird beim interaktiven Lauf
+  bestätigt, wenn man im QEMU-Fenster tippt.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG — GRENZEN
+--------------------------------------------------------------------------------
+
+  - US-Layout, NUR Kleinbuchstaben. Kein Shift/Caps/Ctrl/Alt. Enter='\n',
+    Backspace=0x08, Tab='\t', Space, Ziffern, Satzzeichen.
+  - Eingabe kommt über das QEMU-GRAFIKFENSTER (PS/2), nicht über die serielle
+    Konsole. Beim interaktiven Lauf also ins QEMU-Fenster tippen.
+  - IO-APIC-Basis ist auf 0xFEC00000 hartkodiert (Standard auf QEMU q35); ein
+    echter ACPI-MADT-Parse käme später.
+  - SYS_READ blockiert (sti; hlt) bis Eingabe da ist; es gibt nur einen Prozess,
+    also blockiert das ganze System währenddessen — für ein Single-Prozess-OS ok.
+
+  Das init-Demo-Programm (userland/init) bleibt bewusst nicht-interaktiv
+  (Banner + Info + Exit), damit der automatische Boot-Test nicht auf Eingabe
+  wartet. SYS_READ ist für das eigentliche OS-Programm gedacht.

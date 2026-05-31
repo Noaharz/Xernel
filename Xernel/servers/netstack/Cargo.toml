@@ -1,0 +1,15 @@
+[package]
+name = "netstack"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "User-space network stack (smoltcp-based) — phase 5"
+
+[[bin]]
+name = "netstack"
+path = "src/main.rs"
+
+[dependencies]
+xabi = { path = "../../libs/xabi" }
+xstd = { path = "../../libs/xstd" }

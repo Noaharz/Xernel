@@ -1,0 +1,81 @@
+================================================================================
+0.6 — ERSTES OS: EINE BRAUCHBARE SYSCALL-ABI
+================================================================================
+
+Zeitraum:      2026-05-29
+Ausgangspunkt: Phase 0.5 — ein kompiliertes ELF-Programm lief in Ring 3, konnte
+               aber nur eine Zahl per SYS_DEBUG ausgeben und sich beenden.
+Ergebnis:      Eine brauchbare Syscall-ABI: das User-Programm kann jetzt echten
+               TEXT ausgeben, System-Infos (RAM, Uptime) abfragen und sich
+               beenden. Damit lässt sich ein erstes, eigenständiges OS-Programm
+               auf Xernel bauen. Das mitgelieferte init demonstriert es mit
+               Boot-Banner + Systemanzeige.
+
+WARUM DIESER SCHRITT:
+  Eine Zahl in einem Register auszugeben ist kein OS. Sobald ein Programm
+  beliebigen Text drucken und den Systemzustand abfragen kann, ist es ein
+  Programm, das sich wie ein OS anfühlt — und das war das Ziel: "ein erstes OS
+  drauf bauen können".
+
+
+--------------------------------------------------------------------------------
+DIE SCHRITTE DIESER PHASE
+--------------------------------------------------------------------------------
+
+  0.6.1_SyscallABI.txt
+      Die neue Syscall-ABI im Detail (SYS_WRITE/EXIT/DEBUG/GET_TICKS/SYSINFO),
+      User-Pointer-Validierung. DIES IST DIE REFERENZ FÜR USERLAND-PROGRAMME.
+
+  0.6.2_DemoOS_und_Stack.txt
+      Der größere User-Stack und das init-Demo-OS (Banner + Systeminfo).
+
+
+--------------------------------------------------------------------------------
+WAS AM ENDE DIESER PHASE NACHWEISBAR FUNKTIONIERT
+--------------------------------------------------------------------------------
+
+    cd Xernel
+    cargo xtask run
+
+    limine: Loading module `boot:///boot/init.elf`...
+    [xernel] entering ring 3: entry=0x400010
+
+      __  __                    _
+     |  \/  | ___ _ __ _ __  ___| |
+     | |\/| |/ _ \ '__| '_ \/ -_) |   Xernel OS
+     |_|  |_|\___/_|  |_| |_\___|_|   first userland
+
+     RAM total : 497 MiB
+     RAM used  : 124 KiB
+     uptime    : 5 ticks
+
+     booted successfully. halting userland.
+
+Jede Textzeile kommt aus dem User-Programm via SYS_WRITE; die Zahlen stammen
+aus echten SYS_SYSINFO/SYS_GET_TICKS-Aufrufen an den Kernel.
+
+
+--------------------------------------------------------------------------------
+GEÄNDERTE DATEIEN (KEINE NEUEN DATEIEN)
+--------------------------------------------------------------------------------
+
+  kernel/src/syscall.rs        neue ABI: WRITE/EXIT/DEBUG/GET_TICKS/SYSINFO
+  kernel/src/user.rs           User-Stack von 4 KiB auf 64 KiB (16 Pages)
+  userland/init/src/main.rs    Mini-OS: Banner + Systeminfo statt Zahl-Blink
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG — WAS NOCH FEHLT
+--------------------------------------------------------------------------------
+
+  - KEIN Input. Es gibt noch keinen Tastatur-Treiber, also kein interaktiver
+    Prompt. Ein "erstes OS" ist hier ausgabe-/zustandsgetrieben (Boot-Sequenz,
+    Dashboards, Animationen über die Uptime-Ticks).
+  - KEIN dynamischer Speicher für das User-Programm (kein malloc-Syscall). Es
+    muss mit festen Puffern / statischem Speicher auskommen (no_std, kein alloc).
+  - Nur EIN Prozess, ein Adressraum. Mehrere Prozesse + Trennung kommen später.
+  - Die Syscalls sind weiter ein fixer Satz (noch nicht capability-gebunden).
+
+Diese ABI ist der STABILE VERTRAG, gegen den ein erstes Userland-OS gebaut
+werden kann. Erweiterungen (Input, mehr Infos) kommen additiv mit neuen
+Syscall-Nummern.

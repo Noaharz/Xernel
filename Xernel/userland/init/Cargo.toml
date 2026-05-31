@@ -1,0 +1,13 @@
+[package]
+name = "init"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Xernel's first user-space program — loaded as a Limine module, run in ring 3"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+test = false
+bench = false

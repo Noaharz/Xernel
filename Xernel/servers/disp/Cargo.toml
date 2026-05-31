@@ -1,0 +1,15 @@
+[package]
+name = "disp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Display server — abstract enough for framebuffer, GPU, and AR-headset outputs"
+
+[[bin]]
+name = "disp"
+path = "src/main.rs"
+
+[dependencies]
+xabi = { path = "../../libs/xabi" }
+xstd = { path = "../../libs/xstd" }

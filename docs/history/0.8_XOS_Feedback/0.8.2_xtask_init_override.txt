@@ -1,0 +1,62 @@
+================================================================================
+0.8.2 — EXTERNE USERLAND-ELF BOOTEN OHNE KERNEL-EINGRIFF (xtask --init)
+================================================================================
+
+Ziel: XOS (in seinem eigenen Ordner) booten, ohne eine
+einzige Datei im Xernel-Baum anzufassen — die saubere Plattform/Software-Trennung
+in der Praxis.
+
+
+--------------------------------------------------------------------------------
+DER SCHALTER   (xtask/src/main.rs)
+--------------------------------------------------------------------------------
+
+  cargo xtask run  --init <PFAD-ZU-ELF>
+  cargo xtask iso  --init <PFAD-ZU-ELF>
+
+  Mit --init nimmt der xtask die angegebene externe ELF als init.elf-Boot-Modul,
+  statt userland/init zu bauen. Ohne --init bleibt alles wie gehabt (baut das
+  mitgelieferte init).
+
+  Implementierung: build_iso bekommt ein Option<&Path> "init_override".
+    Some(pfad) -> existiert? -> direkt als init.elf ins ISO kopieren.
+    None       -> build_init() wie bisher.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS DIE RICHTIGE TRENNUNG IST
+--------------------------------------------------------------------------------
+
+  - Der Kernel "weiß" nichts von XOS. Er lädt beim Boot eine Datei namens
+    init.elf und führt sie aus — egal woher sie kommt.
+  - XOS entwickelt in seinem eigenen Repo, kompiliert zu einer ELF.
+  - Die einzige Verbindung ist die Syscall-ABI.
+  Genau wie bei echten Betriebssystemen: man baut gegen Syscalls, nicht in den
+  Kernel hinein.
+
+
+--------------------------------------------------------------------------------
+VERIFIZIERTER XOS-BOOT
+--------------------------------------------------------------------------------
+
+  cargo xtask run --init <XOS>/target/x86_64-xernel-user/release/xos-init
+
+    limine: Loading module `boot:///boot/init.elf`...
+    [xernel] init module: 9368 bytes
+    [xernel] entering ring 3: entry=0x400122
+    [2J[H===========================================
+      ... XOS-Banner ...
+              XOS INTERACTIVE SHELL
+    xos> _
+
+  XOS (mit SSE kompiliert) läuft jetzt OHNE #UD (dank 0.8.1) und ohne jeden
+  Kernel-Eingriff. Die Shell startet und wartet auf Eingabe.
+
+
+--------------------------------------------------------------------------------
+FERTIGE ARTEFAKTE IM REPO-ROOT
+--------------------------------------------------------------------------------
+
+  xos.iso            bootbar, XOS als init (interaktive Shell)
+  xernel.iso         bootbar, Demo-init
+  xernel-kernel.elf  reiner SSE-fähiger Release-Kernel

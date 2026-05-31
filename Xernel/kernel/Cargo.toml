@@ -1,0 +1,35 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Xernel — capability-based microkernel"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+limine = "0.6.3"
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
+linked_list_allocator = "0.10"
+xabi = { path = "../libs/xabi" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15", default-features = false, features = [
+    "instructions",
+    "abi_x86_interrupt",
+    "step_trait",
+] }
+uart_16550 = "0.3"
+
+[features]
+default = []
+# Compile-time switch for very verbose serial tracing during early boot.
+verbose-boot = []
+# When set, the kernel runs its in-kernel self-tests and exits QEMU with a
+# pass/fail status instead of idling. Used by `cargo xtask run --test`.
+boot-test = []

@@ -1,0 +1,4 @@
+[alias]
+xtask = "run --package xtask --release --"
+kbuild = "build --package kernel --target targets/x86_64-xernel.json -Z json-target-spec -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem"
+kcheck = "check --package kernel --target targets/x86_64-xernel.json -Z json-target-spec -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem"

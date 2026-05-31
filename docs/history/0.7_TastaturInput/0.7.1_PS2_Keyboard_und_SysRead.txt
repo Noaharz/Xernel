@@ -1,0 +1,137 @@
+================================================================================
+0.7.1 — PS/2-TASTATUR-TREIBER UND SYS_READ
+================================================================================
+
+Ziel dieses Schritts:
+  Tasteneingaben von der Hardware bis ins User-Programm bringen — als
+  durchgehende Kette: Taste -> IRQ -> Kernel-Handler -> Puffer -> SYS_READ.
+
+
+--------------------------------------------------------------------------------
+DER WEG EINER TASTE (ÜBERBLICK)
+--------------------------------------------------------------------------------
+
+  1. Taste gedrückt -> der 8042 PS/2-Controller löst IRQ 1 aus.
+  2. Die IO-APIC leitet IRQ 1 (GSI 1) an einen LAPIC-Interrupt-Vektor weiter.
+  3. Der IDT-Handler liest den rohen Scancode aus Port 0x60.
+  4. Scancode-Set-1-Make-Code -> ASCII (Tabelle), Break-Codes werden ignoriert.
+  5. Das ASCII-Byte landet in einem Ring-Puffer.
+  6. SYS_READ entleert den Ring-Puffer in den User-Puffer (blockierend).
+
+
+--------------------------------------------------------------------------------
+A) IO-APIC-ROUTING   (kernel/src/arch/x86_64/keyboard.rs, init)
+--------------------------------------------------------------------------------
+
+  Bisher war nur der LAPIC aktiv (für den Timer). Geräte-IRQs wie die Tastatur
+  kommen aber über die IO-APIC. Deren MMIO-Fenster liegt auf QEMU q35 (und
+  Standard-PCs) bei physisch 0xFEC00000; wir mappen es uncached
+  (paging::map_mmio) an eine feste virtuelle Adresse.
+
+  Zugriff: Index in IOREGSEL (Offset 0), Daten in IOWIN (Offset 0x10).
+  Für GSI 1 (Tastatur) gibt es zwei Redirection-Register:
+    - High (0x13): Ziel-APIC-ID (hier 0, die Boot-CPU)
+    - Low  (0x12): Vektor 0x21, Fixed Delivery, physisch, edge, aktiv-high,
+                   unmaskiert (alle diese Felder außer dem Vektor sind 0)
+
+  Aufgerufen in arch::enable_interrupts(), nach apic::init() (braucht den
+  Frame-Allocator fürs MMIO-Mapping).
+
+
+--------------------------------------------------------------------------------
+B) IRQ-HANDLER + SCANCODE-ÜBERSETZUNG
+--------------------------------------------------------------------------------
+
+  Im IDT registriert: Vektor 0x21 -> keyboard::irq_handler (in idt::init).
+
+  irq_handler:
+    - liest 1 Byte aus Port 0x60 (den Scancode),
+    - translate(scancode) -> Option<u8> (ASCII),
+    - bei Erfolg ins Ring-Puffer pushen,
+    - apic::eoi() (End-of-Interrupt an den LAPIC; die IRQ kam via IO-APIC,
+      quittiert wird trotzdem am LAPIC).
+
+  translate(): eine Tabelle SC1[0x3A] bildet Scancode-Set-1-Make-Codes auf ASCII
+  ab (US-Layout, lowercase). 0 = keine Zuordnung. Werte >= Tabellenlänge (u.a.
+  alle Break-/Release-Codes >= 0x80) liefern None.
+
+
+--------------------------------------------------------------------------------
+C) RING-PUFFER
+--------------------------------------------------------------------------------
+
+  Ein fester [u8; 256] mit head/tail-Indizes hinter einem spin::Mutex.
+    push(): schreibt, wenn Platz ist (sonst verworfen).
+    pop():  liefert das nächste Byte oder None.
+
+  Der Producer ist der IRQ-Handler, der Consumer ist SYS_READ.
+
+
+--------------------------------------------------------------------------------
+D) BLOCKIERENDES LESEN   (keyboard::read)
+--------------------------------------------------------------------------------
+
+  read(buf) -> Anzahl Bytes:
+    loop {
+      // Puffer leeren — MIT abgeschalteten Interrupts, damit der IRQ-Handler
+      // nicht gegen uns auf dem Puffer-Lock verklemmt (without_interrupts).
+      n = without_interrupts(|| drain BUFFER into buf)
+      if n > 0 { return n }
+      // nichts da: Interrupts an und schlafen legen bis zum nächsten IRQ
+      enable_and_hlt()    // atomar: sti; hlt
+    }
+
+  Warum without_interrupts beim Puffer-Zugriff? Der IRQ-Handler nimmt denselben
+  Lock. Liefe er, während der Consumer den Lock hält, würde er endlos darauf
+  warten (Interrupt-Kontext kann nicht schlafen) -> Deadlock. Mit abgeschalteten
+  Interrupts im kurzen kritischen Abschnitt ist das ausgeschlossen.
+
+  Wichtig: Der Syscall-Eintritt maskiert IF (SFMASK). Deshalb MUSS read() die
+  Interrupts fürs Warten selbst wieder anschalten (enable_and_hlt) — sonst käme
+  nie ein Tastatur-IRQ und read() würde ewig hängen.
+
+
+--------------------------------------------------------------------------------
+E) DER SYSCALL   (kernel/src/syscall.rs)
+--------------------------------------------------------------------------------
+
+  SYS_READ = 6, args: fd, ptr, len.
+    - user_slice_mut(ptr, len) validiert den Zielpuffer (untere Adresshälfte,
+      len <= 1 MiB) und borgt ihn schreibbar,
+    - arch::keyboard_read(buf) füllt ihn (blockierend),
+    - Rückgabe: Anzahl gelesener Bytes (u64::MAX bei ungültigem Puffer).
+
+
+--------------------------------------------------------------------------------
+F) SELBSTTEST   (keyboard::selftest, im Boot-Test)
+--------------------------------------------------------------------------------
+
+  Da headless kein echter Tastendruck möglich ist, schiebt der Selbsttest
+  synthetische Scancodes (0x23,0x17,0x1C) durch dieselbe translate+push-Logik
+  und liest sie nicht-blockierend zurück; erwartet "hi\n". Ausgabe:
+        [xernel] kbd: self-test ok
+
+
+--------------------------------------------------------------------------------
+USERLAND-NUTZUNG (WRAPPER)
+--------------------------------------------------------------------------------
+
+    fn read(buf: &mut [u8]) -> u64 {
+        syscall3(6, 0, buf.as_mut_ptr() as u64, buf.len() as u64)
+    }
+
+  Typische Shell-Schleife: read() in einen Puffer, Zeichen mit write()
+  zurück-echoen, bei '\n' die Zeile auswerten.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/keyboard.rs   NEU: Treiber, IO-APIC, Ring, read, selftest
+  kernel/src/arch/x86_64/mod.rs        keyboard::init in enable_interrupts;
+                                       keyboard_read / keyboard_selftest export
+  kernel/src/arch/x86_64/idt.rs        Vektor 0x21 -> irq_handler
+  kernel/src/arch/x86_64/apic.rs       eoi() öffentlich gemacht
+  kernel/src/syscall.rs                SYS_READ=6, user_slice_mut
+  kernel/src/main.rs                   kbd-Selbsttest im Boot-Test

@@ -1,0 +1,105 @@
+================================================================================
+0.3 — KERNEL-FUNDAMENT: VOM LEEREN SCAFFOLD ZUM BOOTENDEN MIKROKERNEL
+================================================================================
+
+Zeitraum:      2026-05-29
+Ausgangspunkt: das Scaffold aus 0.2_AnfangDesCodens (Verzeichnisse + leere
+               mod-Dateien, hat noch nie gebootet).
+Ergebnis:      Ein Mikrokernel, der real in QEMU bootet, seinen Speicher
+               verwaltet, Interrupts und einen Timer hat und ZWEI KERNEL-THREADS
+               ÜBER IPC KOMMUNIZIEREN lässt — alles per automatisiertem
+               Boot-Test belegt.
+
+Dieses Dokument ist das Inhaltsverzeichnis dieser Phase. Jeder Schritt hat sein
+eigenes Dokument, in dem EXAKT steht, was getan wurde, welcher Code dabei
+entstand, WARUM so entschieden wurde, welche Sackgassen auftraten und wie das
+Ergebnis verifiziert wurde. Wer diese Dokumente von oben nach unten liest, kann
+den Kernel von Null nachbauen.
+
+
+--------------------------------------------------------------------------------
+DIE SCHRITTE DIESER PHASE
+--------------------------------------------------------------------------------
+
+  0.3.1_Phase0_Boot.txt
+      Phase 0 — der Kernel bootet bis "hello, xernel" auf der seriellen
+      Konsole. Automatisierter Boot-Test. Der Limine-Base-Revision-Bug.
+      (Roadmap: Konzept Phase 0)
+
+  0.3.2_Phase1_SpeicherUndInterrupts.txt
+      Phase 1 — GDT/TSS, IDT mit Exception-Handlern, Frame-Allocator, Paging,
+      Kernel-Heap, LAPIC + Timer.
+      (Roadmap: Konzept Phase 1)
+
+  0.3.3_Meilenstein2_SchedulerUndIPC.txt
+      Meilenstein 2.0 — Context-Switch, kooperativer Scheduler, In-Kernel-IPC,
+      Demo mit zwei Threads.
+      (Roadmap: Konzept Meilenstein 2.0)
+
+
+--------------------------------------------------------------------------------
+WAS AM ENDE DIESER PHASE NACHWEISBAR FUNKTIONIERT
+--------------------------------------------------------------------------------
+
+Ein einziger Befehl baut, verpackt und testet den ganzen Kernel:
+
+    cd Xernel            # der Code-Ordner
+    cargo xtask run --test
+
+Erwartete Ausgabe (gekürzt):
+
+    limine: Loading kernel `boot:///boot/xernel.elf`...
+    [xernel] #BP breakpoint at 0xffffffff8000481a
+    [xernel] hello, xernel — arch=x86_64, build=debug
+    [xernel] phys: 501 MiB usable (128481 frames, 3 in use)
+    [xernel] timer: 5 ticks
+    [producer t0] send 1
+    [consumer t1] recv 1 (running sum 1)
+    ...
+    [xernel] ipc demo done: 10 messages, sum 55
+    [xernel] boot-test: ok
+    xtask: boot-test PASSED
+
+
+--------------------------------------------------------------------------------
+DIE BUILD-UMGEBUNG (EINMALIG)
+--------------------------------------------------------------------------------
+
+Diese Phase wurde auf folgendem System gebaut — wichtig, weil HOST UND ZIEL
+SICH UNTERSCHEIDEN (Cross-Compilation):
+
+  Host:      Apple Silicon (aarch64-apple-darwin), macOS (Darwin 23.6)
+  Ziel:      x86_64 Bare-Metal (targets/x86_64-xernel.json, eigenes Target)
+  Toolchain: nightly-2026-05-01, festgenagelt in rust-toolchain.toml,
+             mit den Komponenten rust-src, llvm-tools-preview
+  Werkzeuge: qemu-system-x86_64, xorriso (beide via Homebrew)
+
+Der Custom-Target-Build braucht im verwendeten nightly zwingend das Flag
+"-Z json-target-spec". Es ist in den Cargo-Aliasen (.cargo/config.toml,
+kbuild/kcheck) und im xtask fest verdrahtet — wer ohne xtask baut, muss es
+selbst mitgeben.
+
+
+--------------------------------------------------------------------------------
+BEGRIFFE, DIE IN DEN SCHRITT-DOKUMENTEN IMMER WIEDER AUFTAUCHEN
+--------------------------------------------------------------------------------
+
+Limine
+    Der Bootloader. Er bringt die CPU in den 64-Bit-Long-Mode, lädt unser
+    Kernel-ELF in die obere Speicherhälfte und übergibt an kmain.
+
+HHDM (Higher Half Direct Map)
+    Limine spiegelt den GESAMTEN physischen Speicher an einen festen virtuellen
+    Offset. Dadurch erreichen wir jede physische Adresse "pa" virtuell unter
+    "pa + hhdm_offset". Das ist die Grundlage für unseren Paging-Code.
+
+Boot-Test
+    Build mit dem Cargo-Feature "boot-test". Der Kernel führt dann interne
+    Selbsttests aus und beendet QEMU über das isa-debug-exit-Gerät mit einem
+    Erfolgs-/Fehler-Status, statt ewig zu laufen. So wird "bootet wirklich" zu
+    einem reproduzierbaren Pass/Fail.
+
+HAL (Hardware Abstraction Layer)
+    Der architekturspezifische Teil unter kernel/src/arch/<arch>/. Jede
+    Architektur (x86_64, aarch64, riscv64) bietet dieselbe Funktionssammlung an;
+    generischer Kernel-Code ruft nur über arch::* — nie direkt Assembler.

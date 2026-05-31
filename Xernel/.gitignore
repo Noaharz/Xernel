@@ -1,0 +1,36 @@
+# Cargo
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+*.swp
+*.swo
+
+# Build artifacts
+/build
+/dist
+/iso
+/out
+*.iso
+*.img
+*.bin
+*.elf
+*.o
+*.a
+
+# Logs & dumps
+*.log
+qemu.log
+serial.log
+core.*
+*.dmp
+
+# Local tooling
+/.envrc
+/.direnv

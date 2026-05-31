@@ -1,0 +1,28 @@
+# Repo-Root .gitignore (gilt für den gesamten Push-Baum).
+# Der Code-Unterbaum hat zusätzlich Xernel/.gitignore.
+
+# macOS-Müll
+.DS_Store
+
+# Lokale Tool-Configs / externe Symlinks (gehören nicht ins Repo)
+/.antigravitycli/
+
+# Binär-Artefakte (gebaut, nicht versionieren)
+*.iso
+*.img
+*.bin
+*.elf
+
+# Rust-Build-Output (zusätzlich zu Xernel/.gitignore, zur Sicherheit)
+/Xernel/target/
+
+# Mitgelieferte Bootloader-Binaries — per `cargo xtask fetch-limine` holen,
+# nicht ins Repo (eigenes Git-Repo, große Binärdateien)
+/Xernel/boot/limine/
+
+# Logs & Dumps
+*.log
+qemu.log
+serial.log
+core.*
+*.dmp

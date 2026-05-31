@@ -1,0 +1,147 @@
+================================================================================
+0.3.3 — MEILENSTEIN 2.0: CONTEXT-SWITCH, SCHEDULER UND IPC
+================================================================================
+
+Ziel dieses Schritts (aus dem Konzept, Meilenstein 2.0):
+  "Zwei Kernel-interne Threads tauschen über IPC Nachrichten aus." Das ist der
+  erste Beweis, dass das Mikrokernel-Design trägt: mehrere Ausführungsfäden,
+  echtes Umschalten zwischen ihnen, und Kommunikation dazwischen.
+
+EHRLICHE EINORDNUNG:
+  Das ist die IN-KERNEL-Vorstufe. Es gibt hier noch KEINE Capabilities, KEINEN
+  User-Space und KEINEN Syscall-Übergang. Die FORM (spawn, yield, blockierendes
+  recv) ist aber schon die, die später für echte Endpoint-/Notification-IPC und
+  User-Threads gilt. Es ist ein Sprungbrett, kein Endzustand.
+
+
+--------------------------------------------------------------------------------
+A) CONTEXT-SWITCH   (kernel/src/arch/x86_64/context.rs)
+--------------------------------------------------------------------------------
+
+Das Herzstück. Eine "naked" Assembler-Funktion, die den CPU-Zustand eines
+Threads sichert und den eines anderen wiederherstellt.
+
+    switch(save_rsp: *mut u64, next_rsp: u64)
+
+Ablauf (System-V-Aufrufkonvention, rdi = save_rsp, rsi = next_rsp):
+  1. Die "callee-saved"-Register (rbp, rbx, r12-r15) auf den EIGENEN Stack pushen.
+  2. Den resultierenden Stack-Pointer nach *save_rsp schreiben (Zustand des
+     alten Threads gesichert).
+  3. rsp auf next_rsp setzen (Stack des neuen Threads).
+  4. Dieselben Register vom neuen Stack poppen.
+  5. ret -> springt an die Rücksprungadresse, die auf dem neuen Stack liegt.
+
+WARUM nur callee-saved Register? Weil switch() aus Sicht des Aufrufers ein ganz
+normaler "extern C"-Aufruf ist. Die caller-saved Register sichert der Compiler
+nach Konvention ohnehin selbst.
+
+init_stack(stack, entry):
+  Legt einen FRISCHEN Thread-Stack so an, dass der allererste switch() in ihn
+  hinein bei "entry" zu laufen beginnt. Dafür werden von oben nach unten
+  abgelegt: die Adresse von entry (als Rücksprungadresse für das ret), dann
+  sechs Null-Register (rbp, rbx, r12, r13, r14, r15). Ausrichtung so, dass beim
+  Eintritt rsp % 16 == 8 gilt — genau der Zustand, den ein normales "call"
+  hinterlässt. Der Thread-Einstieg darf NIE zurückkehren (-> ! ).
+
+
+--------------------------------------------------------------------------------
+B) SCHEDULER   (kernel/src/sched.rs)
+--------------------------------------------------------------------------------
+
+Ein KOOPERATIVER Round-Robin-Scheduler. Threads laufen, bis sie selbst
+yield_now() rufen; dann geht die CPU an den nächsten bereiten Thread.
+
+  spawn(entry):
+      Allokiert einen 64-KiB-Stack (Vec<u64>), ruft arch::init_thread_stack(),
+      legt den Thread in die Thread-Tabelle. Muss VOR start() passieren.
+
+  start() -> !:
+      Schaltet in den ersten Thread und kehrt nie zum Aufrufer zurück (der
+      Boot-Kontext wird aufgegeben).
+
+  yield_now():
+      Wählt den nächsten Thread (round-robin), GIBT DEN LOCK FREI und ruft dann
+      switch(). Der wiederaufgenommene Thread sperrt selbst wieder.
+
+WICHTIGE DESIGN-ANNAHME (und warum sie hält):
+  Es werden alle Threads VOR start() angelegt und (noch) nie zerstört. Dadurch
+  realloziert die Thread-Tabelle nie. Das ist entscheidend, weil yield_now()
+  einen rohen Zeiger auf das rsp-Feld eines Threads über das Lock-freie Fenster
+  des Context-Switch hinweg weiterreicht — würde der Vec umziehen, wäre der
+  Zeiger ungültig. Sobald dynamisches Spawnen/Beenden kommt, muss das geändert
+  werden (z. B. stabile Thread-Boxen).
+
+
+--------------------------------------------------------------------------------
+C) IN-KERNEL-IPC   (kernel/src/ipc.rs)
+--------------------------------------------------------------------------------
+
+Ein minimaler FIFO-Channel zwischen Kernel-Threads:
+
+  Channel::send(msg)   -> hängt msg hinten an (blockiert nie).
+  Channel::recv()      -> nimmt vorne eins; ist nichts da, yield_now() und
+                          erneut versuchen (kooperatives Blockieren).
+  Channel::try_recv()  -> nicht-blockierend.
+
+Das "Blockieren" ist hier bewusst ein Yield-Loop: Der leere recv() gibt die CPU
+ab, der Producer kommt dran, legt etwas in den Channel, beim nächsten Zug des
+Consumers ist es da. Genau dieses Zusammenspiel beweist, dass Scheduler UND IPC
+zusammen funktionieren.
+
+
+--------------------------------------------------------------------------------
+D) DIE DEMO   (kernel/src/demo.rs)
+--------------------------------------------------------------------------------
+
+Zwei Kernel-Threads, ein gemeinsamer statischer Channel:
+
+  producer():  sendet die Zahlen 1..=10, yieldet nach jeder.
+  consumer():  empfängt 10 Nachrichten, summiert sie, loggt jeden Schritt.
+
+Am Ende prüft der Consumer (nur im boot-test): Summe == 10*11/2 == 55. Stimmt
+es, druckt er "boot-test: ok" und ruft arch::exit(true) -> QEMU endet mit Erfolg.
+
+run(): spawnt beide Threads und ruft sched::start(). kmain ruft am Ende
+demo::run() — der Kernel "lebt" jetzt im Scheduler.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — DER BEWEIS FÜR MEILENSTEIN 2.0
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+    [producer t0] send 1
+    [consumer t1] recv 1 (running sum 1)
+    [producer t0] send 2
+    [consumer t1] recv 2 (running sum 3)
+    ...
+    [producer t0] send 10
+    [consumer t1] recv 10 (running sum 55)
+    [xernel] ipc demo done: 10 messages, sum 55
+    [xernel] boot-test: ok
+    xtask: boot-test PASSED
+
+Man sieht das Umschalten direkt: t0 (Producer) und t1 (Consumer) wechseln sich
+sauber ab, jede Nachricht kommt genau einmal an, die Summe stimmt. Der
+Context-Switch in Assembler funktioniert real.
+
+
+--------------------------------------------------------------------------------
+WO WIR JETZT STEHEN — UND WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+Erreicht (alles in QEMU verifiziert):
+  - Phase 0  (Boot + Serial)                          [0.3.1]
+  - Phase 1  (Speicher, Interrupts, Timer)            [0.3.2]
+  - Meilenstein 2.0 (Threads + Scheduler + IPC)       dieses Dokument
+
+NOCH NICHT erreicht — die Grenze zum "eigenes OS drauf bauen":
+  1. Capability-System (CNode, Untyped, Endpoint, Notification, ...)
+  2. Echte Endpoint-/Notification-IPC statt des Demo-Channels
+  3. Syscall-Entry (syscall/sysret) + Übergang nach Ring 3 (User-Space)
+  4. ELF-Loader im Root-Server -> erster echter User-Prozess
+  5. Preemption über den bereits laufenden LAPIC-Timer (statt kooperativ)
+
+Erst wenn Syscalls + User-Space stehen, gibt es eine ABI, gegen die man
+Anwendungen schreiben kann. Das ist die nächste Phase (0.4).

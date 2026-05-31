@@ -1,0 +1,238 @@
+================================================================================
+0.3.2 — PHASE 1: SPEICHER UND INTERRUPTS
+================================================================================
+
+Ziel dieses Schritts:
+  Der Kernel managt seinen eigenen Speicher (physisch UND virtuell), fängt
+  CPU-Fehler sauber ab und hat einen periodischen Timer. Reihenfolge ist hier
+  entscheidend — jede Stufe baut auf der vorigen auf.
+
+Die Boot-Reihenfolge in kmain() am Ende dieses Schritts (kernel/src/main.rs):
+
+    arch::init();            // serial, GDT, IDT, paging-Grundlage, int3-Test
+    mm::init_early_heap();   // 1-MiB-Heap, damit alloc/Vec funktionieren
+    mm::init_frames();       // physischer Frame-Allocator aus Limine-Memmap
+    arch::enable_interrupts(); // LAPIC hoch, Timer an, Interrupts frei
+
+WARUM diese Reihenfolge?
+  - GDT/IDT zuerst: ohne gültige Segmente und Exception-Handler ist jeder Fehler
+    ein stiller Triple-Fault.
+  - Heap VOR Frame-Allocator: der Frame-Allocator benutzt intern Vec, braucht
+    also schon einen funktionierenden Allokator.
+  - Interrupts ZULETZT: das Aufsetzen des LAPIC mappt dessen MMIO-Fenster und
+    kann dabei Zwischen-Page-Tables allokieren — Frame-Allocator muss also schon
+    leben. Erst danach werden Interrupts global freigegeben.
+
+
+--------------------------------------------------------------------------------
+A) GDT + TSS   (kernel/src/arch/x86_64/gdt.rs)
+--------------------------------------------------------------------------------
+
+Was und warum:
+  Long-Mode nutzt ein "flaches" Segmentmodell (Segmente decken den ganzen
+  Adressraum ab), aber die CPU braucht trotzdem gültige Code-/Daten-Selektoren
+  und ein TSS. Das TSS trägt die "Interrupt Stack Table" (IST): garantiert gute
+  Stacks für die Fälle, in denen der normale Kernel-Stack kaputt oder nicht
+  gemappt ist.
+
+Konkret aufgebaut:
+  - GDT mit: Kernel-Code, Kernel-Daten, User-Daten, User-Code, TSS.
+    (Die User-Selektoren werden jetzt schon angelegt, damit ihre GDT-Indizes
+    fest stehen; benutzt werden sie erst beim Sprung nach Ring 3 in Phase 3.)
+  - TSS mit zwei dedizierten IST-Stacks:
+        IST-Index 0 -> Double-Fault (#DF)
+        IST-Index 1 -> Page-Fault   (#PF)
+    Jeder Stack ist 20 KiB groß. WICHTIG: x86-Stacks wachsen nach unten, der
+    IST-Eintrag zeigt also auf das ENDE des Arrays (stack_top()).
+  - Laden: gdt.load(), dann CS/SS auf die Kernel-Selektoren setzen, load_tss().
+
+Verwendete Crate-API: x86_64 0.15.4 (GlobalDescriptorTable, Descriptor,
+TaskStateSegment, Segment::set_reg, load_tss). spin::Once für die statische,
+genau-einmal-Initialisierung.
+
+
+--------------------------------------------------------------------------------
+B) IDT + EXCEPTION-HANDLER   (kernel/src/arch/x86_64/idt.rs)
+--------------------------------------------------------------------------------
+
+Was und warum:
+  Jede CPU-Exception bekommt einen Handler, damit ein Fehler eine LESBARE
+  Meldung auf Serial druckt, statt still zu triple-faulten.
+
+Konkret:
+  - Handler für alle Standard-Exceptions (#DE, #DB, NMI, #BP, #OF, #BR, #UD,
+    #NM, #DF, #TS, #NP, #SS, #GP, #PF, #MF, #AC, #XM).
+  - Zwei Makros reduzieren Boilerplate: trap! (ohne Error-Code) und trap_err!
+    (mit Error-Code). Beide panic'en mit Exception-Name + Stack-Frame-Dump.
+  - #PF liest zusätzlich das CR2-Register (die fehlerhafte Adresse) und die
+    PageFaultErrorCode-Flags.
+  - #DF und #PF laufen auf ihren IST-Stacks (set_stack_index mit den Indizes
+    aus gdt.rs) — deshalb mussten GDT und IDT zusammen gebaut werden.
+  - #BP (Breakpoint) ist NICHT fatal: er loggt nur und kehrt zurück. Das ist
+    der Selbsttest (siehe unten).
+
+STOLPERSTEIN, DER ZEIT KOSTETE:
+  Die Handler haben die Signatur `extern "x86-interrupt"`. Beim Bauen:
+
+      error[E0658]: the extern "x86-interrupt" ABI is experimental
+      help: add `#![feature(abi_x86_interrupt)]`
+
+  Zwei Dinge waren nötig:
+    1. Im Kernel: #![feature(abi_x86_interrupt)] in main.rs.
+    2. In der x86_64-Crate: das Cargo-Feature "abi_x86_interrupt" aktivieren.
+       Wir hatten default-features=false gesetzt, dadurch fehlte es. Korrektur
+       in kernel/Cargo.toml:
+           x86_64 = { version = "0.15", default-features = false, features = [
+               "instructions", "abi_x86_interrupt", "step_trait" ] }
+
+  (Eine zwischenzeitliche "feature declared but not used"-Warnung war ein
+  Stale-Build-Artefakt — das Feature WIRD gebraucht. Kurz testweise entfernt,
+  Build brach mit E0658, also wieder rein.)
+
+SELBSTTEST, DER BEWEIST DASS DIE IDT LÄUFT:
+  Am Ende von arch::init() steht bewusst ein Software-Breakpoint:
+
+      x86_64::instructions::interrupts::int3();
+
+  Bootet er sauber durch, sieht man im Log:
+
+      [xernel] #BP breakpoint at 0xffffffff8000481a
+
+  Das ist der Beweis: die CPU hat die Exception in die IDT vektoriert, unser
+  Handler lief, und der Boot lief danach NORMAL WEITER (Breakpoint ist nicht
+  fatal). Wäre die IDT kaputt -> Triple-Fault -> Reboot/Stille.
+
+
+--------------------------------------------------------------------------------
+C) FRAME-ALLOCATOR   (kernel/src/mm/frame.rs)
+--------------------------------------------------------------------------------
+
+Was und warum:
+  Verwaltet den PHYSISCHEN Speicher in 4-KiB-Frames. Gespeist aus den als
+  "usable" markierten Regionen der Limine-Memory-Map.
+
+Design (bewusst simpel):
+  - Linearer "Bump" innerhalb der Regionen + Free-List für zurückgegebene
+    Frames. Reicht, um Paging, Heap und später den Capability-"Untyped"-
+    Allocator zu bootstrappen — Letzterer übernimmt dann die Bulk-Politik.
+  - Regionen werden auf Frame-Grenzen ausgerichtet, Teil-Frames verworfen.
+  - Global hinter spin::Mutex<Option<...>>, init() befüllt es.
+  - stats() liefert (in_use, total) für die Boot-Meldung.
+
+Anbindung an Limine (kernel/src/arch/x86_64/mod.rs):
+  usable_regions() filtert die Memmap-Einträge auf type_ == MEMMAP_USABLE und
+  liefert (base, base+length)-Paare. mm::init_frames() reicht die an
+  frame::init().
+
+API der limine-Crate, die dabei genutzt wurde:
+  MEMMAP.response().entries()  -> &[&Entry], Entry { base, length, type_ }
+  Konstante MEMMAP_USABLE = 0.
+
+
+--------------------------------------------------------------------------------
+D) PAGING   (kernel/src/arch/x86_64/paging.rs)
+--------------------------------------------------------------------------------
+
+Was und warum:
+  Manipuliert die Seitentabellen, um virtuelle auf physische Adressen zu mappen.
+  Möglich ohne "recursive mapping", weil Limine via HHDM den gesamten physischen
+  Speicher an einen festen Offset spiegelt: pa erreichbar unter pa+hhdm_offset.
+
+Konkret:
+  - init(hhdm_offset) merkt sich den Offset (von HHDM.response().offset).
+  - mapper() baut einen x86_64::OffsetPageTable über die aktive L4-Tabelle
+    (aus Cr3::read()), adressiert über den HHDM-Offset.
+  - GlobalFrames: Adapter, der den generischen Frame-Allocator als
+    x86_64::FrameAllocator-Trait verfügbar macht — so kommen neue Zwischen-
+    Tabellen aus demselben Pool wie alles andere.
+  - map(virt, phys, writable): PRESENT (+ WRITABLE), TLB-Flush nach Erfolg.
+  - map_mmio(virt, phys): zusätzlich NO_CACHE + WRITE_THROUGH, damit Schreib-
+    zugriffe das Gerät wirklich erreichen (für LAPIC-MMIO genutzt).
+
+SELBSTTEST (paging::selftest):
+  Frame allokieren -> an eine Scratch-Adresse mappen -> Sentinel schreiben ->
+  zurücklesen -> vergleichen. Beweist, dass Frame-Allocator UND Mapper zusammen
+  korrekt arbeiten. Wird im boot-test ausgeführt.
+
+
+--------------------------------------------------------------------------------
+E) KERNEL-HEAP   (kernel/src/mm.rs)
+--------------------------------------------------------------------------------
+
+STOLPERSTEIN:
+  Sobald "extern crate alloc" im Kernel steht, verlangt Rust einen
+  #[global_allocator]:
+
+      error: no global memory allocator found but one is required
+
+Lösung — ein zweistufiges Heap-Konzept:
+  1. FRÜHER HEAP (init_early_heap): ein festes 1-MiB-Array in .bss, das der
+     Bootloader bereits als Teil des Kernel-Images mappt. Sofort verfügbar,
+     bevor wir die Seitentabellen selbst besitzen. Als #[global_allocator]
+     dient ein linked_list_allocator::LockedHeap.
+  2. (Später) wird der Heap mit echten, frisch gemappten Frames wachsen; die
+     1-MiB-Arena bleibt die Bootstrap-Arena.
+
+WICHTIG: init_early_heap() MUSS vor der ersten Allokation laufen — deshalb steht
+es in kmain direkt nach arch::init() und vor init_frames() (das Vec benutzt).
+
+
+--------------------------------------------------------------------------------
+F) LAPIC + PIC-ABSCHALTUNG + TIMER   (kernel/src/arch/x86_64/apic.rs)
+--------------------------------------------------------------------------------
+
+Was und warum:
+  Wir benutzen die alten 8259-PICs GAR NICHT. Sie werden aus dem Exception-
+  Bereich heraus-remappt und vollständig maskiert. Interrupts laufen über den
+  Local APIC. Der LAPIC-Timer liefert den periodischen Tick, der später das
+  preemptive Scheduling treibt; vorerst zählt er nur ticks() hoch.
+
+Konkret:
+  - disable_pic(): Standard-8259-Init-Sequenz, dann beide PICs auf 0xff maskiert
+    (PIC1-Vektor-Offset 0x20, PIC2 0x28).
+  - LAPIC global enablen: IA32_APIC_BASE-MSR lesen, Enable-Bit (Bit 11) setzen,
+    zurückschreiben; physische LAPIC-Basis daraus extrahieren.
+  - LAPIC-MMIO an feste virtuelle Adresse mappen (paging::map_mmio).
+  - Spurious-Vector-Register mit Enable-Bit setzen (Vektor 0xff).
+  - Timer: Divider /16, periodischer Modus, Vektor 0x20, Init-Count 10_000_000.
+  - Handler:
+        timer_handler   -> ticks += 1, EOI
+        spurious_handler -> EOI
+
+WARUM ALS EIGENE FUNKTION enable_interrupts() (nicht in arch::init)?
+  Das LAPIC-MMIO-Mapping kann Frames allokieren. Der Frame-Allocator lebt aber
+  erst NACH mm::init_frames(). Deshalb ist die APIC-Initialisierung von init()
+  getrennt und wird in kmain erst nach init_frames() aufgerufen — danach erst
+  x86_64::instructions::interrupts::enable().
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION DIESES GANZEN SCHRITTS
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+Relevante Ausgabe:
+
+    [xernel] #BP breakpoint at 0xffffffff...     <- IDT funktioniert
+    [xernel] hello, xernel — arch=x86_64, build=debug
+    [xernel] phys: 501 MiB usable (128481 frames, 3 in use)   <- Frame-Allocator
+    [xernel] timer: 5 ticks                       <- LAPIC-Timer feuert
+
+Im boot-test prüft kmain zusätzlich:
+  - arch::paging_selftest()  (alloc -> map -> Sentinel -> read-back)
+  - wait_for_timer_ticks(5)  (bounded; tickt der Timer nie, schlägt der Test
+    fehl statt zu hängen)
+
+Die "3 frames in use" stammen aus dem LAPIC-MMIO-Mapping (Zwischen-Tabellen).
+
+
+--------------------------------------------------------------------------------
+MULTI-ARCH-DISZIPLIN (FÜR AR-BRILLEN & CO. WICHTIG)
+--------------------------------------------------------------------------------
+
+Jede neue arch-Funktion (hhdm_offset, usable_regions, paging_selftest,
+enable_interrupts, timer_ticks, ...) wurde gleichzeitig auch in den Stubs
+aarch64/mod.rs und riscv64/mod.rs angelegt. Generischer Code ruft NUR über
+arch::* — nie direkt Assembler oder x86-spezifische Crates. So bleibt der Port
+auf andere Architekturen jederzeit möglich.
