@@ -18,9 +18,17 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
+use crate::cap::{CapEntry, CNode};
 use crate::{arch, elf, println};
 
 const PAGE: u64 = 4096;
+/// Capability-table size for a process.
+const CAP_SLOTS: usize = 64;
+/// PCI I/O-BAR window on the QEMU q35 machine. The root driver task is granted
+/// an `IoPort` capability over exactly this range — enough to reach virtio
+/// devices' legacy registers, but not the low system ports (PIC, PIT, CMOS, …).
+const PCI_IO_BASE: u16 = 0xc000;
+const PCI_IO_COUNT: u16 = 0x4000; // [0xc000, 0x10000)
 const USER_STACK_VA: u64 = 0x80_0000;
 const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
@@ -50,6 +58,7 @@ struct Process {
     ksp: u64,          // saved kernel stack pointer (for context switch)
     kstack_top: u64,   // top of the kernel stack (for syscall entry)
     state: State,
+    caps: CNode, // this process's capability space (its only authority)
 }
 
 struct Scheduler {
@@ -100,7 +109,32 @@ fn create(pid: u64, module: &[u8]) -> Option<Process> {
         ksp,
         kstack_top,
         state: State::Ready,
+        caps: seed_caps(pid),
     })
+}
+
+/// Build a process's initial capability space. The root task (pid 0) is the
+/// system's first driver host, so it is granted device authority directly —
+/// here, an `IoPort` capability over the PCI I/O window. Every other process
+/// starts with an empty CNode and receives authority only by delegation. A more
+/// mature system would derive even the root's caps from firmware/a manifest
+/// rather than hardcoding them.
+fn seed_caps(pid: u64) -> CNode {
+    let mut caps = CNode::new(CAP_SLOTS);
+    if pid == 0 {
+        let _ = caps.insert(0, CapEntry::io_port(PCI_IO_BASE, PCI_IO_COUNT));
+    }
+    caps
+}
+
+/// Does the currently running process hold a capability authorizing a
+/// `size`-byte I/O-port access at `port`? The port-I/O syscalls consult this —
+/// there is no ambient permission to touch hardware ports.
+pub fn current_authorizes_port(port: u16, size: u8) -> bool {
+    let guard = SCHED.lock();
+    guard
+        .as_ref()
+        .is_some_and(|s| s.procs[s.current].caps.authorizes_port(port, size))
 }
 
 /// Make process at index `i` the active one: switch its address space and

@@ -119,11 +119,8 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         )),
         SYS_IOMAP => sys_iomap(args[0], args[1]),
         SYS_DMA_ALLOC => sys_dma_alloc(args[0], args[1]),
-        SYS_PORT_IN => u64::from(arch::port_in(args[0] as u16, args[1] as u8)),
-        SYS_PORT_OUT => {
-            arch::port_out(args[0] as u16, args[1] as u8, args[2] as u32);
-            0
-        }
+        SYS_PORT_IN => sys_port_in(args[0] as u16, args[1] as u8),
+        SYS_PORT_OUT => sys_port_out(args[0] as u16, args[1] as u8, args[2] as u32),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -270,6 +267,27 @@ fn sys_dma_alloc(len: u64, out_ptr: u64) -> u64 {
     };
     buf[0..8].copy_from_slice(&va_base.to_le_bytes());
     buf[8..16].copy_from_slice(&phys.to_le_bytes());
+    0
+}
+
+/// Read an I/O port — but only if the calling process holds an `IoPort`
+/// capability covering it. Returns the value, or `u64::MAX` if unauthorized.
+fn sys_port_in(port: u16, size: u8) -> u64 {
+    if !crate::process::current_authorizes_port(port, size) {
+        println!("[cap] DENY port_in 0x{port:x} (no IoPort capability)");
+        return u64::MAX;
+    }
+    u64::from(arch::port_in(port, size))
+}
+
+/// Write an I/O port, gated by an `IoPort` capability. Returns 0 on success,
+/// `u64::MAX` if unauthorized (the write does not happen).
+fn sys_port_out(port: u16, size: u8, value: u32) -> u64 {
+    if !crate::process::current_authorizes_port(port, size) {
+        println!("[cap] DENY port_out 0x{port:x} (no IoPort capability)");
+        return u64::MAX;
+    }
+    arch::port_out(port, size, value);
     0
 }
 
