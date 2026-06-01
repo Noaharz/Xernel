@@ -222,50 +222,27 @@ fn fb_demo() {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Exactly one init process now (the kernel no longer launches copies).
     let pid = getpid();
 
-    // Every process runs the same program but in its OWN address space.
-    print("\n[process ");
+    print("\n[init pid ");
     print_u64(pid);
     print("] hello — eigener Adressraum, eigener Heap\n");
 
-    // Each process allocates from its own private heap (proves isolation).
     heap_check(8192);
 
-    // Only the first process draws the banner + framebuffer (the framebuffer is
-    // mapped per address space; mapping it in every process comes later).
-    if pid == 0 {
-        print("  __  __                    _ \n");
-        print(" |  \\/  | ___ _ __ _ __  ___| |\n");
-        print(" | |\\/| |/ _ \\ '__| '_ \\/ -_) |   Xernel OS\n");
-        print(" |_|  |_|\\___/_|  |_| |_\\___|_|   multitasking\n");
-        fb_demo();
-        pci_scan();
-    }
+    print("  __  __                    _ \n");
+    print(" |  \\/  | ___ _ __ _ __  ___| |\n");
+    print(" | |\\/| |/ _ \\ '__| '_ \\/ -_) |   Xernel OS\n");
+    print(" |_|  |_|\\___/_|  |_| |_\\___|_|\n");
 
-    // Busy work with NO yield: each process just computes between prints. If the
-    // output still INTERLEAVES across processes, the kernel is preempting us
-    // (timer-driven) rather than waiting for a voluntary yield — that is real
-    // preemptive multitasking.
-    let _ = yield_now; // wrapper kept for programs that want cooperative yield
-    let mut step = 0;
-    while step < 3 {
-        print("  [pid ");
-        print_u64(pid);
-        print("] work ");
-        print_u64(step);
-        print("\n");
-        let mut i: u64 = 0;
-        while i < 3_000_000 {
-            core::hint::black_box(i);
-            i += 1;
-        }
-        step += 1;
-    }
+    // Framebuffer: now mapped into THIS process's address space (per-process),
+    // so writing pixels works in any process — not just the first caller.
+    fb_demo();
+    pci_scan();
 
-    print("[process ");
-    print_u64(pid);
-    print("] fertig\n");
+    let _ = yield_now; // cooperative yield available for programs that want it
+    print("[init] fertig\n");
     exit(0);
 }
 
