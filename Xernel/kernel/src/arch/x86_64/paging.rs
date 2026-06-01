@@ -106,6 +106,17 @@ pub fn map_user_device(virt: u64, phys: u64) -> Result<(), MapToError<Size4KiB>>
     )
 }
 
+/// Like [`map_user_device`] but idempotent: if the page is already mapped (e.g.
+/// the framebuffer mapped again into the same address space), that is treated as
+/// success. Used so a per-process resource can be (re)mapped on every request.
+pub fn map_user_device_idempotent(virt: u64, phys: u64) -> bool {
+    match map_user_device(virt, phys) {
+        Ok(()) => true,
+        Err(MapToError::PageAlreadyMapped(_)) => true,
+        Err(_) => false,
+    }
+}
+
 /// Map a user-accessible page. `writable` controls W, `executable` controls
 /// whether instructions may be fetched (when false, the page is marked NX).
 ///

@@ -26,7 +26,13 @@ const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
 const HEAP_MAX: u64 = 0x2000_0000;
 const KSTACK_WORDS: usize = 4096; // 32 KiB kernel stack per process
-const NUM_PROCESSES: u64 = 3;
+/// How many processes to start from the init module at boot. Real systems boot
+/// exactly ONE init, which then spawns its own children; launching several
+/// copies of init (as an early multitasking demo did) breaks real userland —
+/// every copy fights over the framebuffer and other shared state. Multiple
+/// processes remain fully supported; they are created on demand, not by running
+/// init N times.
+const NUM_PROCESSES: u64 = 1;
 
 #[derive(PartialEq, Eq)]
 enum State {

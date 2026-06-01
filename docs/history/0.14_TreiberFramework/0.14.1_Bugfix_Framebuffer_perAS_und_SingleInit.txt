@@ -1,0 +1,81 @@
+================================================================================
+0.14.1 — BUGFIX (v0.11.1): EIN INIT-PROZESS + FRAMEBUFFER PRO ADRESSRAUM
+================================================================================
+
+Zeitraum:      2026-06-01
+Auslöser:      Bug-Report vom XOS-Team gegen v0.11.0. XOS' grafischer Desktop
+               renderte, crashte aber: (1) der Kernel startete init dreimal,
+               (2) #PF beim Framebuffer-Schreiben aus Ring 3.
+
+
+--------------------------------------------------------------------------------
+BUG 1 — "TRIPLE-INIT"
+--------------------------------------------------------------------------------
+
+Symptom: process 0/1/2 ready — der Kernel startete DREI Kopien des init-Moduls.
+Für echtes Userland falsch: alle drei XOS-Instanzen kämpften gleichzeitig um
+Framebuffer und Heap.
+
+Ursache: NUM_PROCESSES = 3 in process.rs — DEMO-Code aus Phase 0.11/0.12, um
+Multitasking zu zeigen. Echte Systeme booten GENAU EINEN init, der dann selbst
+Kindprozesse spawnt.
+
+Fix: NUM_PROCESSES = 1. Mehrere Prozesse bleiben voll unterstützt (eigene
+Adressräume, Preemption) — sie werden auf Anforderung erzeugt, nicht durch
+N-faches Starten von init.
+
+
+--------------------------------------------------------------------------------
+BUG 2 — #PF BEIM FRAMEBUFFER (DER ECHTE BUG)
+--------------------------------------------------------------------------------
+
+Symptom: SYS_FB_INFO liefert 0x30000000, aber der erste Pixel-Schreibzugriff aus
+Ring 3 wirft #PF (CAUSED_BY_WRITE | USER_MODE).
+
+XOS' Vermutung ("writable/user-mode vergessen") war NICHT die Ursache:
+map_user_device setzt PRESENT|USER_ACCESSIBLE|WRITABLE|NO_CACHE|WRITE_THROUGH|NX
+— korrekt.
+
+Die echte Ursache (ein Multiprocessing-Bug): der Framebuffer wurde EINMALIG
+(spin::Once-gecacht) in den Adressraum des ERSTEN Aufrufers gemappt. Jeder
+Prozess hat aber EIGENE Page-Tables. Die anderen Prozesse bekamen die Adresse
+0x30000000 zurück, in IHREM Adressraum war sie aber nicht gemappt -> #PF beim
+Schreiben. (Genau deshalb hing Bug 2 an Bug 1: erst durch die drei Instanzen
+faulteten die Nicht-Erst-Aufrufer.)
+
+Fix (framebuffer.rs): Geometrie (phys, Breite, Höhe, Pitch, bpp) wird weiter
+EINMAL erkannt (adressraum-unabhängig), aber das MAPPING passiert jetzt bei
+JEDEM SYS_FB_INFO-Aufruf in den AKTIVEN Adressraum — idempotent über
+paging::map_user_device_idempotent (schon-gemappt = ok). So bekommt jeder
+Prozess den Framebuffer in seinem eigenen Adressraum.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+  cargo xtask run --test:
+    - nur noch "process 0 ready" (ein init)
+    - "fb : 1280x800 ok" (kein #PF)
+    - PASSED
+  Visuell: QEMU-Screenshot zeigt den Farbverlauf -> Framebuffer-Schreiben aus
+  Ring 3 funktioniert.
+
+
+--------------------------------------------------------------------------------
+LEHRE
+--------------------------------------------------------------------------------
+
+Jede Ressource, die in den User-Space gemappt wird (Framebuffer, später
+Geräte-MMIO via SYS_IOMAP, DMA-Puffer), muss PRO ADRESSRAUM gemappt werden, nicht
+global einmal. Mit mehreren Prozessen ist "einmal mappen und cachen" ein Bug.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs                 NUM_PROCESSES = 1
+  kernel/src/arch/x86_64/framebuffer.rs Geometrie cachen, Mapping pro Aufruf/AS
+  kernel/src/arch/x86_64/paging.rs      map_user_device_idempotent
+  userland/init/src/main.rs             ein-Prozess-init (Banner + fb + pci)
