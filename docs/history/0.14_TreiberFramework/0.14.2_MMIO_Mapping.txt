@@ -1,0 +1,85 @@
+================================================================================
+0.14.2 — TREIBER-FRAMEWORK STUFE 2: GERÄTE-MMIO IN DEN USER-SPACE
+================================================================================
+
+Zeitraum:      2026-06-01
+Ausgangspunkt: Stufe 1 (0.14.0) — User-Space findet das virtio-Gerät via PCI.
+Ergebnis:      Ein User-Prozess kann die memory-mapped Register eines Geräts
+               (eine PCI-BAR) in seinen Adressraum mappen und lesen. Der
+               nächste Baustein des User-Space-Block-Treibers.
+
+
+--------------------------------------------------------------------------------
+DER NEUE SYSCALL — SYS_IOMAP = 13
+--------------------------------------------------------------------------------
+
+  Args:     phys, len
+  Rückgabe: User-virtuelle Adresse, an die das physische MMIO gemappt ist
+            (uncached), oder u64::MAX bei Fehler.
+
+  Kernel (kernel/src/syscall.rs sys_iomap):
+    - phys auf Page-Grenze runden, Seitenzahl berechnen,
+    - aus einer Bump-Region (0x5000_0000..0x6000_0000) eine User-VA vergeben,
+    - jede Page via arch::map_user_device (uncached, user, RW, NX) in den
+      AKTIVEN Adressraum mappen — PRO PROZESS (die Lehre aus dem Framebuffer-Bug
+      0.14.1: niemals global einmal cachen),
+    - va_base + Sub-Page-Offset zurückgeben.
+
+  arch::map_user_device -> paging::map_user_device_idempotent (schon-gemappt=ok).
+
+
+--------------------------------------------------------------------------------
+DER USER-TREIBER  (userland/init/src/main.rs)
+--------------------------------------------------------------------------------
+
+  - pci_scan() liefert jetzt das Slot des virtio-Geräts zurück.
+  - iomap_demo(dev):
+      * BARs 0..6 lesen (Config-Offset 0x10 + i*4),
+      * I/O-BARs (Bit 0 = 1) überspringen, erste Memory-BAR nehmen,
+      * 64-bit-BAR: oberes Dword aus der nächsten BAR,
+      * Basis-Adresse via SYS_IOMAP mappen,
+      * erstes Register (dword) lesen und ausgeben.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+      dev 3: vendor 0x1af4 device 0x1001   <- VIRTIO
+     MMIO-Map (dev 3):
+       BAR1 phys 0xfebd5000  -> user 0x50000000, [0]=0x00000000
+    xtask: boot-test PASSED
+
+Ein Ring-3-Prozess hat die MMIO-BAR (phys 0xfebd5000) in seinen Adressraum
+(user 0x50000000) gemappt und ohne #PF gelesen. (Beim transitional virtio-blk
+ist BAR0 ein I/O-Port-Bereich, BAR1 die MMIO-Region — der Wert 0 ist hier
+nebensächlich; entscheidend ist, dass der Zugriff funktioniert.)
+
+
+--------------------------------------------------------------------------------
+WAS NOCH FEHLT (STUFE 3 + 4)
+--------------------------------------------------------------------------------
+
+  Stufe 3 — DMA + IRQ:
+    - SYS_DMA_ALLOC(len) -> physisch-zusammenhängender, user-gemappter Puffer
+      + dessen physische Adresse (die das Gerät per DMA liest/schreibt).
+    - IRQ-Zustellung an den User-Prozess (SYS_IRQ_WAIT) oder Polling des
+      virtio-Used-Rings.
+  Stufe 4 — virtio-Protokoll:
+    - virtio-PCI-Capabilities parsen (Common-Config/Notify/ISR/Device-Config),
+    - Feature-Negotiation, Virtqueue (Descriptor-Table, Available/Used-Ring),
+    - Read-Request absenden, Completion lesen.
+
+Erst dann: "Sektor 0 lesen und den Magic-String der disk.img ausgeben."
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/syscall.rs                SYS_IOMAP=13, sys_iomap, Bump-VA-Region
+  kernel/src/arch/x86_64/mod.rs        map_user_device (aktiver AS, uncached)
+  kernel/src/arch/x86_64/paging.rs     map_user_device_idempotent (aus 0.14.1)
+  userland/init/src/main.rs            iomap-Wrapper, pci_scan->dev, iomap_demo

@@ -22,6 +22,8 @@ const SYS_FB_INFO: u64 = 9;
 const SYS_GETPID: u64 = 10;
 const SYS_YIELD: u64 = 11;
 const SYS_PCI_READ: u64 = 12;
+const SYS_IOMAP: u64 = 13;
+const SYS_DMA_ALLOC: u64 = 14;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -87,9 +89,11 @@ fn pci_read(bus: u64, dev: u64, func: u64, offset: u64) -> u32 {
     syscall4(SYS_PCI_READ, bus, dev, func, offset) as u32
 }
 
-/// Scan PCI bus 0 from user space and report devices, flagging virtio ones.
-fn pci_scan() {
+/// Scan PCI bus 0 from user space and report devices. Returns the slot of the
+/// first virtio device (vendor 0x1AF4), or 0xFF if none.
+fn pci_scan() -> u64 {
     print(" PCI-Scan (Bus 0):\n");
+    let mut virtio = 0xFFu64;
     for dev in 0..32u64 {
         let id = pci_read(0, dev, 0, 0); // offset 0: vendor | device<<16
         let vendor = (id & 0xFFFF) as u16;
@@ -105,9 +109,98 @@ fn pci_scan() {
         print_hex(u64::from(device), 4);
         if vendor == 0x1af4 {
             print("   <- VIRTIO");
+            if virtio == 0xFF {
+                virtio = dev;
+            }
         }
         print("\n");
     }
+    virtio
+}
+
+fn iomap(phys: u64, len: u64) -> u64 {
+    syscall3(SYS_IOMAP, phys, len, 0)
+}
+
+/// Allocate a DMA buffer; returns (user_vaddr, phys_addr) or (u64::MAX, 0).
+fn dma_alloc(len: u64) -> (u64, u64) {
+    let mut out = [0u64; 2];
+    if syscall3(SYS_DMA_ALLOC, len, out.as_mut_ptr() as u64, 0) == u64::MAX {
+        return (u64::MAX, 0);
+    }
+    (out[0], out[1])
+}
+
+/// Allocate a DMA buffer, write a pattern and read it back — proof that a
+/// user-space driver has physically-contiguous memory it can hand to a device.
+fn dma_demo() {
+    let (va, phys) = dma_alloc(4096);
+    if va == u64::MAX {
+        print(" DMA: alloc FEHLER\n");
+        return;
+    }
+    print(" DMA: 4 KiB @ user 0x");
+    print_hex(va, 8);
+    print(" phys 0x");
+    print_hex(phys, 8);
+    let p = va as *mut u64;
+    let mut ok = true;
+    // SAFETY: the kernel mapped [va, va+4096) as user read/write memory.
+    unsafe {
+        for i in 0..512u64 {
+            p.add(i as usize).write_volatile(0xDEAD_0000 + i);
+        }
+        for i in 0..512u64 {
+            if p.add(i as usize).read_volatile() != 0xDEAD_0000 + i {
+                ok = false;
+                break;
+            }
+        }
+    }
+    print(if ok { "  ok\n" } else { "  VERIFY FEHLER\n" });
+}
+
+/// Map the first memory BAR of `dev` into our address space and read a register
+/// — proof that a user-space driver can reach device MMIO.
+fn iomap_demo(dev: u64) {
+    print(" MMIO-Map (dev ");
+    print_u64(dev);
+    print("):\n");
+    let mut i = 0u64;
+    while i < 6 {
+        let bar = pci_read(0, dev, 0, (0x10 + i * 4) as u64);
+        if bar == 0 || (bar & 1) == 1 {
+            i += 1; // empty slot or I/O BAR (we want memory)
+            continue;
+        }
+        let is_64 = ((bar >> 1) & 3) == 2;
+        let mut base = u64::from(bar & 0xFFFF_FFF0);
+        if is_64 {
+            base |= u64::from(pci_read(0, dev, 0, (0x10 + (i + 1) * 4) as u64)) << 32;
+        }
+        if base == 0 {
+            i += if is_64 { 2 } else { 1 };
+            continue;
+        }
+        print("   BAR");
+        print_u64(i);
+        print(" phys 0x");
+        print_hex(base, 8);
+        let va = iomap(base, 0x1000);
+        if va == u64::MAX {
+            print("  -> iomap FEHLER\n");
+            return;
+        }
+        print("  -> user 0x");
+        print_hex(va, 8);
+        // SAFETY: the kernel just mapped this page as uncached device memory.
+        let val = unsafe { (va as *const u32).read_volatile() };
+        print(", [0]=0x");
+        print_hex(u64::from(val), 8);
+        print("\n");
+        return;
+    }
+    print("   keine Memory-BAR\n");
 }
 
 fn print(s: &str) {
@@ -239,7 +332,11 @@ pub extern "C" fn _start() -> ! {
     // Framebuffer: now mapped into THIS process's address space (per-process),
     // so writing pixels works in any process — not just the first caller.
     fb_demo();
-    pci_scan();
+    let vdev = pci_scan();
+    if vdev != 0xFF {
+        iomap_demo(vdev);
+    }
+    dma_demo();
 
     let _ = yield_now; // cooperative yield available for programs that want it
     print("[init] fertig\n");
