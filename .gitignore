@@ -26,3 +26,7 @@ qemu.log
 serial.log
 core.*
 *.dmp
+
+# Lose Feedback-Notizen (gehoeren nicht ins Repo)
+XOS.txt
+*.feedback.txt
