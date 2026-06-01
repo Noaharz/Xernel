@@ -45,6 +45,10 @@ pub const SYS_FB_INFO: u64 = 9;
 pub const SYS_GETPID: u64 = 10;
 /// Voluntarily yield the CPU to another ready process. Returns 0.
 pub const SYS_YIELD: u64 = 11;
+/// Read a 32-bit PCI config dword. Args: bus, dev, func, offset. Returns the
+/// dword. Lets a user-space driver discover PCI devices (privileged port I/O is
+/// done by the kernel on its behalf).
+pub const SYS_PCI_READ: u64 = 12;
 
 // sysinfo keys.
 const INFO_RAM_TOTAL: u64 = 0;
@@ -78,6 +82,12 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
             crate::process::yield_now();
             0
         }
+        SYS_PCI_READ => u64::from(arch::pci_config_read(
+            args[0] as u8,
+            args[1] as u8,
+            args[2] as u8,
+            args[3] as u8,
+        )),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX

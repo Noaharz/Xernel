@@ -62,6 +62,9 @@ pub fn vspace_selftest() -> bool {
     true
 }
 pub fn set_kernel_stack(_top: u64) {}
+pub fn pci_config_read(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 {
+    0xFFFF_FFFF
+}
 
 pub fn keyboard_selftest() -> bool {
     true

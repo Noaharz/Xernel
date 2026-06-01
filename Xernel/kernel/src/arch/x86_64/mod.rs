@@ -13,6 +13,7 @@ mod gdt;
 mod idt;
 mod keyboard;
 mod paging;
+mod pci;
 mod syscall;
 mod vspace;
 
@@ -166,6 +167,11 @@ pub fn vspace_current() -> u64 {
 /// Run the address-space self-test (create + switch + read/write + restore).
 pub fn vspace_selftest() -> bool {
     vspace::selftest()
+}
+
+/// Read a 32-bit PCI config-space dword (mediated privileged port I/O).
+pub fn pci_config_read(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    pci::config_read(bus, dev, func, offset)
 }
 
 /// In-kernel keyboard decode/buffer self-test (no hardware, no blocking).

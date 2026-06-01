@@ -1,0 +1,96 @@
+================================================================================
+0.14 — TREIBER-FRAMEWORK, STUFE 1: HARDWARE-DISCOVERY AUS DEM USER-SPACE
+================================================================================
+
+Zeitraum:      2026-05-31
+Kontext:       Mit Prozess-Isolation + preemptivem Multitasking (0.11-0.13) ist
+               die Voraussetzung da, Treiber als eigene User-Space-Prozesse zu
+               bauen — die Mikrokernel-Vision (Crash eines Treibers != Kernel-
+               Panic) und NexusClouds Storage-Bedarf.
+Ergebnis:      Ein User-Space-Prozess scannt den PCI-Bus und FINDET die
+               virtio-blk-Disk — der erste Schritt eines User-Space-Block-
+               Treibers. Hardware-Discovery komplett ausserhalb des Kernels.
+
+
+--------------------------------------------------------------------------------
+DAS PRINZIP — KERNEL VERMITTELT, USER ENTSCHEIDET
+--------------------------------------------------------------------------------
+
+PCI-Config-Zugriff geht über privilegierte Port-I/O (0xCF8/0xCFC), die ein
+Ring-3-Prozess nicht selbst darf. Statt dem Treiber I/O-Rechte zu geben, macht
+der KERNEL die Port-I/O auf seine Bitte (SYS_PCI_READ). Der Treiber selbst —
+die Logik, welches Gerät er sucht und was er damit tut — lebt im User-Space.
+Das ist das capability-saubere Muster: der Kernel stellt das Primitiv bereit,
+die Policy ist Userland.
+
+
+--------------------------------------------------------------------------------
+DIE TEILE
+--------------------------------------------------------------------------------
+
+1. Disk an QEMU  (xtask/src/main.rs)
+   - ensure_disk(): erzeugt target/disk.img (1 MiB) mit Magic-String in Sektor 0
+     (für spätere Lese-Verifikation).
+   - QEMU-Args: -drive file=disk.img,if=none,id=disk0,format=raw
+                -device virtio-blk-pci,drive=disk0
+
+2. PCI-Config-Primitiv  (kernel/src/arch/x86_64/pci.rs)
+   - config_read(bus,dev,func,offset): Mechanismus #1.
+       outl(0xCF8, 0x80000000 | bus<<16 | dev<<11 | func<<8 | (offset & 0xFC))
+       inl(0xCFC) -> 32-bit-Wert
+   - Neuer Syscall SYS_PCI_READ = 12 (args bus,dev,func,offset -> u32).
+
+3. User-Space-Scan  (userland/init/src/main.rs, nur Prozess 0)
+   - syscall4 (4. Argument in r10),
+   - Bus 0, Slots 0..32: Offset 0 lesen (Vendor | Device<<16),
+   - Vendor 0xFFFF = kein Gerät; sonst Vendor/Device hex drucken,
+   - Vendor 0x1AF4 (virtio) markieren.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     PCI-Scan (Bus 0):
+       dev 0: vendor 0x8086 device 0x29c0    (Q35 Host-Bridge)
+       dev 1: vendor 0x1234 device 0x1111    (QEMU-VGA = Framebuffer)
+       dev 2: vendor 0x8086 device 0x10d3    (e1000 NIC)
+       dev 3: vendor 0x1af4 device 0x1001    <- VIRTIO (virtio-blk)
+       dev 31: vendor 0x8086 device 0x2918   (LPC-Bridge)
+    xtask: boot-test PASSED
+
+Ein Ring-3-Prozess hat die echte (emulierte) Hardware aufgezählt und die
+virtio-blk-Disk an dev 3 gefunden. (0x1AF4 = virtio, 0x1001 = transitional
+virtio-blk.)
+
+
+--------------------------------------------------------------------------------
+EHRLICH: DAS IST ERST STUFE 1 VON ~4
+--------------------------------------------------------------------------------
+
+Ein FUNKTIONIERENDER virtio-blk-Treiber (Sektor lesen) braucht noch:
+
+  Stufe 2 — MMIO/BAR-Mapping: SYS_IOMAP(phys,len) -> die Geräte-Register
+            (aus den PCI-BARs) in den User-Adressraum mappen (uncached).
+  Stufe 3 — DMA-Speicher: SYS_DMA_ALLOC(len) -> physisch-zusammenhängender,
+            user-gemappter Puffer + dessen physische Adresse (die das Gerät
+            liest/schreibt). Plus IRQ-Zustellung an den User-Prozess
+            (SYS_IRQ_WAIT) oder Polling.
+  Stufe 4 — virtio-Protokoll: Feature-Negotiation, Virtqueue (Descriptor-Table,
+            Available/Used-Ring), eine Read-Request absenden, Completion lesen.
+
+Erst danach: "Sektor 0 von der Disk lesen und den Magic-String ausgeben". Das
+ist der nächste Meilenstein. Stufe 1 (Discovery) ist die Grundlage.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  xtask/src/main.rs                   ensure_disk + virtio-blk an QEMU
+  kernel/src/arch/x86_64/pci.rs       NEU: PCI config_read (Port I/O)
+  kernel/src/arch/x86_64/mod.rs       pci_config_read export
+  kernel/src/syscall.rs               SYS_PCI_READ=12
+  userland/init/src/main.rs           syscall4, print_hex, pci_scan
