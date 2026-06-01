@@ -378,6 +378,22 @@ fn iomap_demo(dev: u64) {
     print("   keine Memory-BAR\n");
 }
 
+/// Demonstrate that hardware authority is capability-gated. The virtio-blk
+/// driver above only worked because this process holds an `IoPort` capability
+/// covering the PCI I/O window. A port OUTSIDE that range — here CMOS/RTC at
+/// 0x70 — must be refused by the kernel, even though the call is identical.
+fn cap_demo() {
+    print(" Capability-Check (IoPort):\n");
+    let r = syscall3(SYS_PORT_IN, 0x70, 1, 0); // CMOS/RTC — not in our range
+    if r == u64::MAX {
+        print("   port_in(0x70) -> VERWEIGERT (keine Capability) — korrekt\n");
+    } else {
+        print("   port_in(0x70) -> 0x");
+        print_hex(r, 2);
+        print("  (FEHLER: haette gesperrt sein muessen)\n");
+    }
+}
+
 fn print(s: &str) {
     write(s.as_bytes());
 }
@@ -513,6 +529,7 @@ pub extern "C" fn _start() -> ! {
         virtio_blk_demo(vdev);
     }
     dma_demo();
+    cap_demo();
 
     let _ = yield_now; // cooperative yield available for programs that want it
     print("[init] fertig\n");

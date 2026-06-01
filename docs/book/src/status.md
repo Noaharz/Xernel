@@ -13,8 +13,9 @@ Stand: 2026-06-01. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 - **SSE/FPU** für Ring 3 aktiviert.
 - **Multitasking-Kern:** Context-Switch, kooperativer Scheduler, In-Kernel-IPC
   (Demo: zwei Threads tauschen Nachrichten).
-- **Capabilities:** CNode/CapEntry-Grundstrukturen (noch nicht an Syscalls
-  gebunden).
+- **Capabilities:** CNode/CapEntry pro Prozess; **Port-I/O ist an eine
+  `IoPort`-Capability gebunden** — keine ambiente Hardware-Autorität mehr (der
+  virtio-Treiber darf seine Ports, ein System-Port wie CMOS wird verweigert).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
   Programm als Limine-Modul), 16 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
@@ -42,6 +43,7 @@ Stand: 2026-06-01. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.12 Multitasking | kooperatives Scheduling (`YIELD`) — verzahnte Prozesse |
 | 0.13 Preemption | timer-getriebenes preemptives Scheduling |
 | 0.14 TreiberFramework | User-Space-Treiber: PCI, MMIO, DMA, Port-I/O → virtio-blk liest Sektor 0 |
+| 0.15 Capabilities | Port-I/O an `IoPort`-Capability gebunden — Least-Privilege für Treiber |
 
 ## XOS — das erste OS auf Xernel
 
@@ -55,7 +57,8 @@ cargo xtask run --init /pfad/zu/xos-init.elf
 
 ## Noch offen
 
-- Capabilities an die Syscalls binden (`invoke(cap, method, args)`)
+- Capabilities weiter binden: `IOMAP`/`DMA_ALLOC` per Cap, Delegation
+  (`invoke(cap, method, args)`, copy/grant) — Port-I/O ist bereits gated
 - Mehrere Prozesse + Adressraum-Trennung (dann: XMM-Save im Context-Switch)
 - Timer-Frequenz in Hz (LAPIC kalibrieren)
 - Framebuffer/GUI, Dateisystem-API, `fork`/`exec`
