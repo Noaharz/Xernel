@@ -41,6 +41,10 @@ pub const SYS_SBRK: u64 = 8;
 /// `[u64; 5]` the kernel fills with `[addr, width, height, pitch, bpp]`.
 /// Returns 0 on success, `u64::MAX` if there is no framebuffer or a bad buffer.
 pub const SYS_FB_INFO: u64 = 9;
+/// Return the current process's PID.
+pub const SYS_GETPID: u64 = 10;
+/// Voluntarily yield the CPU to another ready process. Returns 0.
+pub const SYS_YIELD: u64 = 11;
 
 // sysinfo keys.
 const INFO_RAM_TOTAL: u64 = 0;
@@ -58,7 +62,7 @@ const MAX_WRITE: u64 = 1 << 20;
 pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
     match nr {
         SYS_WRITE => sys_write(args[0], args[1], args[2]),
-        SYS_EXIT => exit(args[0]),
+        SYS_EXIT => crate::process::exit(args[0]),
         SYS_DEBUG => {
             println!("[user] debug: {:#x}", args[0]);
             0
@@ -67,8 +71,13 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_SYSINFO => sysinfo(args[0]),
         SYS_READ => sys_read(args[0], args[1], args[2]),
         SYS_READ_NB => sys_read_nb(args[0], args[1], args[2]),
-        SYS_SBRK => crate::user::sbrk(args[0] as i64).unwrap_or(u64::MAX),
+        SYS_SBRK => crate::process::sbrk(args[0] as i64).unwrap_or(u64::MAX),
         SYS_FB_INFO => sys_fb_info(args[0]),
+        SYS_GETPID => crate::process::getpid(),
+        SYS_YIELD => {
+            crate::process::yield_now();
+            0
+        }
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -161,16 +170,3 @@ fn sysinfo(which: u64) -> u64 {
     }
 }
 
-fn exit(code: u64) -> ! {
-    println!("[user] exit({code})");
-    #[cfg(feature = "boot-test")]
-    {
-        println!("[xernel] boot-test: ok");
-        crate::arch::exit(code == 0);
-    }
-    #[cfg(not(feature = "boot-test"))]
-    {
-        println!("[xernel] first user process exited; halting.");
-        crate::arch::halt_forever();
-    }
-}

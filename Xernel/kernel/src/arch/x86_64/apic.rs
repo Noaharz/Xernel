@@ -101,12 +101,55 @@ pub fn init() {
 
     write_reg(REG_TIMER_DIV, 0x3); // divide by 16
     write_reg(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_TIMER_PERIODIC);
-    write_reg(REG_TIMER_INIT, 10_000_000);
+    write_reg(REG_TIMER_INIT, 1_000_000);
 }
 
-pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+/// Tick the clock and acknowledge the interrupt.
+extern "C" fn timer_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     eoi();
+}
+
+/// Tick, acknowledge, and (since we interrupted user mode) preempt: hand the CPU
+/// to the next ready process. Returns when this process is scheduled again.
+extern "C" fn timer_preempt() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    eoi();
+    crate::process::yield_now();
+}
+
+/// Naked timer interrupt entry. If it interrupted ring 0 (we were in the kernel,
+/// e.g. a syscall), it only ticks + EOIs — kernel code is not preempted. If it
+/// interrupted ring 3, it `swapgs`es to the kernel GS, saves the full register
+/// context on this process's kernel stack, and preempts via the scheduler;
+/// `swapgs` + `iretq` resume whichever process runs next.
+#[unsafe(naked)]
+pub unsafe extern "C" fn timer_isr() {
+    core::arch::naked_asm!(
+        "test byte ptr [rsp + 8], 3", // CS & 3 != 0  ->  came from ring 3
+        "jnz 2f",
+        // ---- from ring 0: tick + EOI only (no preempt, no swapgs) ----
+        "push rax", "push rcx", "push rdx", "push rsi", "push rdi",
+        "push r8", "push r9", "push r10", "push r11",
+        "call {tick}",
+        "pop r11", "pop r10", "pop r9", "pop r8", "pop rdi",
+        "pop rsi", "pop rdx", "pop rcx", "pop rax",
+        "iretq",
+        // ---- from ring 3: full save + preempt ----
+        "2:",
+        "swapgs",
+        "push rax", "push rbx", "push rcx", "push rdx", "push rsi",
+        "push rdi", "push rbp", "push r8", "push r9", "push r10",
+        "push r11", "push r12", "push r13", "push r14", "push r15",
+        "call {preempt}",
+        "pop r15", "pop r14", "pop r13", "pop r12", "pop r11",
+        "pop r10", "pop r9", "pop r8", "pop rbp", "pop rdi",
+        "pop rsi", "pop rdx", "pop rcx", "pop rbx", "pop rax",
+        "swapgs",
+        "iretq",
+        tick = sym timer_tick,
+        preempt = sym timer_preempt,
+    )
 }
 
 pub extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {

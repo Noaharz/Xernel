@@ -1,0 +1,149 @@
+================================================================================
+0.11 — MULTIPROCESSING: ISOLIERTE ADRESSRÄUME
+================================================================================
+
+Zeitraum:      2026-05-31
+Kontext:       Mehrere Userland-Nutzer (XOS, NexusCloud). NexusClouds Beschwerde
+               nannte u.a. "Mehrere Prozesse / Multitasking". Das ist KEIN
+               Ein-User-Wunsch, sondern der Schlussstein der Mikrokernel-Vision:
+               Treiber, Dateisysteme, Netz sollen als getrennte, isolierte
+               User-Prozesse laufen. Also universell — gut für alle.
+Ergebnis:      Mehrere Prozesse, JEDER MIT EIGENEM ADRESSRAUM (eigene Page-Table).
+               Ein Prozess kann den Speicher eines anderen weder sehen noch
+               beschädigen. Verifiziert: 3 Prozesse, 3 verschiedene CR3-Werte.
+
+
+--------------------------------------------------------------------------------
+WAS NEU IST — UND WAS (NOCH) NICHT
+--------------------------------------------------------------------------------
+
+NEU (dieser Schritt):
+  - Pro Prozess eine eigene PML4 (Top-Level-Page-Table). Kernel-Hälfte geteilt,
+    User-Hälfte privat -> echte Speicher-Isolation.
+  - ELF wird in den jeweiligen Adressraum geladen.
+  - Mehrere Prozesse laufen, jeder in seinem Adressraum.
+
+NOCH NICHT (nächster Schritt):
+  - Scheduling ist SEQUENTIELL: Prozesse laufen nacheinander (jeder bis
+    SYS_EXIT, dann der nächste). Das übt die volle Adressraum-Isolation und das
+    CR3-Umschalten. ECHTE GLEICHZEITIGKEIT (preemptives Umschalten eines
+    laufenden Prozesses, Kontext sichern/wiederherstellen) kommt als Phase 0.12.
+
+
+--------------------------------------------------------------------------------
+A) ADRESSRAUM-MASCHINERIE   (kernel/src/arch/x86_64/vspace.rs)
+--------------------------------------------------------------------------------
+
+Ein Adressraum = eine PML4, identifiziert über ihre physische Adresse (= CR3).
+
+  vspace::new():
+    - frame für eine neue PML4 allokieren, nullen,
+    - die KERNEL-HÄLFTE (PML4-Einträge 256..512: HHDM + Kernel-Image) aus der
+      aktiven PML4 KOPIEREN -> Kernel bleibt in jedem Adressraum gemappt,
+    - die User-Hälfte (0..256) bleibt leer = privat.
+
+  vspace::map_user(space, va, phys, w, x):
+    - in EINEN BELIEBIGEN (auch inaktiven) Adressraum mappen, via OffsetPageTable
+      über die HHDM (alle physischen Frames sind über die HHDM erreichbar, egal
+      welcher Adressraum aktiv ist). TLB-Flush wird ge-`ignore`d (inaktiv).
+
+  vspace::switch(space):  CR3 = space (Adressraum-Wechsel).
+  vspace::current():      CR3 lesen.
+
+  SELBSTTEST (vspace::selftest, im Boot-Test): zweiten Adressraum bauen, CR3
+  dorthin schalten, eine nur dort gemappte Page schreiben/lesen, zurückschalten.
+  Beweist: Kernel bleibt über den Wechsel gemappt, private Mappings funktionieren.
+  Ausgabe: "[xernel] vspace: self-test ok".
+
+
+--------------------------------------------------------------------------------
+B) PROZESS-MODELL   (kernel/src/process.rs)
+--------------------------------------------------------------------------------
+
+  Process: { pid, space (CR3), entry, stack_top, heap_break, done }
+
+  run(): erstellt N Prozesse (hier 3) aus dem init-Modul — jeder bekommt seinen
+         eigenen Adressraum, die ELF wird hineingeladen, ein privater Stack
+         gemappt. Dann läuft Prozess 0.
+  enter_current(): CR3 auf den aktuellen Prozess schalten, in Ring 3 springen.
+  exit(code): aktuellen Prozess als fertig markieren, nächsten nicht-fertigen
+              suchen, dorthin wechseln. Sind alle fertig -> halt / boot-test ok.
+
+  Per-Prozess: eigener Heap-Break (SYS_SBRK mappt in den EIGENEN Adressraum),
+  eigene PID (SYS_GETPID = 10, neu).
+
+
+--------------------------------------------------------------------------------
+DER BUG, DER ZEIT KOSTETE — swapgs-UNGLEICHGEWICHT
+--------------------------------------------------------------------------------
+
+Symptom: Prozess 0 lief komplett durch, beim Eintritt in Prozess 1 dann
+    PANIC: #PF page fault at 0x8 (CAUSED_BY_WRITE), in Ring 0.
+
+Ursache: Der Syscall-Eintritt macht `swapgs` (GS.base <-> KERNEL_GS_BASE).
+Ein normaler Syscall macht ZWEI swapgs (Eintritt + vor sysretq) — balanciert.
+ABER SYS_EXIT kehrt NIE per sysretq zurück (es wechselt direkt zum nächsten
+Prozess). Das abschließende swapgs entfiel -> die GS-Base-MSRs gerieten aus dem
+Gleichgewicht. Prozess 1's erster `swapgs` landete dann auf GS.base = 0, und
+`mov gs:[8], rsp` schrieb nach Adresse 0x8 -> #PF.
+
+Fix (kernel/src/arch/x86_64/syscall.rs, enter_user): Vor JEDEM Ring-3-Eintritt
+die GS-Base-MSRs explizit in den kanonischen Zustand setzen —
+    GsBase = 0,  KernelGsBase = &PERCPU
+— idempotent, unabhängig davon, ob ein vorheriger Syscall sein swapgs
+ausgelassen hat.
+
+Lehre: Jeder nicht-zurückkehrende Syscall (exit, künftig yield/Prozesswechsel)
+muss den per-CPU-Zustand (GS-Base, später Kernel-Stack) explizit herstellen,
+statt sich auf das balancierte swapgs-Paar zu verlassen.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+    [xernel] vspace: self-test ok
+    [xernel] process 0 ready: cr3=0x5f000 entry=0x400010
+    [xernel] process 1 ready: cr3=0x78000 entry=0x400010
+    [xernel] process 2 ready: cr3=0x91000 entry=0x400010
+    [xernel] --> ring 3: process 0 (cr3=0x5f000)
+    [process 0] hello — eigener Adressraum, eigener Heap
+     heap      : 8 KiB ok
+     ... (Banner + Framebuffer nur Prozess 0) ...
+    [user pid 0] exit(0)
+    [xernel] --> ring 3: process 1 (cr3=0x78000)
+    [process 1] hello — eigener Adressraum, eigener Heap ...
+    [user pid 1] exit(0)
+    [xernel] --> ring 3: process 2 (cr3=0x91000) ...
+    [user pid 2] exit(0)
+    [xernel] all processes exited.
+    xtask: boot-test PASSED
+
+Drei VERSCHIEDENE CR3-Werte = drei getrennte Page-Tables = echte Isolation.
+Jeder Prozess hat seinen eigenen Heap (jeweils "8 KiB ok" frisch).
+
+
+--------------------------------------------------------------------------------
+WARUM DAS UNIVERSELL IST (NICHT FÜR EINEN NUTZER)
+--------------------------------------------------------------------------------
+
+Adressraum-Isolation ist das Fundament JEDES echten OS und genau unsere
+Mikrokernel-Vision: ab hier können Treiber/FS/Netz als getrennte, abgesicherte
+User-Prozesse entstehen (Crash eines Treibers != Kernel-Panic). XOS (mehrere
+Programme), NexusCloud (Services) und ein künftiges AR-OS (Apps) profitieren
+alle. KVM/Hypervisor (NexusClouds Niche-Wunsch) bleibt bewusst aussen vor.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/vspace.rs   NEU: per-Prozess Page-Tables, Selbsttest
+  kernel/src/process.rs              NEU: Prozess-Modell, sequentielle Ausführung
+  kernel/src/elf.rs                  load(image, space) — lädt in gegebenen AS
+  kernel/src/arch/x86_64/syscall.rs  enter_user setzt GS-Base (swapgs-Fix)
+  kernel/src/syscall.rs              SYS_GETPID=10; exit/sbrk -> process::*
+  kernel/src/main.rs                 process::run() statt user::run()
+  userland/init/src/main.rs          PID-bewusst; nur PID 0 zeichnet Framebuffer

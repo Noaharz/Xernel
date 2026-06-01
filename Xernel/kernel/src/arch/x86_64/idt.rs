@@ -35,8 +35,14 @@ pub fn init() {
         idt.alignment_check.set_handler_fn(alignment);
         idt.simd_floating_point.set_handler_fn(simd);
 
-        // Device IRQs delivered via the LAPIC.
-        idt[super::apic::TIMER_VECTOR].set_handler_fn(super::apic::timer_handler);
+        // Device IRQs delivered via the LAPIC. The timer uses a naked entry
+        // (full context save + preemption), so it is installed by raw address.
+        // SAFETY: `timer_isr` is a valid interrupt entry that saves/restores all
+        // state and ends in `iretq`.
+        unsafe {
+            idt[super::apic::TIMER_VECTOR]
+                .set_handler_addr(x86_64::VirtAddr::new(super::apic::timer_isr as *const () as u64));
+        }
         idt[super::apic::SPURIOUS_VECTOR].set_handler_fn(super::apic::spurious_handler);
         idt[super::keyboard::KEYBOARD_VECTOR].set_handler_fn(super::keyboard::irq_handler);
 

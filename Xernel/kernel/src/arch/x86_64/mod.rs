@@ -14,6 +14,7 @@ mod idt;
 mod keyboard;
 mod paging;
 mod syscall;
+mod vspace;
 
 use limine::request::{HhdmRequest, MemmapRequest, ModulesRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
@@ -131,6 +132,42 @@ pub fn framebuffer_info() -> Option<[u64; 5]> {
     framebuffer::info()
 }
 
+// ---- Per-process address spaces ----
+
+/// Create a new address space (kernel half shared). Returns its handle (PML4
+/// physical address) or `None`.
+pub fn vspace_new() -> Option<u64> {
+    vspace::new()
+}
+
+/// Map a user page into address space `space`.
+pub fn vspace_map(space: u64, virt: u64, phys: u64, writable: bool, executable: bool) -> bool {
+    vspace::map_user(space, virt, phys, writable, executable)
+}
+
+/// Allocate+zero+map a fresh user page into `space`.
+pub fn vspace_alloc_map(space: u64, virt: u64, writable: bool, executable: bool) -> bool {
+    vspace::alloc_map_user(space, virt, writable, executable)
+}
+
+/// Switch the active address space.
+///
+/// # Safety
+/// `space` must be a valid address space from [`vspace_new`].
+pub unsafe fn vspace_switch(space: u64) {
+    unsafe { vspace::switch(space) }
+}
+
+/// Handle of the currently active address space.
+pub fn vspace_current() -> u64 {
+    vspace::current()
+}
+
+/// Run the address-space self-test (create + switch + read/write + restore).
+pub fn vspace_selftest() -> bool {
+    vspace::selftest()
+}
+
 /// In-kernel keyboard decode/buffer self-test (no hardware, no blocking).
 pub fn keyboard_selftest() -> bool {
     keyboard::selftest()
@@ -144,6 +181,14 @@ pub fn init_thread_stack(stack: &mut [u64], entry: extern "C" fn() -> !) -> u64 
 /// Initialise `syscall`/`sysret` support (MSRs + per-CPU scratch).
 pub fn init_syscalls() {
     syscall::init();
+}
+
+/// Set the per-process kernel stack used by BOTH the syscall entry path
+/// (PERCPU) and ring 3 -> ring 0 interrupts (TSS RSP0), so a process is always
+/// entered/preempted onto its own kernel stack.
+pub fn set_kernel_stack(top: u64) {
+    syscall::set_kernel_stack(top);
+    gdt::set_rsp0(top);
 }
 
 /// Map a user-accessible page (`writable`/`executable` control W/NX).

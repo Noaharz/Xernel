@@ -67,9 +67,9 @@ struct PageInfo {
     phys: u64,
 }
 
-/// Load `image` into the current address space. Returns the entry virtual
-/// address on success.
-pub fn load(image: &[u8]) -> Result<u64, ElfError> {
+/// Load `image` into address space `space` (a handle from
+/// `arch::vspace_new`). Returns the entry virtual address on success.
+pub fn load(image: &[u8], space: u64) -> Result<u64, ElfError> {
     if image.len() < 64 {
         return Err(ElfError::TooSmall);
     }
@@ -135,7 +135,7 @@ pub fn load(image: &[u8]) -> Result<u64, ElfError> {
         unsafe {
             core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, PAGE as usize);
         }
-        if !arch::map_user(page, phys, info.writable, info.executable) {
+        if !arch::vspace_map(space, page, phys, info.writable, info.executable) {
             return Err(ElfError::MapFailed);
         }
         info.phys = phys;

@@ -31,10 +31,10 @@ mod elf;
 mod ipc;
 mod mm;
 mod panic;
+mod process;
 mod sched;
 mod serial;
 mod syscall;
-mod user;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -70,15 +70,13 @@ extern "C" fn kmain() -> ! {
         println!("[xernel] cap: self-test ok");
         assert!(arch::keyboard_selftest(), "keyboard self-test failed");
         println!("[xernel] kbd: self-test ok");
+        assert!(arch::vspace_selftest(), "address-space self-test failed");
+        println!("[xernel] vspace: self-test ok");
     }
 
-    // Load and enter the first ring-3 user program. Never returns; under
-    // boot-test the SYS_EXIT handler exits QEMU on success.
-    //
-    // Note: the milestone-2.0 IPC demo (`demo::run`) also lives here but cannot
-    // run in the same boot, because the cooperative scheduler's `start()`
-    // abandons this boot context and never returns. It is exercised on its own.
-    user::run();
+    // Create the user processes (each in its own address space) and run them.
+    // Never returns; under boot-test the last SYS_EXIT exits QEMU on success.
+    process::run();
 }
 
 /// Spin until the LAPIC timer has advanced by `n` ticks, with a bounded budget
