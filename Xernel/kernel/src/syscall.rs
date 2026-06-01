@@ -11,7 +11,17 @@
 
 use alloc::string::String;
 
+use spin::Mutex;
+
 use crate::{arch, mm::frame, println};
+
+/// Next free virtual address for device-MMIO mappings (`SYS_IOMAP`). Each
+/// process maps into its OWN address space at the returned address, so a single
+/// monotonically increasing allocator across processes is fine (the same VA in
+/// different address spaces does not collide).
+static NEXT_MMIO_VA: Mutex<u64> = Mutex::new(0x5000_0000);
+const MMIO_REGION_END: u64 = 0x6000_0000;
+const PAGE: u64 = 4096;
 
 /// Write `len` bytes from user address `ptr` to a console fd (1=stdout,
 /// 2=stderr; both go to the serial console). Args: fd, ptr, len. Returns the
@@ -49,6 +59,20 @@ pub const SYS_YIELD: u64 = 11;
 /// dword. Lets a user-space driver discover PCI devices (privileged port I/O is
 /// done by the kernel on its behalf).
 pub const SYS_PCI_READ: u64 = 12;
+/// Map device MMIO into the calling process. Args: phys, len. Returns the user
+/// virtual address the region is mapped at (uncached), or `u64::MAX` on failure.
+/// Lets a user-space driver reach a device's memory-mapped registers (e.g. a
+/// PCI BAR).
+pub const SYS_IOMAP: u64 = 13;
+/// Allocate a physically-contiguous, zeroed DMA buffer and map it into the
+/// caller. Args: len, out_ptr (pointer to a `[u64; 2]` the kernel fills with
+/// `[user_vaddr, phys_addr]`). Returns 0 on success, `u64::MAX` on failure. The
+/// phys address is what a device is told to DMA to/from.
+pub const SYS_DMA_ALLOC: u64 = 14;
+
+/// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
+static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
+const DMA_REGION_END: u64 = 0x7000_0000;
 
 // sysinfo keys.
 const INFO_RAM_TOTAL: u64 = 0;
@@ -88,6 +112,8 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
             args[2] as u8,
             args[3] as u8,
         )),
+        SYS_IOMAP => sys_iomap(args[0], args[1]),
+        SYS_DMA_ALLOC => sys_dma_alloc(args[0], args[1]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -167,6 +193,73 @@ fn sys_fb_info(ptr: u64) -> u64 {
     for (i, value) in info.iter().enumerate() {
         buf[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
     }
+    0
+}
+
+/// Map `len` bytes of device physical memory (a PCI BAR) into the current
+/// process's address space, uncached. Returns the user virtual address.
+fn sys_iomap(phys: u64, len: u64) -> u64 {
+    if len == 0 || len > (16 << 20) {
+        return u64::MAX;
+    }
+    let phys_base = phys & !(PAGE - 1);
+    let offset = phys - phys_base;
+    let pages = (offset + len).div_ceil(PAGE);
+
+    let mut next = NEXT_MMIO_VA.lock();
+    let va_base = *next;
+    match va_base.checked_add(pages * PAGE) {
+        Some(end) if end <= MMIO_REGION_END => {}
+        _ => return u64::MAX,
+    }
+    for i in 0..pages {
+        if !arch::map_user_device(va_base + i * PAGE, phys_base + i * PAGE) {
+            return u64::MAX;
+        }
+    }
+    *next = va_base + pages * PAGE;
+    va_base + offset
+}
+
+/// Allocate a physically-contiguous, zeroed DMA buffer of `len` bytes, map it
+/// into the current process (cached, RW, NX), and write `[user_vaddr, phys]`
+/// to `out_ptr`. Returns 0 on success.
+fn sys_dma_alloc(len: u64, out_ptr: u64) -> u64 {
+    if len == 0 || len > (1 << 20) {
+        return u64::MAX;
+    }
+    let pages = len.div_ceil(PAGE);
+    let Some(phys) = frame::alloc_contiguous(pages) else {
+        return u64::MAX;
+    };
+    // Zero the buffer through the HHDM before user code sees it.
+    // SAFETY: freshly allocated contiguous frames, reachable via the HHDM.
+    unsafe {
+        core::ptr::write_bytes(
+            (phys + arch::hhdm_offset()) as *mut u8,
+            0,
+            (pages * PAGE) as usize,
+        );
+    }
+    let mut next = NEXT_DMA_VA.lock();
+    let va_base = *next;
+    match va_base.checked_add(pages * PAGE) {
+        Some(end) if end <= DMA_REGION_END => {}
+        _ => return u64::MAX,
+    }
+    for i in 0..pages {
+        if !arch::map_user(va_base + i * PAGE, phys + i * PAGE, true, false) {
+            return u64::MAX;
+        }
+    }
+    *next = va_base + pages * PAGE;
+    drop(next);
+
+    let Some(buf) = user_slice_mut(out_ptr, 16) else {
+        return u64::MAX;
+    };
+    buf[0..8].copy_from_slice(&va_base.to_le_bytes());
+    buf[8..16].copy_from_slice(&phys.to_le_bytes());
     0
 }
 
