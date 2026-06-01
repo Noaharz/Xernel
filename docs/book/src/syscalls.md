@@ -30,8 +30,14 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 7 | `READ_NB` | fd, ptr, len | #bytes (0 = leer) | Wie `READ`, aber **nie blockierend** (für Idle-/Animations-Loops). |
 | 8 | `SBRK` | delta (i64) | alter Break / `u64::MAX` | Verschiebt den Heap-Break (Unix-`sbrk`); `delta = 0` fragt ab. |
 | 9 | `FB_INFO` | ptr | 0 / `u64::MAX` | Mappt den Framebuffer in User-Space; schreibt `[addr, width, height, pitch, bpp]` (5×u64) nach `ptr`. |
+| 10 | `GETPID` | — | pid | PID des aktuellen Prozesses. |
+| 11 | `YIELD` | — | 0 | Gibt die CPU an den nächsten bereiten Prozess ab (kooperativ). |
 
 Unbekannte Nummern liefern `u64::MAX`.
+
+> Jeder Prozess läuft in seinem **eigenen Adressraum** (eigene Page-Table) —
+> Speicher ist zwischen Prozessen isoliert. Prozesse laufen **verzahnt**
+> (kooperatives Multitasking über `YIELD`).
 
 ## Minimaler Rust-Wrapper (Kopiervorlage)
 

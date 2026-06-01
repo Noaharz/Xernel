@@ -1,0 +1,145 @@
+================================================================================
+0.13 — PREEMPTIVES SCHEDULING: DER TIMER ERZWINGT DEN WECHSEL
+================================================================================
+
+Zeitraum:      2026-05-31
+Ausgangspunkt: Phase 0.12 — kooperatives Multitasking (Prozesse wechseln nur per
+               SYS_YIELD). Ein Prozess der nie yieldet, läuft ewig.
+Ergebnis:      PREEMPTIVES Multitasking: der LAPIC-Timer unterbricht einen
+               laufenden Ring-3-Prozess und schaltet zum nächsten — ohne dass
+               der Prozess mitwirkt. Das ist „echtes" Multitasking und der
+               Schutz davor, dass ein Amok-Prozess das ganze System blockiert
+               (wichtig sobald Treiber/Services als Prozesse laufen).
+
+
+--------------------------------------------------------------------------------
+DIE KERNIDEE — TIMER-INTERRUPT PARKT WIE EIN YIELD
+--------------------------------------------------------------------------------
+
+Der Trick, der es sauber macht: ein vom Timer unterbrochener Prozess wird über
+GENAU DENSELBEN Kernel-Thread-Switch geparkt wie beim kooperativen Yield. Der
+Timer-Interrupt aus Ring 3 landet auf dem KERNEL-STACK DES PROZESSES (TSS RSP0 =
+dessen kstack), sichert dort den vollen User-Kontext und ruft dann den normalen
+Scheduler (process::yield_now). Resume und Park sind damit für preemptive und
+kooperative Wechsel EINHEITLICH.
+
+Voraussetzung (aus 0.13, Stufe 1): TSS RSP0 ist jetzt PER PROZESS gesetzt
+(gdt::set_rsp0, via arch::set_kernel_stack zusammen mit dem Syscall-Stack), so
+dass der Interrupt auf dem richtigen Stack landet. (TSS ist `packed` ->
+write_unaligned nötig.)
+
+
+--------------------------------------------------------------------------------
+DER NAKED TIMER-ISR   (kernel/src/arch/x86_64/apic.rs)
+--------------------------------------------------------------------------------
+
+Der Timer kann in Ring 0 (mitten im Kernel/Syscall) ODER Ring 3 (User) feuern.
+Beide Fälle brauchen unterschiedliche Behandlung:
+
+  test byte [rsp+8], 3        ; CS & 3: kam der Interrupt aus Ring 3?
+  jnz  from_user
+
+  from_kernel:                ; Ring 0 — NICHT preempten (wir sind im Kernel)
+    push (caller-saved)
+    call timer_tick           ; nur ticks++ und EOI
+    pop  (caller-saved)
+    iretq
+
+  from_user:                  ; Ring 3 — voller Save + Preempt
+    swapgs                    ; auf Kernel-GS (Konsistenz, s.u.)
+    push (alle 15 GP-Register) ; voller User-Kontext auf dem Prozess-kstack
+    call timer_preempt        ; ticks++, EOI, dann yield_now() -> Wechsel
+    pop  (alle 15)            ; (kehrt zurück, wenn dieser Prozess wieder dran ist)
+    swapgs
+    iretq
+
+Installiert per set_handler_addr (roher ISR statt extern "x86-interrupt"), siehe
+idt.rs.
+
+WARUM kein Preempt aus Ring 0? Wird der Kernel mitten in einem Syscall
+unterbrochen, würde ein Wechsel dort den Kernel-Zustand auf dem Stack hängen
+lassen. Also: nur Ring-3-Prozesse werden preemptet; in-Kernel-Code läuft kurz zu
+Ende (Syscalls sind kurz). Ein blockierender Syscall (SYS_READ) gibt damit noch
+nicht an andere Prozesse ab — bekannte Grenze.
+
+
+--------------------------------------------------------------------------------
+DAS bedingte swapgs — WARUM ÜBERHAUPT?
+--------------------------------------------------------------------------------
+
+Der Kernel selbst nutzt GS nur im Syscall-Stub (PERCPU). Trotzdem ist das swapgs
+hier NÖTIG — wegen der Konsistenz zwischen preemptiven und kooperativen Wechseln:
+
+  - Ein kooperativ geparkter Prozess (mitten im Syscall) erwartet beim Resume
+    GS.base = PERCPU (sein Eintritts-swapgs hat das gesetzt).
+  - Ein vom Timer aus Ring 3 unterbrochener Prozess hat GS.base = 0 (User).
+
+Ohne swapgs im ISR würde ein Wechsel von einem preemptierten (GS=0) zu einem
+kooperativ geparkten Prozess (erwartet GS=PERCPU) das swapgs-Paar des Syscalls
+aus dem Gleichgewicht bringen -> falsche GS.base in Userspace. MIT swapgs im ISR
+(nur aus Ring 3) gilt einheitlich: im Kernel GS.base = PERCPU, in User = 0 —
+egal über welchen Pfad gewechselt wird.
+
+
+--------------------------------------------------------------------------------
+STACK-ALIGNMENT IM ISR
+--------------------------------------------------------------------------------
+
+RSP0 ist 16-Byte-aligned. Aus Ring 3 pusht die CPU 5 Qwords (SS,RSP,RFLAGS,CS,
+RIP) -> rsp%16==8. Nach 15 weiteren Pushes -> rsp%16==0, also ist der folgende
+`call` ABI-korrekt ausgerichtet. (Kein zusätzliches Padding nötig.)
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — VERZAHNUNG OHNE YIELD
+--------------------------------------------------------------------------------
+
+init macht jetzt Busy-Loops mit Ausgaben und ruft NIE yield. Wenn die Ausgabe
+trotzdem verzahnt -> Preemption.
+
+    cargo xtask run --test
+
+      [pid 1] work 2
+      [pid 2] work 2
+      [pid 0] work 2
+      [pid 1] work 3
+      [pid 2] work 3
+    [process 2] fertig
+    [user pid 2] exit(0)
+    [process 1] fertig ...
+      [pid 0] work 3
+    [process 0] fertig
+    [xernel] all processes exited.
+    xtask: boot-test PASSED
+
+Die Reihenfolge ist TIMING-ABHÄNGIG (1,2,0 ...), nicht das saubere Round-Robin
+aus 0.12 — genau das beweist echte Preemption: der Timer schlägt zu, wo immer er
+gerade zuschlägt. Kein Prozess hat freiwillig abgegeben.
+
+Timer-Frequenz für die Demo erhöht (REG_TIMER_INIT 10M -> 1M), damit häufiger
+preemptet wird.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE GRENZEN (BEWUSST, SPÄTER)
+--------------------------------------------------------------------------------
+
+  - Blockierende Syscalls (SYS_READ) geben nicht an andere Prozesse ab (Preempt
+    nur aus Ring 3, nicht aus dem Kernel).
+  - Kein XMM-Save: der Kernel ist soft-float und fasst XMM nie an; User-XMM
+    bleibt in den Registern, solange wir nicht zwei User-Prozesse haben, die
+    SSE nutzen UND zwischen ihnen XMM erhalten werden muss. -> Sobald
+    SSE-User-Prozesse parallel laufen, muss der Context-Switch FXSAVE/FXRSTOR
+    machen. (Aktuell tut init kein SSE im preemptierten Pfad -> ok.)
+  - Sterbende Prozesse geben Speicher noch nicht frei (Leak).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/gdt.rs      static mut TSS, set_rsp0 (write_unaligned)
+  kernel/src/arch/x86_64/mod.rs      set_kernel_stack setzt auch RSP0
+  kernel/src/arch/x86_64/apic.rs     naked timer_isr + timer_tick/timer_preempt
+  kernel/src/arch/x86_64/idt.rs      Timer-Vektor via set_handler_addr
+  userland/init/src/main.rs          Busy-Loop-Demo ohne yield

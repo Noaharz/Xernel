@@ -16,7 +16,9 @@ Stand: 2026-05-30. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 - **Capabilities:** CNode/CapEntry-Grundstrukturen (noch nicht an Syscalls
   gebunden).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 8 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 10 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+- **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
+  **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.
 - **Dynamischer Speicher:** wachsender User-Heap via `SBRK`.
 
@@ -31,6 +33,10 @@ Stand: 2026-05-30. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.7 TastaturInput | PS/2-Tastatur + `READ` → interaktiv |
 | 0.8 XOS_Feedback | SSE, `READ_NB`, externes Booten (`--init`), Loader-Fix |
 | 0.9 UserHeap | `SBRK` → dynamischer Speicher; Stack-Alignment-Fix |
+| 0.10 Framebuffer | `FB_INFO` → Pixel-Grafik aus dem User-Space |
+| 0.11 Multiprocessing | Prozesse mit isolierten Adressräumen |
+| 0.12 Multitasking | kooperatives Scheduling (`YIELD`) — verzahnte Prozesse |
+| 0.13 Preemption | timer-getriebenes preemptives Scheduling |
 
 ## XOS — das erste OS auf Xernel
 

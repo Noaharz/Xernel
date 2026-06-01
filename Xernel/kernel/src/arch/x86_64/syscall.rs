@@ -13,7 +13,9 @@
 
 use core::arch::naked_asm;
 
-use x86_64::registers::model_specific::{Efer, EferFlags, KernelGsBase, LStar, SFMask, Star};
+use x86_64::registers::model_specific::{
+    Efer, EferFlags, GsBase, KernelGsBase, LStar, SFMask, Star,
+};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
@@ -88,6 +90,16 @@ pub fn init() {
     }
 }
 
+/// Set the kernel stack the syscall entry switches to (per-process). `top` is
+/// the top-of-stack address; it is 16-byte aligned for ABI correctness.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: single-CPU; PERCPU is only mutated here and read by the entry stub
+    // (with interrupts masked during scheduling), so there is no race.
+    unsafe {
+        PERCPU.kernel_rsp = top & !0xf;
+    }
+}
+
 /// Enter ring 3 at `entry` with `user_stack_top` as the user stack pointer.
 /// Never returns to the caller.
 ///
@@ -95,10 +107,18 @@ pub fn init() {
 /// `entry` and `user_stack_top` must be valid, user-accessible mappings, and
 /// the syscall MSRs must already be initialised via [`init`].
 pub unsafe fn enter_user(entry: u64, user_stack_top: u64) -> ! {
-    // We deliberately do not `swapgs` here: while in the kernel GS.base is 0
-    // (the user value) and KERNEL_GS_BASE holds the per-CPU pointer, which is
-    // exactly the state user code should run with. The first `swapgs` happens
-    // on syscall entry. RFLAGS 0x202 = reserved bit + IF (interrupts on).
+    // Force the GS base into the canonical "running user" state: GS.base = 0
+    // (user) and KERNEL_GS_BASE = &PERCPU (so the first `swapgs` on syscall
+    // entry lands on the per-CPU scratch). This is reset on EVERY entry because
+    // a syscall that never returns (e.g. `exit`, which switches to another
+    // process) skips its closing `swapgs` and would otherwise leave GS.base
+    // unbalanced — the next process's first `swapgs` would then give GS.base 0
+    // and `mov gs:[8], rsp` would fault at address 0x8.
+    // SAFETY: writing the GS-base MSRs is safe; we set both to known values.
+    unsafe {
+        GsBase::write(VirtAddr::new(0));
+        KernelGsBase::write(VirtAddr::new(core::ptr::addr_of!(PERCPU) as u64));
+    }
     unsafe {
         core::arch::asm!(
             "mov rsp, {stack}",
