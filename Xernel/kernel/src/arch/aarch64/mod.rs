@@ -46,6 +46,24 @@ pub fn framebuffer_info() -> Option<[u64; 5]> {
     None
 }
 
+pub fn vspace_new() -> Option<u64> {
+    None
+}
+pub fn vspace_map(_space: u64, _virt: u64, _phys: u64, _writable: bool, _executable: bool) -> bool {
+    false
+}
+pub fn vspace_alloc_map(_space: u64, _virt: u64, _writable: bool, _executable: bool) -> bool {
+    false
+}
+pub unsafe fn vspace_switch(_space: u64) {}
+pub fn vspace_current() -> u64 {
+    0
+}
+pub fn vspace_selftest() -> bool {
+    true
+}
+pub fn set_kernel_stack(_top: u64) {}
+
 pub fn keyboard_selftest() -> bool {
     true
 }

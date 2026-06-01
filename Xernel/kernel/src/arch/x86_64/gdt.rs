@@ -41,7 +41,10 @@ pub struct Selectors {
     pub tss: SegmentSelector,
 }
 
-static TSS: Once<TaskStateSegment> = Once::new();
+// The TSS is `static mut` because RSP0 (the kernel stack used on ring 3 -> ring
+// 0 interrupts) is updated per process by the scheduler. Single-CPU, so the
+// only writer is `set_rsp0`; the CPU reads RSP0 by hardware via the descriptor.
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
 /// Top-of-stack address for a stack array. x86 stacks grow downward, so this
@@ -50,9 +53,22 @@ fn stack_top(stack: *const u8, size: usize) -> VirtAddr {
     VirtAddr::from_ptr(stack) + size as u64
 }
 
-/// The kernel stack used for ring 3 -> ring 0 interrupt transitions (RSP0).
+/// The default kernel stack for ring 3 -> ring 0 interrupt transitions (RSP0),
+/// used until the scheduler assigns each process its own.
 pub fn rsp0() -> VirtAddr {
     stack_top(addr_of!(RSP0_STACK).cast(), KERNEL_STACK_SIZE)
+}
+
+/// Set the kernel stack the CPU switches to on a ring 3 -> ring 0 interrupt
+/// (TSS RSP0). Called by the scheduler so each process is preempted onto its
+/// own kernel stack.
+pub fn set_rsp0(top: u64) {
+    // SAFETY: single-CPU; this is the only writer of RSP0, and a 64-bit aligned
+    // write is not torn from the CPU's point of view.
+    unsafe {
+        // The TSS is `packed(4)`, so the field is not 8-byte aligned -> unaligned.
+        core::ptr::addr_of_mut!(TSS.privilege_stack_table[0]).write_unaligned(VirtAddr::new(top));
+    }
 }
 
 pub fn selectors() -> Selectors {
@@ -60,15 +76,16 @@ pub fn selectors() -> Selectors {
 }
 
 pub fn init() {
-    let tss = TSS.call_once(|| {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            stack_top(addr_of!(DF_STACK).cast(), IST_STACK_SIZE);
-        tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] =
-            stack_top(addr_of!(PF_STACK).cast(), IST_STACK_SIZE);
-        tss.privilege_stack_table[0] = rsp0();
-        tss
-    });
+    // SAFETY: init runs once before anything reads the TSS; we set the IST
+    // stacks and the default RSP0 via raw-pointer writes (no `&mut` to static).
+    unsafe {
+        // TSS is `packed(4)`; its VirtAddr fields are unaligned -> write_unaligned.
+        core::ptr::addr_of_mut!(TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize])
+            .write_unaligned(stack_top(addr_of!(DF_STACK).cast(), IST_STACK_SIZE));
+        core::ptr::addr_of_mut!(TSS.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize])
+            .write_unaligned(stack_top(addr_of!(PF_STACK).cast(), IST_STACK_SIZE));
+        core::ptr::addr_of_mut!(TSS.privilege_stack_table[0]).write_unaligned(rsp0());
+    }
 
     let (gdt, selectors) = GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
@@ -78,7 +95,11 @@ pub fn init() {
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
         let user_data = gdt.append(Descriptor::user_data_segment());
         let user_code = gdt.append(Descriptor::user_code_segment());
-        let tss = gdt.append(Descriptor::tss_segment(tss));
+        // The descriptor only captures the TSS base address at build time; no
+        // live reference to the (mutable) TSS is kept afterward.
+        // SAFETY: TSS is initialised above and lives for the whole kernel.
+        let tss_ref: &'static TaskStateSegment = unsafe { &*core::ptr::addr_of!(TSS) };
+        let tss = gdt.append(Descriptor::tss_segment(tss_ref));
         (
             gdt,
             Selectors {

@@ -1,0 +1,132 @@
+================================================================================
+0.12 — MULTITASKING: KOOPERATIVES SCHEDULING (SYS_YIELD)
+================================================================================
+
+Zeitraum:      2026-05-31
+Ausgangspunkt: Phase 0.11 — mehrere Prozesse mit isolierten Adressräumen, aber
+               SEQUENTIELL (einer nach dem anderen).
+Ergebnis:      Prozesse laufen jetzt VERZAHNT. Jeder läuft in Ring 3 bis zu
+               einem SYS_YIELD, dann übernimmt der nächste — echtes
+               kooperatives Multitasking, mit voller Adressraum-Isolation.
+
+
+--------------------------------------------------------------------------------
+DAS DESIGN — KERNEL-THREAD PRO PROZESS
+--------------------------------------------------------------------------------
+
+Jeder Prozess bekommt einen "Kernel-Thread": einen eigenen Kernel-Stack plus
+einen gesicherten Kernel-Stack-Pointer. Das ist genau die Maschinerie aus
+Meilenstein 2.0 (kernel/src/arch/x86_64/context.rs, `switch`), nur erweitert um
+Adressraum und User-Eintritt.
+
+Ein Prozess hat also:
+  - space        : eigener Adressraum (Page-Table / CR3)         [aus 0.11]
+  - user_stack   : in seinem Adressraum
+  - kstack + ksp : eigener Kernel-Stack + gesicherter RSP        [NEU]
+  - kstack_top   : oberes Ende, für den Syscall-Eintritt          [NEU]
+
+WARUM eigener Kernel-Stack pro Prozess? Wenn Prozess A mitten in einem Syscall
+yieldet, bleibt sein Kernel-Zustand auf SEINEM Kernel-Stack liegen, während B
+auf SEINEM läuft. Mit nur einem gemeinsamen Stack würde B den von A überschreiben.
+
+
+--------------------------------------------------------------------------------
+WAS BEIM UMSCHALTEN PASSIERT   (kernel/src/process.rs)
+--------------------------------------------------------------------------------
+
+yield_now() / der Wechsel zu Prozess i (`activate`):
+  1. CR3 = i.space                       (Adressraum wechseln)
+  2. Syscall-Kernel-Stack = i.kstack_top (arch::set_kernel_stack -> PERCPU)
+  3. current = i
+  4. arch::switch_context(&mut prev.ksp, i.ksp)
+       -> sichert die callee-saved Register von prev auf prev's Kernel-Stack,
+          lädt i's Kernel-Stack und springt dorthin.
+
+  Punkte 1–2 laufen auf dem Kernel-Stack in der GETEILTEN oberen Hälfte, deshalb
+  ist der CR3-Wechsel sicher (Kernel-Code/-Stack bleiben gemappt). Punkt 4 läuft
+  NACH Freigabe des Scheduler-Locks (single-CPU, IF während des Syscalls
+  maskiert -> keine Race).
+
+Erststart eines Prozesses: sein Kernel-Stack ist via init_thread_stack so
+präpariert, dass der erste Switch eine `trampoline`-Funktion erreicht, die
+arch::enter_user(entry, user_stack) ruft — Sprung nach Ring 3. Spätere Resumes
+kehren einfach im yield_now nach dem switch_context zurück und laufen weiter bis
+zum sysretq des Syscalls.
+
+exit(): Prozess als Done markieren, zum nächsten wechseln OHNE den sterbenden zu
+sichern. Sind alle Done -> halt / boot-test ok.
+
+
+--------------------------------------------------------------------------------
+GS-BASE-KONSISTENZ ÜBER WECHSEL HINWEG
+--------------------------------------------------------------------------------
+
+Alle Wechsel passieren INNERHALB eines Syscalls (yield/exit), wo GS.base bereits
+= PERCPU ist (Eintritts-swapgs). Ein wieder aufgenommener Prozess erwartet
+GS.base = PERCPU (er ist mitten im Syscall) — passt. Der Erststart über die
+trampoline ruft enter_user, das GS.base/KERNEL_GS_BASE explizit setzt (Fix aus
+0.11). Damit bleibt der GS-Zustand bei jedem Pfad konsistent.
+
+
+--------------------------------------------------------------------------------
+DER NEUE SYSCALL
+--------------------------------------------------------------------------------
+
+  SYS_YIELD = 11   (keine Args)  -> gibt die CPU an den nächsten bereiten
+                                    Prozess ab; kehrt mit 0 zurück, wenn dieser
+                                    Prozess wieder dran ist.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION — VERZAHNTE AUSGABE
+--------------------------------------------------------------------------------
+
+init lässt jeden Prozess "step 0/1/2" drucken und nach jedem Schritt yielden:
+
+    cargo xtask run --test
+
+      [pid 0] step 0
+      [pid 1] step 0
+      [pid 2] step 0
+      [pid 0] step 1
+      [pid 1] step 1
+      [pid 2] step 1
+      [pid 0] step 2
+      [pid 1] step 2
+      [pid 2] step 2
+    [process 0] fertig
+    [user pid 0] exit(0)
+    ... (1, 2) ...
+    [xernel] all processes exited.
+    xtask: boot-test PASSED
+
+Die Reihenfolge 0,1,2 / 0,1,2 / 0,1,2 BEWEIST die Verzahnung: kein Prozess läuft
+durch, jeder gibt nach einem Schritt ab und kommt eine Runde später wieder dran
+— alles über getrennte Adressräume und Kernel-Stacks.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE EINORDNUNG — KOOPERATIV vs PREEMPTIV
+--------------------------------------------------------------------------------
+
+Das ist KOOPERATIVES Multitasking: ein Prozess gibt FREIWILLIG ab (SYS_YIELD).
+Gibt er nie ab, läuft er ewig. Klassische OSe (frühes Mac OS, Windows 3.x) waren
+genau so. Der nächste Schritt ist PREEMPTIV: der LAPIC-Timer erzwingt den
+Wechsel auch ohne yield. Dafür muss der Timer-Interrupt den VOLLEN
+User-Kontext (alle GP-Register + iretq-Frame) sichern/wiederherstellen — ein
+eigener Assembler-Interrupt-Eintritt. Kommt als Phase 0.13.
+
+Weitere Grenzen (bewusst, später): blockierende Syscalls (SYS_READ) geben noch
+nicht an andere Prozesse ab; ein sterbender Prozess gibt seinen Speicher noch
+nicht frei (Leak).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs                Kernel-Thread pro Prozess, Scheduler,
+                                       yield_now/exit/activate/pick_next
+  kernel/src/arch/x86_64/syscall.rs    set_kernel_stack (PERCPU.kernel_rsp)
+  kernel/src/syscall.rs                SYS_YIELD=11
+  userland/init/src/main.rs            verzahnte Demo (step + yield)

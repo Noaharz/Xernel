@@ -19,6 +19,8 @@ const SYS_GET_TICKS: u64 = 4;
 const SYS_SYSINFO: u64 = 5;
 const SYS_SBRK: u64 = 8;
 const SYS_FB_INFO: u64 = 9;
+const SYS_GETPID: u64 = 10;
+const SYS_YIELD: u64 = 11;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -110,6 +112,14 @@ fn ticks() -> u64 {
     syscall3(SYS_GET_TICKS, 0, 0, 0)
 }
 
+fn getpid() -> u64 {
+    syscall3(SYS_GETPID, 0, 0, 0)
+}
+
+fn yield_now() {
+    syscall3(SYS_YIELD, 0, 0, 0);
+}
+
 fn exit(code: u64) -> ! {
     syscall3(SYS_EXIT, code, 0, 0);
     loop {
@@ -151,29 +161,49 @@ fn fb_demo() {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    print("\n");
-    print("  __  __                    _ \n");
-    print(" |  \\/  | ___ _ __ _ __  ___| |\n");
-    print(" | |\\/| |/ _ \\ '__| '_ \\/ -_) |   Xernel OS\n");
-    print(" |_|  |_|\\___/_|  |_| |_\\___|_|   first userland\n");
-    print("\n");
+    let pid = getpid();
 
-    print(" RAM total : ");
-    print_u64(sysinfo(INFO_RAM_TOTAL) / (1024 * 1024));
-    print(" MiB\n");
+    // Every process runs the same program but in its OWN address space.
+    print("\n[process ");
+    print_u64(pid);
+    print("] hello — eigener Adressraum, eigener Heap\n");
 
-    print(" RAM used  : ");
-    print_u64(sysinfo(INFO_RAM_USED) / 1024);
-    print(" KiB\n");
-
-    print(" uptime    : ");
-    print_u64(ticks());
-    print(" ticks\n");
-
+    // Each process allocates from its own private heap (proves isolation).
     heap_check(8192);
-    fb_demo();
 
-    print("\n booted successfully. halting userland.\n\n");
+    // Only the first process draws the banner + framebuffer (the framebuffer is
+    // mapped per address space; mapping it in every process comes later).
+    if pid == 0 {
+        print("  __  __                    _ \n");
+        print(" |  \\/  | ___ _ __ _ __  ___| |\n");
+        print(" | |\\/| |/ _ \\ '__| '_ \\/ -_) |   Xernel OS\n");
+        print(" |_|  |_|\\___/_|  |_| |_\\___|_|   multitasking\n");
+        fb_demo();
+    }
+
+    // Busy work with NO yield: each process just computes between prints. If the
+    // output still INTERLEAVES across processes, the kernel is preempting us
+    // (timer-driven) rather than waiting for a voluntary yield — that is real
+    // preemptive multitasking.
+    let _ = yield_now; // wrapper kept for programs that want cooperative yield
+    let mut step = 0;
+    while step < 4 {
+        print("  [pid ");
+        print_u64(pid);
+        print("] work ");
+        print_u64(step);
+        print("\n");
+        let mut i: u64 = 0;
+        while i < 8_000_000 {
+            core::hint::black_box(i);
+            i += 1;
+        }
+        step += 1;
+    }
+
+    print("[process ");
+    print_u64(pid);
+    print("] fertig\n");
     exit(0);
 }
 
