@@ -32,6 +32,7 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 9 | `FB_INFO` | ptr | 0 / `u64::MAX` | Mappt den Framebuffer in User-Space; schreibt `[addr, width, height, pitch, bpp]` (5×u64) nach `ptr`. |
 | 10 | `GETPID` | — | pid | PID des aktuellen Prozesses. |
 | 11 | `YIELD` | — | 0 | Gibt die CPU an den nächsten bereiten Prozess ab (kooperativ). |
+| 12 | `PCI_READ` | bus, dev, func, offset | dword | Liest 32 Bit aus dem PCI-Config-Space (für User-Space-Treiber). |
 
 Unbekannte Nummern liefern `u64::MAX`.
 
