@@ -69,6 +69,11 @@ pub const SYS_IOMAP: u64 = 13;
 /// `[user_vaddr, phys_addr]`). Returns 0 on success, `u64::MAX` on failure. The
 /// phys address is what a device is told to DMA to/from.
 pub const SYS_DMA_ALLOC: u64 = 14;
+/// Read an I/O port. Args: port, size (1/2/4). Returns the value. For
+/// user-space drivers of legacy (I/O-BAR) devices.
+pub const SYS_PORT_IN: u64 = 15;
+/// Write an I/O port. Args: port, size (1/2/4), value. Returns 0.
+pub const SYS_PORT_OUT: u64 = 16;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -114,6 +119,11 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         )),
         SYS_IOMAP => sys_iomap(args[0], args[1]),
         SYS_DMA_ALLOC => sys_dma_alloc(args[0], args[1]),
+        SYS_PORT_IN => u64::from(arch::port_in(args[0] as u16, args[1] as u8)),
+        SYS_PORT_OUT => {
+            arch::port_out(args[0] as u16, args[1] as u8, args[2] as u32);
+            0
+        }
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX

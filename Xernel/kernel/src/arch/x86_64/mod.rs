@@ -180,6 +180,16 @@ pub fn map_user_device(virt: u64, phys: u64) -> bool {
     paging::map_user_device_idempotent(virt, phys)
 }
 
+/// Read `size` (1/2/4) bytes from an I/O port (mediated privileged I/O).
+pub fn port_in(port: u16, size: u8) -> u32 {
+    pci::port_in(port, size)
+}
+
+/// Write `size` (1/2/4) bytes to an I/O port (mediated privileged I/O).
+pub fn port_out(port: u16, size: u8, value: u32) {
+    pci::port_out(port, size, value);
+}
+
 /// In-kernel keyboard decode/buffer self-test (no hardware, no blocking).
 pub fn keyboard_selftest() -> bool {
     keyboard::selftest()
