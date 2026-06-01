@@ -1,0 +1,84 @@
+================================================================================
+0.14.3 — TREIBER-FRAMEWORK STUFE 3: DMA-PUFFER (SYS_DMA_ALLOC)
+================================================================================
+
+Zeitraum:      2026-06-01
+Ergebnis:      Ein User-Prozess kann einen physisch-zusammenhängenden,
+               user-gemappten DMA-Puffer anfordern UND dessen physische Adresse
+               erfahren — das Herz jedes Treibers: Speicher, den das Gerät per
+               DMA liest/schreibt.
+
+
+--------------------------------------------------------------------------------
+WARUM "PHYSISCH ZUSAMMENHÄNGEND" + "PHYS-ADRESSE"?
+--------------------------------------------------------------------------------
+
+Ein Gerät (z.B. virtio-blk) liest/schreibt Speicher per DMA über PHYSISCHE
+Adressen — es kennt keine virtuellen Adressräume. Der Treiber muss dem Gerät
+also die PHYSISCHE Adresse seines Puffers geben. Und Strukturen wie eine
+Virtqueue müssen physisch zusammenhängend sein (das Gerät folgt physischen
+Zeigern). Der Treiber braucht beides: die USER-VA (um den Puffer zu befüllen/
+auszulesen) und die PHYS-Adresse (um sie dem Gerät zu nennen).
+
+
+--------------------------------------------------------------------------------
+DER NEUE SYSCALL — SYS_DMA_ALLOC = 14
+--------------------------------------------------------------------------------
+
+  Args:     len, out_ptr (Zeiger auf [u64; 2])
+  Wirkung:  allokiert len Bytes physisch ZUSAMMENHÄNGEND, nullt sie, mappt sie
+            user-les/schreibbar (cached, NX) in den AKTIVEN Adressraum.
+            Schreibt [user_vaddr, phys_addr] nach out_ptr.
+  Rückgabe: 0 ok, u64::MAX bei Fehler.
+
+  Kernel:
+   - frame::alloc_contiguous(n) (NEU in mm/frame.rs): n aufeinanderfolgende
+     Frames aus dem Bump-Cursor (nie aus der Free-List) -> garantiert
+     zusammenhängend.
+   - Nullen über die HHDM.
+   - Mapping via arch::map_user (cached, RW, NX) in den aktiven AS, aus einer
+     DMA-Bump-Region (0x6000_0000..0x7000_0000) — PRO PROZESS.
+
+  Cached ist auf x86 korrekt: die Plattform ist DMA-cache-kohärent, das Gerät
+  sieht die CPU-Schreibzugriffe.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     DMA: 4 KiB @ user 0x60000000 phys 0x0007f000  ok
+
+init allokierte 4 KiB, schrieb ein Muster über die User-VA, las es korrekt
+zurück. Der Prozess kennt jetzt user 0x60000000 (zum Befüllen) UND phys 0x7f000
+(für das Gerät).
+
+
+--------------------------------------------------------------------------------
+STAND DES TREIBERS + WAS NOCH FEHLT
+--------------------------------------------------------------------------------
+
+  Stufe 1 (PCI-Discovery)      ✅
+  Stufe 2 (MMIO/BAR-Mapping)   ✅
+  Stufe 3 (DMA-Puffer)         ✅  <- hier
+  Stufe 4 (virtio-Protokoll)   offen
+
+Hinweis: IRQ-Zustellung an den User-Prozess (SYS_IRQ_WAIT) ist NICHT umgesetzt —
+für virtio-blk reicht POLLING des Used-Rings (in Stufe 4). Ein echter
+IRQ-Pfad kommt später, wenn ein Treiber blockierend warten soll.
+
+Stufe 4: virtio-PCI-Capabilities parsen (Common-Config/Notify/ISR/Device-
+Config in den BARs), Feature-Negotiation, Virtqueue aufsetzen (Descriptor-
+Table + Available/Used-Ring im DMA-Puffer), eine Read-Request für Sektor 0
+absenden, Used-Ring pollen, den Magic-String aus der disk.img ausgeben.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/mm/frame.rs    alloc_contiguous (n zusammenhängende Frames)
+  kernel/src/syscall.rs     SYS_DMA_ALLOC=14, sys_dma_alloc, DMA-Bump-Region
+  userland/init/src/main.rs dma_alloc-Wrapper, dma_demo

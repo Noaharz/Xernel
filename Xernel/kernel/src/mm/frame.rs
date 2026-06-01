@@ -75,6 +75,29 @@ impl PhysFrameAllocator {
         None
     }
 
+    /// Allocate `n` physically *contiguous* frames, returning the base address.
+    /// Taken only from the bump cursor (never the free list), so the run is
+    /// guaranteed contiguous. Needed for DMA buffers / virtqueues.
+    pub fn alloc_contiguous(&mut self, n: u64) -> Option<u64> {
+        if n == 0 {
+            return None;
+        }
+        while self.region_idx < self.regions.len() {
+            let region = self.regions[self.region_idx];
+            if self.cursor + n * FRAME_SIZE <= region.end {
+                let pa = self.cursor;
+                self.cursor += n * FRAME_SIZE;
+                self.in_use += n;
+                return Some(pa);
+            }
+            self.region_idx += 1;
+            if let Some(next) = self.regions.get(self.region_idx) {
+                self.cursor = next.start;
+            }
+        }
+        None
+    }
+
     /// Return a previously allocated frame to the pool.
     pub fn free(&mut self, pa: u64) {
         self.free.push(pa);
@@ -98,6 +121,14 @@ pub fn init(regions: impl Iterator<Item = Region>) {
 
 pub fn alloc() -> Option<u64> {
     ALLOCATOR.lock().as_mut().and_then(PhysFrameAllocator::alloc)
+}
+
+/// Allocate `n` physically contiguous frames; returns the base physical address.
+pub fn alloc_contiguous(n: u64) -> Option<u64> {
+    ALLOCATOR
+        .lock()
+        .as_mut()
+        .and_then(|a| a.alloc_contiguous(n))
 }
 
 pub fn free(pa: u64) {

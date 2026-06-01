@@ -174,6 +174,12 @@ pub fn pci_config_read(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     pci::config_read(bus, dev, func, offset)
 }
 
+/// Map one page of device MMIO (uncached) into the CURRENT (active) address
+/// space. Idempotent. Returns `false` on failure.
+pub fn map_user_device(virt: u64, phys: u64) -> bool {
+    paging::map_user_device_idempotent(virt, phys)
+}
+
 /// In-kernel keyboard decode/buffer self-test (no hardware, no blocking).
 pub fn keyboard_selftest() -> bool {
     keyboard::selftest()
