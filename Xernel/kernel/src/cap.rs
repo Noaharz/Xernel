@@ -35,6 +35,27 @@ impl CapEntry {
             badge: 0,
         }
     }
+
+    /// An `IoPort` capability authorizing the port range `[base, base + count)`.
+    /// The range is packed into `object`: high 16 bits = base, low 16 = count.
+    pub const fn io_port(base: u16, count: u16) -> Self {
+        Self::new(CapType::IoPort, ((base as u64) << 16) | count as u64)
+    }
+
+    /// For an `IoPort` capability: does it authorize a `size`-byte access at
+    /// `port`? A width-`size` access touches port addresses `[port, port+size)`,
+    /// so the whole span must lie within the capability's range. Any non-IoPort
+    /// capability authorizes nothing here.
+    pub fn authorizes_port(&self, port: u16, size: u8) -> bool {
+        if self.cap_type != CapType::IoPort {
+            return false;
+        }
+        let base = u32::from((self.object >> 16) as u16);
+        let count = u32::from(self.object as u16);
+        let lo = u32::from(port);
+        let hi = lo + u32::from(size.max(1));
+        lo >= base && hi <= base + count
+    }
 }
 
 /// A capability table: a fixed number of slots, each empty or holding one
@@ -89,6 +110,16 @@ impl CNode {
     pub fn delete(&mut self, index: usize) -> Result<CapEntry, CapError> {
         let slot = self.slots.get_mut(index).ok_or(CapError::InvalidCap)?;
         slot.take().ok_or(CapError::InvalidCap)
+    }
+
+    /// Does this CNode hold any `IoPort` capability authorizing a `size`-byte
+    /// access at `port`? This is the kernel's authority check for port-I/O
+    /// syscalls: no ambient privilege, only what the holder was granted.
+    pub fn authorizes_port(&self, port: u16, size: u8) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|cap| cap.authorizes_port(port, size))
     }
 }
 

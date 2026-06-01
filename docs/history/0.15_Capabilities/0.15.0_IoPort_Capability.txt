@@ -1,0 +1,110 @@
+================================================================================
+0.15.0 — CAPABILITIES STUFE 1: PORT-I/O HINTER EINER CAPABILITY
+================================================================================
+
+Zeitraum:      2026-06-01
+Ergebnis:      Das Kernversprechen von Xernel wird real: Hardware-Autorität ist
+               nicht mehr ambient. Jeder Prozess hat eine CNode (Capability-
+               Tabelle); die Port-I/O-Syscalls prüfen, ob der Aufrufer eine
+               passende IoPort-Capability hält. Derselbe Syscall gelingt für
+               erlaubte Ports und wird für nicht-erlaubte verweigert.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS DER WICHTIGSTE SCHRITT WAR
+--------------------------------------------------------------------------------
+
+Bis hierher durfte JEDER Prozess JEDEN Port ansprechen: SYS_PORT_OUT auf einen
+beliebigen Port, SYS_IOMAP auf eine beliebige physische Adresse. Das ist das
+Gegenteil eines capability-basierten Systems. Die CNode/CapEntry-Strukturen
+existierten seit Phase 0.4 — aber rein dekorativ, an nichts gebunden.
+
+Jetzt ist die erste echte Bindung da: keine ambiente Autorität mehr für Ports.
+Ein Treiber kann nur die Hardware anfassen, für die er eine Capability besitzt.
+
+
+--------------------------------------------------------------------------------
+WAS EINE IoPort-CAPABILITY IST  (kernel/src/cap.rs)
+--------------------------------------------------------------------------------
+
+CapEntry { cap_type: IoPort, object, badge }. Der Port-Bereich [base, base+count)
+ist in `object` gepackt: obere 16 Bit = base, untere 16 Bit = count.
+
+  CapEntry::io_port(base, count)        -> Capability über [base, base+count)
+  cap.authorizes_port(port, size)       -> deckt die Cap einen size-Byte-Zugriff
+                                           bei `port` ab? (Span [port, port+size)
+                                           muss vollständig im Bereich liegen)
+  CNode::authorizes_port(port, size)    -> hält IRGENDEINE Cap im Knoten das ab?
+
+
+--------------------------------------------------------------------------------
+PRO PROZESS EINE CNode + BOOT-SEEDING  (kernel/src/process.rs)
+--------------------------------------------------------------------------------
+
+  - Process bekommt ein Feld `caps: CNode` (64 Slots).
+  - seed_caps(pid): der Root-Task (pid 0) ist der erste Treiber-Host und erhält
+    direkt eine IoPort-Cap über das PCI-I/O-Fenster [0xc000, 0x10000). Jeder
+    andere Prozess startet mit LEERER CNode und bekommt Autorität nur durch
+    Delegation.
+  - current_authorizes_port(port, size): prüft die CNode des laufenden Prozesses.
+
+Bewusst eng: Das gewährte Fenster reicht für die Legacy-Register der virtio-
+Geräte, schließt aber die niedrigen System-Ports aus (PIC 0x20, PIT 0x40,
+CMOS/RTC 0x70, ...). Ein reiferes System würde selbst die Root-Caps aus
+Firmware/einem Manifest ableiten statt sie hart zu setzen.
+
+
+--------------------------------------------------------------------------------
+DIE GATE-PRÜFUNG  (kernel/src/syscall.rs)
+--------------------------------------------------------------------------------
+
+  SYS_PORT_IN  -> sys_port_in(port, size):
+      if !process::current_authorizes_port(port, size) { DENY -> u64::MAX }
+      sonst arch::port_in(...)
+  SYS_PORT_OUT -> sys_port_out(port, size, value):
+      if !...authorizes... { DENY -> u64::MAX (Schreibzugriff findet NICHT statt) }
+      sonst arch::port_out(...)
+
+(SYS_PCI_READ bleibt vorerst ungated — nur lesende Discovery über die Kernel-
+eigenen Ports 0xCF8/0xCFC; bekommt später eine eigene Cap. SYS_IOMAP und
+SYS_DMA_ALLOC sind die nächsten Kandidaten — Stufe 2/3.)
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (userland/init/src/main.rs, cap_demo)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     Sektor 0: "XERNEL-DISK: hello from virtio-blk sector 0!"   (Ports 0xc000 erlaubt)
+     Capability-Check (IoPort):
+    [cap] DENY port_in 0x70 (no IoPort capability)              (Kernel verweigert)
+       port_in(0x70) -> VERWEIGERT (keine Capability) — korrekt (Treiber sieht es)
+    xtask: boot-test PASSED
+
+Derselbe Syscall (SYS_PORT_IN), zwei Ergebnisse — der Unterschied ist allein die
+gehaltene Capability. Der virtio-blk-Treiber funktioniert unverändert (seine
+Ports sind gedeckt); der Zugriff auf CMOS (0x70) wird gesperrt.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Stufe 2: SYS_IOMAP hinter eine Cap über einen physischen Bereich (Frame/
+    IoMem) — ein Treiber darf nur SEINE BAR mappen.
+  - Stufe 3: SYS_DMA_ALLOC gegen ein Untyped-Budget (begrenzter Speicher statt
+    unbegrenzter Allokation).
+  - Delegation: invoke(cap, method, args) + copy/grant zwischen Prozessen, damit
+    ein Root-Server Caps an Kind-Treiber weiterreicht.
+  - SYS_PCI_READ per Cap einschränken.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/cap.rs            io_port(), authorizes_port (CapEntry + CNode)
+  kernel/src/process.rs        caps-Feld, seed_caps, current_authorizes_port
+  kernel/src/syscall.rs        sys_port_in / sys_port_out mit Cap-Gate
+  userland/init/src/main.rs    cap_demo (verbotener Port -> verweigert)
