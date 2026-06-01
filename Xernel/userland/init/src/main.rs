@@ -24,6 +24,8 @@ const SYS_YIELD: u64 = 11;
 const SYS_PCI_READ: u64 = 12;
 const SYS_IOMAP: u64 = 13;
 const SYS_DMA_ALLOC: u64 = 14;
+const SYS_PORT_IN: u64 = 15;
+const SYS_PORT_OUT: u64 = 16;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -120,6 +122,45 @@ fn pci_scan() -> u64 {
 
 fn iomap(phys: u64, len: u64) -> u64 {
     syscall3(SYS_IOMAP, phys, len, 0)
+}
+
+fn port_in(port: u16, size: u64) -> u32 {
+    syscall3(SYS_PORT_IN, u64::from(port), size, 0) as u32
+}
+
+fn port_out(port: u16, size: u64, value: u32) {
+    syscall3(SYS_PORT_OUT, u64::from(port), size, u64::from(value));
+}
+
+/// Talk to the legacy virtio-blk device over its I/O BAR: reset, acknowledge,
+/// and read the disk capacity — proof that the user-space driver reaches the
+/// device's registers and the device responds.
+fn virtio_blk_demo(dev: u64) {
+    let bar0 = pci_read(0, dev, 0, 0x10);
+    if (bar0 & 1) != 1 {
+        print(" virtio-blk: BAR0 ist kein I/O-Port\n");
+        return;
+    }
+    let io = (bar0 & 0xFFFC) as u16; // legacy virtio register block
+    print(" virtio-blk @ I/O 0x");
+    print_hex(u64::from(io), 4);
+    print("\n");
+
+    // Device-status handshake (legacy offset 0x12): reset, ACKNOWLEDGE, DRIVER.
+    port_out(io + 0x12, 1, 0);
+    port_out(io + 0x12, 1, 1);
+    port_out(io + 0x12, 1, 1 | 2);
+
+    // virtio-blk device config (offset 0x14, MSI-X disabled): capacity = u64
+    // count of 512-byte sectors.
+    let lo = u64::from(port_in(io + 0x14, 4));
+    let hi = u64::from(port_in(io + 0x18, 4));
+    let sectors = lo | (hi << 32);
+    print(" Kapazität: ");
+    print_u64(sectors);
+    print(" Sektoren (");
+    print_u64(sectors * 512 / 1024);
+    print(" KiB)\n");
 }
 
 /// Allocate a DMA buffer; returns (user_vaddr, phys_addr) or (u64::MAX, 0).
@@ -335,6 +376,7 @@ pub extern "C" fn _start() -> ! {
     let vdev = pci_scan();
     if vdev != 0xFF {
         iomap_demo(vdev);
+        virtio_blk_demo(vdev);
     }
     dma_demo();
 
