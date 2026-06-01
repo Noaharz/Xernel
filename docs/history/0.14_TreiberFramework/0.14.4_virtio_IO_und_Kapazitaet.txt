@@ -1,0 +1,83 @@
+================================================================================
+0.14.4 — STUFE 4a: MIT DEM virtio-blk-GERÄT SPRECHEN (PORT-I/O + KAPAZITÄT)
+================================================================================
+
+Zeitraum:      2026-06-01
+Ergebnis:      Der User-Space-Treiber kommuniziert erstmals mit dem ECHTEN
+               Gerät: er liest dessen I/O-Register, macht den virtio-Status-
+               Handshake und liest die Disk-Kapazität — die das Gerät korrekt
+               als 2048 Sektoren (1 MiB = unsere disk.img) zurückmeldet.
+
+
+--------------------------------------------------------------------------------
+NEUE PRIMITIVE — PORT-I/O FÜR LEGACY-GERÄTE
+--------------------------------------------------------------------------------
+
+Das gefundene Gerät (0x1af4:0x1001) ist ein TRANSITIONAL virtio-blk. Sein
+Konfigurations-Interface liegt im LEGACY-Modus auf einer I/O-PORT-BAR (BAR0),
+nicht im MMIO. Dafür brauchte der Treiber Port-I/O — privilegiert, also vom
+Kernel vermittelt:
+
+  SYS_PORT_IN  = 15  (port, size 1/2/4) -> Wert
+  SYS_PORT_OUT = 16  (port, size, value)
+
+(arch::port_in/port_out via x86_64 Port. HINWEIS: aktuell ist jeder Port
+erlaubt; ein echtes System würde per Capability einschränken, welche Ports ein
+Treiber anfassen darf.)
+
+
+--------------------------------------------------------------------------------
+DER TREIBER  (userland/init/src/main.rs, virtio_blk_demo)
+--------------------------------------------------------------------------------
+
+  1. BAR0 aus PCI-Config lesen; Bit 0 == 1 => I/O-BAR; Basis = BAR0 & 0xFFFC.
+     -> I/O-Block bei 0xc000.
+  2. Legacy-virtio-Status-Handshake (Register-Offset 0x12):
+       status = 0            (Reset)
+       status = ACKNOWLEDGE  (1)
+       status = ACK | DRIVER (1|2)
+  3. Geräte-Config (Offset 0x14, ohne MSI-X): capacity = u64 in 512-B-Sektoren.
+       lo = in32(0xc014), hi = in32(0xc018)
+  4. Kapazität ausgeben.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     virtio-blk @ I/O 0xc000
+     Kapazität: 2048 Sektoren (1024 KiB)
+
+2048 * 512 = 1 MiB = exakt die in xtask erzeugte disk.img. Das Gerät antwortet
+also korrekt — der ganze Pfad (PCI-Discovery -> I/O-Register -> Status-Handshake
+-> Config-Read) funktioniert aus dem User-Space.
+
+
+--------------------------------------------------------------------------------
+WAS NOCH FEHLT — STUFE 4b (DAS FINALE)
+--------------------------------------------------------------------------------
+
+Echtes "Sektor lesen":
+  - Virtqueue (queue 0) aufsetzen: queue_select=0, queue_size lesen,
+    Descriptor-Table + Available-Ring + Used-Ring in einem DMA-Puffer
+    (SYS_DMA_ALLOC), Queue-PFN = phys>>12 ins Register schreiben, DRIVER_OK.
+  - Read-Request bauen: 3-Descriptor-Kette
+      [0] virtio_blk_req header (type=0 read, sector=0)  — device-readable
+      [1] 512-B-Datenpuffer                              — device-writable
+      [2] 1-B-Status                                     — device-writable
+  - Head-Index in den Available-Ring, Queue-Notify schreiben (Kick).
+  - Used-Ring POLLEN bis Completion (kein IRQ nötig).
+  - Status == 0 prüfen, den Datenpuffer ausgeben -> der Magic-String
+    "XERNEL-DISK: hello from virtio-blk sector 0!" erscheint.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/pci.rs   port_in / port_out
+  kernel/src/arch/x86_64/mod.rs   port_in/port_out export
+  kernel/src/syscall.rs           SYS_PORT_IN=15, SYS_PORT_OUT=16
+  userland/init/src/main.rs       port_in/out-Wrapper, virtio_blk_demo

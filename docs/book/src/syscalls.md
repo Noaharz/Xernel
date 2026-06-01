@@ -35,6 +35,8 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 12 | `PCI_READ` | bus, dev, func, offset | dword | Liest 32 Bit aus dem PCI-Config-Space (für User-Space-Treiber). |
 | 13 | `IOMAP` | phys, len | user-vaddr / `u64::MAX` | Mappt Geräte-MMIO (eine PCI-BAR) uncached in den aufrufenden Prozess. |
 | 14 | `DMA_ALLOC` | len, out_ptr | 0 / `u64::MAX` | Allokiert einen phys.-zusammenhängenden DMA-Puffer; schreibt `[user_vaddr, phys]` nach `out_ptr`. |
+| 15 | `PORT_IN` | port, size | wert | Liest einen I/O-Port (size 1/2/4) — für Legacy-Geräte-Treiber. |
+| 16 | `PORT_OUT` | port, size, value | 0 | Schreibt einen I/O-Port. |
 
 Unbekannte Nummern liefern `u64::MAX`.
 

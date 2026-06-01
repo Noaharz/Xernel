@@ -69,6 +69,10 @@ pub fn pci_config_read(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 {
 pub fn map_user_device(_virt: u64, _phys: u64) -> bool {
     false
 }
+pub fn port_in(_port: u16, _size: u8) -> u32 {
+    0xFFFF_FFFF
+}
+pub fn port_out(_port: u16, _size: u8, _value: u32) {}
 
 pub fn keyboard_selftest() -> bool {
     true

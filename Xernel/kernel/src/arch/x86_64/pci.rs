@@ -27,3 +27,31 @@ pub fn config_read(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
         data.read()
     }
 }
+
+/// Read `size` (1/2/4) bytes from an I/O port. Privileged, so the kernel does it
+/// for a user-space driver (e.g. a legacy virtio device's I/O BAR).
+///
+/// NOTE: currently any port is allowed; a real system would capability-gate
+/// which ports a driver may touch.
+pub fn port_in(port: u16, size: u8) -> u32 {
+    // SAFETY: a port read; for device registers this is the intended access.
+    unsafe {
+        match size {
+            1 => u32::from(Port::<u8>::new(port).read()),
+            2 => u32::from(Port::<u16>::new(port).read()),
+            _ => Port::<u32>::new(port).read(),
+        }
+    }
+}
+
+/// Write `size` (1/2/4) bytes to an I/O port. See [`port_in`] for the caveat.
+pub fn port_out(port: u16, size: u8, value: u32) {
+    // SAFETY: a port write to a device register chosen by the driver.
+    unsafe {
+        match size {
+            1 => Port::<u8>::new(port).write(value as u8),
+            2 => Port::<u16>::new(port).write(value as u16),
+            _ => Port::<u32>::new(port).write(value),
+        }
+    }
+}
