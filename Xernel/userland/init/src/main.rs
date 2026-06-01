@@ -21,6 +21,7 @@ const SYS_SBRK: u64 = 8;
 const SYS_FB_INFO: u64 = 9;
 const SYS_GETPID: u64 = 10;
 const SYS_YIELD: u64 = 11;
+const SYS_PCI_READ: u64 = 12;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -45,8 +46,68 @@ fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     ret
 }
 
+#[inline]
+fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: Xernel syscall ABI; arg 4 goes in r10 (rcx is clobbered by syscall).
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 fn write(bytes: &[u8]) {
     syscall3(SYS_WRITE, STDOUT, bytes.as_ptr() as u64, bytes.len() as u64);
+}
+
+/// Print `v` as `digits` lowercase hex digits (no `0x` prefix).
+fn print_hex(mut v: u64, digits: usize) {
+    let mut buf = [0u8; 16];
+    let mut i = digits;
+    while i > 0 {
+        i -= 1;
+        let nib = (v & 0xF) as u8;
+        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        v >>= 4;
+    }
+    write(&buf[..digits]);
+}
+
+fn pci_read(bus: u64, dev: u64, func: u64, offset: u64) -> u32 {
+    syscall4(SYS_PCI_READ, bus, dev, func, offset) as u32
+}
+
+/// Scan PCI bus 0 from user space and report devices, flagging virtio ones.
+fn pci_scan() {
+    print(" PCI-Scan (Bus 0):\n");
+    for dev in 0..32u64 {
+        let id = pci_read(0, dev, 0, 0); // offset 0: vendor | device<<16
+        let vendor = (id & 0xFFFF) as u16;
+        if vendor == 0xFFFF {
+            continue; // no device in this slot
+        }
+        let device = (id >> 16) as u16;
+        print("   dev ");
+        print_u64(dev);
+        print(": vendor 0x");
+        print_hex(u64::from(vendor), 4);
+        print(" device 0x");
+        print_hex(u64::from(device), 4);
+        if vendor == 0x1af4 {
+            print("   <- VIRTIO");
+        }
+        print("\n");
+    }
 }
 
 fn print(s: &str) {
@@ -179,6 +240,7 @@ pub extern "C" fn _start() -> ! {
         print(" | |\\/| |/ _ \\ '__| '_ \\/ -_) |   Xernel OS\n");
         print(" |_|  |_|\\___/_|  |_| |_\\___|_|   multitasking\n");
         fb_demo();
+        pci_scan();
     }
 
     // Busy work with NO yield: each process just computes between prints. If the
@@ -187,14 +249,14 @@ pub extern "C" fn _start() -> ! {
     // preemptive multitasking.
     let _ = yield_now; // wrapper kept for programs that want cooperative yield
     let mut step = 0;
-    while step < 4 {
+    while step < 3 {
         print("  [pid ");
         print_u64(pid);
         print("] work ");
         print_u64(step);
         print("\n");
         let mut i: u64 = 0;
-        while i < 8_000_000 {
+        while i < 3_000_000 {
             core::hint::black_box(i);
             i += 1;
         }

@@ -282,9 +282,17 @@ fn run_qemu(
     let mut cmd = Command::new(qemu);
     match arch {
         Arch::X86_64 => {
+            let disk = ensure_disk(workspace)?;
             cmd.args(["-M", "q35", "-m", "512M", "-cdrom"])
                 .arg(&iso)
-                .args(["-serial", "stdio", "-no-reboot"]);
+                .args(["-serial", "stdio", "-no-reboot"])
+                // A virtio-blk disk for the user-space block driver to discover.
+                .arg("-drive")
+                .arg(format!(
+                    "file={},if=none,id=disk0,format=raw",
+                    disk.display()
+                ))
+                .args(["-device", "virtio-blk-pci,drive=disk0"]);
             if test {
                 cmd.args([
                     "-device",
@@ -320,6 +328,20 @@ fn run_qemu(
         bail!("qemu exited with {status}");
     }
     Ok(())
+}
+
+/// Ensure a small raw disk image exists for the virtio-blk device, with a
+/// recognisable magic string in sector 0 (so block reads can be verified).
+fn ensure_disk(workspace: &Path) -> Result<PathBuf> {
+    let path = workspace.join("target").join("disk.img");
+    if !path.exists() {
+        let mut data = vec![0u8; 1024 * 1024]; // 1 MiB
+        let magic = b"XERNEL-DISK: hello from virtio-blk sector 0!";
+        data[..magic.len()].copy_from_slice(magic);
+        fs_err::create_dir_all(path.parent().unwrap())?;
+        fs_err::write(&path, &data)?;
+    }
+    Ok(path)
 }
 
 fn fetch_limine(workspace: &Path) -> Result<()> {
