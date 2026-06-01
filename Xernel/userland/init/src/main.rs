@@ -132,9 +132,35 @@ fn port_out(port: u16, size: u64, value: u32) {
     syscall3(SYS_PORT_OUT, u64::from(port), size, u64::from(value));
 }
 
-/// Talk to the legacy virtio-blk device over its I/O BAR: reset, acknowledge,
-/// and read the disk capacity — proof that the user-space driver reaches the
-/// device's registers and the device responds.
+// --- Legacy virtio-blk register offsets (relative to the I/O BAR base) ---
+const VIO_DEVICE_FEATURES: u16 = 0x00; // u32, R
+const VIO_GUEST_FEATURES: u16 = 0x04; // u32, W
+const VIO_QUEUE_PFN: u16 = 0x08; // u32, RW (phys >> 12)
+const VIO_QUEUE_SIZE: u16 = 0x0C; // u16, R
+const VIO_QUEUE_SELECT: u16 = 0x0E; // u16, W
+const VIO_QUEUE_NOTIFY: u16 = 0x10; // u16, W
+const VIO_STATUS: u16 = 0x12; // u8, RW
+const VIO_CONFIG: u16 = 0x14; // device config begins here (no MSI-X)
+
+// Device-status bits.
+const ST_ACK: u32 = 1;
+const ST_DRIVER: u32 = 2;
+const ST_DRIVER_OK: u32 = 4;
+
+// Descriptor flags + request type.
+const DESC_NEXT: u16 = 1;
+const DESC_WRITE: u16 = 2; // device writes into this buffer
+const BLK_T_IN: u32 = 0; // read
+
+const QALIGN: u64 = 4096;
+
+fn align_up(x: u64, a: u64) -> u64 {
+    (x + a - 1) & !(a - 1)
+}
+
+/// Full user-space virtio-blk driver: bring the device up, set up virtqueue 0,
+/// submit a read of sector 0, poll for completion and print the sector's
+/// contents — a disk read driven entirely from Ring 3.
 fn virtio_blk_demo(dev: u64) {
     let bar0 = pci_read(0, dev, 0, 0x10);
     if (bar0 & 1) != 1 {
@@ -146,21 +172,129 @@ fn virtio_blk_demo(dev: u64) {
     print_hex(u64::from(io), 4);
     print("\n");
 
-    // Device-status handshake (legacy offset 0x12): reset, ACKNOWLEDGE, DRIVER.
-    port_out(io + 0x12, 1, 0);
-    port_out(io + 0x12, 1, 1);
-    port_out(io + 0x12, 1, 1 | 2);
+    // 1. Status handshake: reset -> ACKNOWLEDGE -> DRIVER.
+    port_out(io + VIO_STATUS, 1, 0);
+    port_out(io + VIO_STATUS, 1, ST_ACK);
+    port_out(io + VIO_STATUS, 1, ST_ACK | ST_DRIVER);
 
-    // virtio-blk device config (offset 0x14, MSI-X disabled): capacity = u64
-    // count of 512-byte sectors.
-    let lo = u64::from(port_in(io + 0x14, 4));
-    let hi = u64::from(port_in(io + 0x18, 4));
+    // Read capacity (device config, u64 count of 512-byte sectors).
+    let lo = u64::from(port_in(io + VIO_CONFIG, 4));
+    let hi = u64::from(port_in(io + VIO_CONFIG + 4, 4));
     let sectors = lo | (hi << 32);
     print(" Kapazität: ");
     print_u64(sectors);
     print(" Sektoren (");
     print_u64(sectors * 512 / 1024);
     print(" KiB)\n");
+
+    // 2. Feature negotiation: we need nothing fancy for a plain read -> 0.
+    let _devf = port_in(io + VIO_DEVICE_FEATURES, 4);
+    port_out(io + VIO_GUEST_FEATURES, 4, 0);
+
+    // 3. Set up virtqueue 0. Read its device-fixed size, then lay out the
+    //    legacy vring (desc | avail | pad | used) in one contiguous DMA buffer.
+    port_out(io + VIO_QUEUE_SELECT, 2, 0);
+    let n = u64::from(port_in(io + VIO_QUEUE_SIZE, 2));
+    if n == 0 {
+        print(" virtio-blk: queue 0 nicht vorhanden\n");
+        return;
+    }
+    let desc_sz = 16 * n;
+    let avail_sz = 6 + 2 * n;
+    let used_off = align_up(desc_sz + avail_sz, QALIGN);
+    let used_sz = 6 + 8 * n;
+    let total = used_off + used_sz;
+
+    let (q_va, q_phys) = dma_alloc(total);
+    if q_va == u64::MAX {
+        print(" virtio-blk: queue-DMA FEHLER\n");
+        return;
+    }
+    // Tell the device where the queue lives, then mark the driver ready.
+    port_out(io + VIO_QUEUE_PFN, 4, (q_phys >> 12) as u32);
+    port_out(io + VIO_STATUS, 1, ST_ACK | ST_DRIVER | ST_DRIVER_OK);
+
+    // 4. Request buffers: header (16) | data (512) | status (1), one DMA page.
+    let (b_va, b_phys) = dma_alloc(4096);
+    if b_va == u64::MAX {
+        print(" virtio-blk: req-DMA FEHLER\n");
+        return;
+    }
+    let hdr_phys = b_phys;
+    let data_va = b_va + 16;
+    let data_phys = b_phys + 16;
+    let status_va = b_va + 16 + 512;
+    let status_phys = b_phys + 16 + 512;
+
+    // SAFETY: the kernel mapped both DMA buffers as user read/write memory, and
+    // the buffers are physically contiguous so the device can DMA into them.
+    unsafe {
+        // virtio_blk_req header: type = read, reserved = 0, sector = 0.
+        (b_va as *mut u32).write_volatile(BLK_T_IN);
+        ((b_va + 4) as *mut u32).write_volatile(0);
+        ((b_va + 8) as *mut u64).write_volatile(0);
+        (status_va as *mut u8).write_volatile(0xFF); // sentinel
+
+        // Descriptor chain: header (R) -> data (W) -> status (W).
+        write_desc(q_va, 0, hdr_phys, 16, DESC_NEXT, 1);
+        write_desc(q_va, 1, data_phys, 512, DESC_NEXT | DESC_WRITE, 2);
+        write_desc(q_va, 2, status_phys, 1, DESC_WRITE, 0);
+
+        // Available ring: publish descriptor head 0, then bump idx.
+        let avail = q_va + desc_sz;
+        (avail as *mut u16).write_volatile(0); // flags
+        ((avail + 4) as *mut u16).write_volatile(0); // ring[0] = head 0
+        ((avail + 2) as *mut u16).write_volatile(1); // idx = 1
+    }
+
+    // 5. Kick the device.
+    port_out(io + VIO_QUEUE_NOTIFY, 2, 0);
+
+    // 6. Poll the used ring until the request completes.
+    let used_idx = (q_va + used_off + 2) as *const u16;
+    let mut spins = 0u64;
+    loop {
+        // SAFETY: used-ring index lives in our mapped queue buffer.
+        if unsafe { used_idx.read_volatile() } != 0 {
+            break;
+        }
+        spins += 1;
+        if spins > 200_000_000 {
+            print(" virtio-blk: TIMEOUT (keine Completion)\n");
+            return;
+        }
+    }
+
+    // SAFETY: completion is signalled; status + data buffers are now valid.
+    let st = unsafe { (status_va as *const u8).read_volatile() };
+    if st != 0 {
+        print(" virtio-blk: Read-Status ");
+        print_u64(u64::from(st));
+        print(" (Fehler)\n");
+        return;
+    }
+    print(" Sektor 0: \"");
+    for i in 0..64u64 {
+        // SAFETY: 64 bytes well within the 512-byte data buffer.
+        let c = unsafe { ((data_va + i) as *const u8).read_volatile() };
+        if c == 0 {
+            break;
+        }
+        write(&[c]);
+    }
+    print("\"\n");
+}
+
+/// Write one virtqueue descriptor at index `i` of the table starting at `base`.
+///
+/// # Safety
+/// `base` must point at a mapped descriptor table with room for index `i`.
+unsafe fn write_desc(base: u64, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
+    let d = base + i * 16;
+    (d as *mut u64).write_volatile(addr);
+    ((d + 8) as *mut u32).write_volatile(len);
+    ((d + 12) as *mut u16).write_volatile(flags);
+    ((d + 14) as *mut u16).write_volatile(next);
 }
 
 /// Allocate a DMA buffer; returns (user_vaddr, phys_addr) or (u64::MAX, 0).
