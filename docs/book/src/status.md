@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-05-30. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-06-01. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -16,11 +16,15 @@ Stand: 2026-05-30. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 - **Capabilities:** CNode/CapEntry-Grundstrukturen (noch nicht an Syscalls
   gebunden).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 10 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 16 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.
 - **Dynamischer Speicher:** wachsender User-Heap via `SBRK`.
+- **Treiber im User-Space:** Kernel liefert nur Primitive (PCI-Config-Read,
+  MMIO-Map, DMA-Alloc, Port-I/O). Ein **vollständiger virtio-blk-Treiber in
+  Ring 3** richtet eine Virtqueue ein und liest Sektor 0 von der Disk — der
+  Kernel kennt das Wort "virtio" nicht.
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -37,6 +41,7 @@ Stand: 2026-05-30. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.11 Multiprocessing | Prozesse mit isolierten Adressräumen |
 | 0.12 Multitasking | kooperatives Scheduling (`YIELD`) — verzahnte Prozesse |
 | 0.13 Preemption | timer-getriebenes preemptives Scheduling |
+| 0.14 TreiberFramework | User-Space-Treiber: PCI, MMIO, DMA, Port-I/O → virtio-blk liest Sektor 0 |
 
 ## XOS — das erste OS auf Xernel
 

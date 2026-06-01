@@ -1,0 +1,113 @@
+================================================================================
+0.14.5 — STUFE 4b: DAS FINALE — EINEN SEKTOR VON DER DISK LESEN (RING 3)
+================================================================================
+
+Zeitraum:      2026-06-01
+Ergebnis:      Ein vollständiger virtio-blk-Treiber im USER-SPACE liest Sektor 0
+               von der Disk. Auf dem Schirm erscheint der echte Inhalt:
+
+                 Sektor 0: "XERNEL-DISK: hello from virtio-blk sector 0!"
+
+               Damit ist die Mikrokernel-Treiber-Architektur komplett:
+               PCI-Discovery -> MMIO -> DMA -> virtio-Protokoll -> Disk-Read,
+               ALLES aus Ring 3, ohne dass der Kernel den Treiber kennt.
+
+
+--------------------------------------------------------------------------------
+WAS EINE VIRTQUEUE IST
+--------------------------------------------------------------------------------
+
+Eine Virtqueue ist ein Ringpuffer-Paar im gemeinsamen RAM, über das Treiber und
+Gerät Aufträge austauschen. Drei Strukturen (Legacy-Layout, queue size N):
+
+  Descriptor-Table   16*N Bytes      Array { addr(u64), len(u32),
+                                              flags(u16), next(u16) }
+  Available-Ring     6 + 2*N Bytes   flags(u16), idx(u16), ring[N](u16)
+                                     -> Treiber legt Auftrags-Indizes hier ab
+  (Padding bis 4096-Grenze)
+  Used-Ring          6 + 8*N Bytes   flags(u16), idx(u16),
+                                     ring[N]{ id(u32), len(u32) }
+                                     -> Gerät meldet fertige Aufträge hier
+
+Alles liegt in EINEM phys.-zusammenhängenden DMA-Puffer (SYS_DMA_ALLOC). Dem
+Gerät wird nur die "Queue-PFN" = phys >> 12 ins Register 0x08 geschrieben; aus N
+errechnet es selbst die Offsets von Avail- und Used-Ring.
+
+
+--------------------------------------------------------------------------------
+DER ABLAUF EINES BLOCK-READS  (userland/init/src/main.rs, virtio_blk_demo)
+--------------------------------------------------------------------------------
+
+  1. Status-Handshake: reset -> ACKNOWLEDGE -> DRIVER (Reg 0x12).
+  2. Feature-Negotiation: Device-Features lesen (0x00), Guest-Features = 0
+     schreiben (0x04) — für einen schlichten Read brauchen wir nichts Extra.
+  3. Virtqueue 0 aufsetzen: queue_select=0 (0x0E), queue_size N lesen (0x0C),
+     vring-Layout berechnen, DMA-Puffer holen, PFN schreiben (0x08),
+     DRIVER_OK setzen (0x12).
+  4. Request bauen — 3-Descriptor-Kette in einem zweiten DMA-Puffer
+     (header | data | status):
+        desc[0] header  16 B  flags=NEXT          (Gerät LIEST)
+                  { type=0 (read), reserved=0, sector=0 }
+        desc[1] data   512 B  flags=NEXT|WRITE     (Gerät SCHREIBT)
+        desc[2] status   1 B  flags=WRITE          (Gerät SCHREIBT, 0=OK)
+     Available-Ring: ring[0]=0 (Ketten-Kopf), dann idx=1.
+  5. Kick: queue_notify=0 (Reg 0x10) -> Gerät wacht auf.
+  6. Used-Ring pollen: warten bis used.idx != 0 (kein IRQ nötig). Dann
+     status-Byte prüfen (0=OK) und die 512 Bytes ausgeben.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS AUF x86 OHNE SPEICHER-BARRIEREN GEHT
+--------------------------------------------------------------------------------
+
+x86 hat starke Speicherordnung (Stores werden nicht gegeneinander umsortiert)
+UND ist DMA-cache-kohärent. Deshalb sieht das Gerät unsere Ring-Writes ohne
+explizite Barriere, und wir sehen die per DMA geschriebenen Daten ohne
+Cache-Flush. Auf AArch64/RISC-V braucht derselbe Code zusätzlich DMB/Fence —
+das kommt mit dem jeweiligen Port.
+
+
+--------------------------------------------------------------------------------
+VERIFIKATION
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     virtio-blk @ I/O 0xc000
+     Kapazität: 2048 Sektoren (1024 KiB)
+     Sektor 0: "XERNEL-DISK: hello from virtio-blk sector 0!"
+     [init] fertig
+    xtask: boot-test PASSED
+
+Der String stammt aus target/disk.img, das xtask vor dem Boot mit genau diesem
+Inhalt in Sektor 0 anlegt. Er wurde also wirklich VON DER DISK gelesen.
+
+
+--------------------------------------------------------------------------------
+EINORDNUNG — WARUM DAS WICHTIG IST
+--------------------------------------------------------------------------------
+
+Treiber laufen im User-Space, isoliert, mit eigenem Adressraum. Ein Bug im
+Disk-Treiber kann den Kernel nicht crashen. Der Kernel stellt nur die fünf
+Primitive bereit (PCI-Config, MMIO-Map, DMA-Alloc, Port-I/O) und kennt das
+Wort "virtio" nicht. Das ist die Mikrokernel-Idee in einem laufenden Beispiel
+und das Fundament für ein echtes Storage-/Dateisystem (was XOS und NexusCloud
+brauchen) sowie weitere virtio-Geräte (net, gpu) nach demselben Muster.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT (NICHT TEIL DIESER STUFE)
+--------------------------------------------------------------------------------
+
+  - Den Treiber aus init herauslösen in einen eigenen Prozess + ein schlankes
+    Block-Protokoll (read/write-Requests von anderen Prozessen).
+  - Schreiben (BLK_T_OUT) zusätzlich zum Lesen.
+  - IRQ-statt-Polling (SYS_IRQ_WAIT) für Effizienz unter Last.
+  - Port-I/O / MMIO per Capability einschränken (Least Privilege).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs   virtio_blk_demo (kompletter Treiber), write_desc
