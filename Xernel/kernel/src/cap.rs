@@ -56,6 +56,30 @@ impl CapEntry {
         let hi = lo + u32::from(size.max(1));
         lo >= base && hi <= base + count
     }
+
+    /// An `IoMem` capability authorizing the physical range `[base, base+len)`.
+    /// Physical addresses can be 64-bit (high PCI BARs), so the range uses both
+    /// fields: `object` = base, `badge` = length in bytes.
+    pub const fn io_mem(base: u64, len: u64) -> Self {
+        Self {
+            cap_type: CapType::IoMem,
+            object: base,
+            badge: len,
+        }
+    }
+
+    /// For an `IoMem` capability: does it authorize mapping the physical range
+    /// `[phys, phys+len)`? The whole span must lie within the capability.
+    pub fn authorizes_mmio(&self, phys: u64, len: u64) -> bool {
+        if self.cap_type != CapType::IoMem {
+            return false;
+        }
+        let (Some(end), Some(cap_end)) = (phys.checked_add(len), self.object.checked_add(self.badge))
+        else {
+            return false;
+        };
+        phys >= self.object && end <= cap_end
+    }
 }
 
 /// A capability table: a fixed number of slots, each empty or holding one
@@ -120,6 +144,15 @@ impl CNode {
             .iter()
             .flatten()
             .any(|cap| cap.authorizes_port(port, size))
+    }
+
+    /// Does this CNode hold any `IoMem` capability authorizing a mapping of the
+    /// physical range `[phys, phys+len)`? Consulted by `SYS_IOMAP`.
+    pub fn authorizes_mmio(&self, phys: u64, len: u64) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|cap| cap.authorizes_mmio(phys, len))
     }
 }
 

@@ -29,6 +29,11 @@ const CAP_SLOTS: usize = 64;
 /// devices' legacy registers, but not the low system ports (PIC, PIT, CMOS, …).
 const PCI_IO_BASE: u16 = 0xc000;
 const PCI_IO_COUNT: u16 = 0x4000; // [0xc000, 0x10000)
+/// PCI memory-BAR window (the 32-bit MMIO hole on q35). The root driver task is
+/// granted an `IoMem` capability over exactly this range — it covers device
+/// BARs but NOT real RAM (which lives far below) or the kernel.
+const PCI_MMIO_BASE: u64 = 0xc000_0000;
+const PCI_MMIO_LEN: u64 = 0x4000_0000; // [0xc000_0000, 0x1_0000_0000)
 const USER_STACK_VA: u64 = 0x80_0000;
 const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
@@ -123,6 +128,7 @@ fn seed_caps(pid: u64) -> CNode {
     let mut caps = CNode::new(CAP_SLOTS);
     if pid == 0 {
         let _ = caps.insert(0, CapEntry::io_port(PCI_IO_BASE, PCI_IO_COUNT));
+        let _ = caps.insert(1, CapEntry::io_mem(PCI_MMIO_BASE, PCI_MMIO_LEN));
     }
     caps
 }
@@ -135,6 +141,15 @@ pub fn current_authorizes_port(port: u16, size: u8) -> bool {
     guard
         .as_ref()
         .is_some_and(|s| s.procs[s.current].caps.authorizes_port(port, size))
+}
+
+/// Does the currently running process hold a capability authorizing a mapping
+/// of the physical range `[phys, phys+len)`? Consulted by `SYS_IOMAP`.
+pub fn current_authorizes_mmio(phys: u64, len: u64) -> bool {
+    let guard = SCHED.lock();
+    guard
+        .as_ref()
+        .is_some_and(|s| s.procs[s.current].caps.authorizes_mmio(phys, len))
 }
 
 /// Make process at index `i` the active one: switch its address space and

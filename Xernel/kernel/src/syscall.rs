@@ -213,6 +213,13 @@ fn sys_iomap(phys: u64, len: u64) -> u64 {
     let offset = phys - phys_base;
     let pages = (offset + len).div_ceil(PAGE);
 
+    // Authority check: the process must hold an IoMem capability covering the
+    // whole physical span we are about to map — no mapping arbitrary RAM.
+    if !crate::process::current_authorizes_mmio(phys_base, pages * PAGE) {
+        println!("[cap] DENY iomap phys {phys_base:#x} (no IoMem capability)");
+        return u64::MAX;
+    }
+
     let mut next = NEXT_MMIO_VA.lock();
     let va_base = *next;
     match va_base.checked_add(pages * PAGE) {

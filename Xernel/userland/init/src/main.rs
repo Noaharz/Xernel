@@ -383,13 +383,24 @@ fn iomap_demo(dev: u64) {
 /// covering the PCI I/O window. A port OUTSIDE that range — here CMOS/RTC at
 /// 0x70 — must be refused by the kernel, even though the call is identical.
 fn cap_demo() {
-    print(" Capability-Check (IoPort):\n");
-    let r = syscall3(SYS_PORT_IN, 0x70, 1, 0); // CMOS/RTC — not in our range
+    print(" Capability-Check:\n");
+    // IoPort: CMOS/RTC at 0x70 is outside our granted port window.
+    let r = syscall3(SYS_PORT_IN, 0x70, 1, 0);
     if r == u64::MAX {
-        print("   port_in(0x70) -> VERWEIGERT (keine Capability) — korrekt\n");
+        print("   port_in(0x70)    -> VERWEIGERT (keine IoPort-Cap) — korrekt\n");
     } else {
-        print("   port_in(0x70) -> 0x");
+        print("   port_in(0x70)    -> 0x");
         print_hex(r, 2);
+        print("  (FEHLER: haette gesperrt sein muessen)\n");
+    }
+    // IoMem: phys 0x100000 is real RAM/kernel, outside the PCI MMIO window —
+    // a driver must not be able to map arbitrary physical memory.
+    let m = iomap(0x10_0000, 0x1000);
+    if m == u64::MAX {
+        print("   iomap(0x100000)  -> VERWEIGERT (keine IoMem-Cap) — korrekt\n");
+    } else {
+        print("   iomap(0x100000)  -> 0x");
+        print_hex(m, 8);
         print("  (FEHLER: haette gesperrt sein muessen)\n");
     }
 }
