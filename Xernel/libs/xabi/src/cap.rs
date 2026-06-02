@@ -25,4 +25,5 @@ pub enum CapType {
     Notification = 8,
     IrqHandler = 9,
     IoPort = 10,
+    IoMem = 11,
 }

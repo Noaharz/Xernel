@@ -1,0 +1,104 @@
+================================================================================
+0.15.1 — CAPABILITIES STUFE 2: MMIO-MAPPING HINTER EINER CAPABILITY
+================================================================================
+
+Zeitraum:      2026-06-02
+Ergebnis:      Nach den Ports ist jetzt auch das physische Mappen gebunden.
+               SYS_IOMAP prüft, ob der Aufrufer eine IoMem-Capability über den
+               angefragten physischen Bereich hält. Der virtio-blk-Treiber mappt
+               weiterhin seine BAR (gedeckt) und liest Sektor 0; ein Versuch,
+               echtes RAM zu mappen, wird verweigert.
+
+
+--------------------------------------------------------------------------------
+WARUM PORTS ALLEIN NICHT REICHEN
+--------------------------------------------------------------------------------
+
+Stufe 1 hat die Port-I/O-Syscalls gebunden. Aber moderne PCI-Geräte werden kaum
+noch über Ports gesteuert, sondern über memory-mapped Register (MMIO) in ihren
+BARs. Solange SYS_IOMAP jede beliebige physische Adresse mappen darf, ist die
+Port-Cap nur ein halbes Versprechen: ein Prozess könnte schlicht den Kernel-Code,
+fremden Prozess-Speicher oder Geräte-Register direkt ins eigene VSpace ziehen.
+
+Stufe 2 schließt diese Lücke: ein Treiber darf nur physische Bereiche mappen,
+für die er eine IoMem-Capability besitzt.
+
+
+--------------------------------------------------------------------------------
+WAS EINE IoMem-CAPABILITY IST  (kernel/src/cap.rs)
+--------------------------------------------------------------------------------
+
+CapEntry { cap_type: IoMem, object, badge }. Anders als bei Ports passt ein
+physischer Bereich nicht in 16 Bit — BARs können 64-bittig liegen. Darum nutzt
+IoMem BEIDE Felder:
+
+  object = base (physische Startadresse)
+  badge  = len  (Länge in Bytes)
+
+  CapEntry::io_mem(base, len)           -> Capability über [base, base+len)
+  cap.authorizes_mmio(phys, len)        -> deckt die Cap das Mappen von
+                                           [phys, phys+len) ab? (Span muss
+                                           vollständig im Bereich liegen;
+                                           checked_add gegen Überlauf)
+  CNode::authorizes_mmio(phys, len)     -> hält IRGENDEINE Cap im Knoten das ab?
+
+Neuer ABI-Typ: CapType::IoMem = 11 (in libs/xabi/src/cap.rs, append-only nach
+IoPort = 10).
+
+
+--------------------------------------------------------------------------------
+SEEDING + GATE  (kernel/src/process.rs, kernel/src/syscall.rs)
+--------------------------------------------------------------------------------
+
+  - seed_caps(pid): der Root-Task (pid 0) erhält zusätzlich zur IoPort-Cap eine
+    IoMem-Cap über das PCI-MMIO-Fenster [0xc000_0000, 0x1_0000_0000) — die
+    32-Bit-MMIO-Lücke auf q35. Das deckt die Geräte-BARs (virtio-blk liegt bei
+    phys 0xfebd5000), schließt aber echtes RAM (weit darunter) und den Kernel aus.
+  - current_authorizes_mmio(phys, len): prüft die CNode des laufenden Prozesses.
+  - sys_iomap: nach dem Auflösen von phys_base/pages, VOR der Mapping-Schleife:
+      if !process::current_authorizes_mmio(phys_base, pages*PAGE) {
+          DENY -> u64::MAX
+      }
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (userland/init/src/main.rs, cap_demo)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     virtio-blk @ I/O 0xc000
+     Sektor 0: "XERNEL-DISK: hello from virtio-blk sector 0!"   (BAR gedeckt)
+     Capability-Check:
+    [cap] DENY port_in 0x70 (no IoPort capability)
+       port_in(0x70)    -> VERWEIGERT (keine IoPort-Cap) — korrekt
+    [cap] DENY iomap phys 0x100000 (no IoMem capability)
+       iomap(0x100000)  -> VERWEIGERT (keine IoMem-Cap) — korrekt
+    xtask: boot-test PASSED
+
+Der virtio-blk-Treiber mappt unverändert seine BAR und liest Sektor 0 — diese
+Adresse liegt im gewährten IoMem-Fenster. Derselbe SYS_IOMAP auf phys 0x100000
+(1 MiB, echtes RAM) wird verweigert, weil keine Cap ihn deckt. Wie bei den Ports:
+ein Syscall, zwei Ergebnisse, der Unterschied ist allein die gehaltene Capability.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Stufe 3: SYS_DMA_ALLOC gegen ein Untyped-Budget (begrenzter Speicher statt
+    unbegrenzter Allokation).
+  - Delegation: invoke(cap, method, args) + copy/grant zwischen Prozessen, damit
+    ein Root-Server Caps an Kind-Treiber weiterreicht.
+  - SYS_PCI_READ per Cap einschränken.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  libs/xabi/src/cap.rs         CapType::IoMem = 11 (ABI, append-only)
+  kernel/src/cap.rs            io_mem(), authorizes_mmio (CapEntry + CNode)
+  kernel/src/process.rs        IoMem-Seed für Root, current_authorizes_mmio
+  kernel/src/syscall.rs        sys_iomap mit Cap-Gate
+  userland/init/src/main.rs    cap_demo (verbotenes RAM-Mapping -> verweigert)
