@@ -66,8 +66,9 @@ pub const SYS_PCI_READ: u64 = 12;
 pub const SYS_IOMAP: u64 = 13;
 /// Allocate a physically-contiguous, zeroed DMA buffer and map it into the
 /// caller. Args: len, out_ptr (pointer to a `[u64; 2]` the kernel fills with
-/// `[user_vaddr, phys_addr]`). Returns 0 on success, `u64::MAX` on failure. The
-/// phys address is what a device is told to DMA to/from.
+/// `[user_vaddr, phys_addr]`). Returns 0 on success, `u64::MAX` on failure (or
+/// if the allocation exceeds the caller's `Untyped` budget). The phys address is
+/// what a device is told to DMA to/from.
 pub const SYS_DMA_ALLOC: u64 = 14;
 /// Read an I/O port. Args: port, size (1/2/4). Returns the value. For
 /// user-space drivers of legacy (I/O-BAR) devices.
@@ -238,14 +239,39 @@ fn sys_iomap(phys: u64, len: u64) -> u64 {
 /// Allocate a physically-contiguous, zeroed DMA buffer of `len` bytes, map it
 /// into the current process (cached, RW, NX), and write `[user_vaddr, phys]`
 /// to `out_ptr`. Returns 0 on success.
+///
+/// Bounded by an `Untyped` capability: the allocation is first charged against
+/// the process's memory budget, so a driver cannot pin unbounded physical
+/// memory for DMA. Unlike the port/MMIO gates (which check a fixed range), this
+/// budget is consumable — it shrinks with each allocation.
 fn sys_dma_alloc(len: u64, out_ptr: u64) -> u64 {
     if len == 0 || len > (1 << 20) {
         return u64::MAX;
     }
     let pages = len.div_ceil(PAGE);
-    let Some(phys) = frame::alloc_contiguous(pages) else {
+    let need = pages * PAGE;
+
+    if !crate::process::current_charge_untyped(need) {
+        println!("[cap] DENY dma_alloc {need:#x} bytes (Untyped budget exhausted)");
         return u64::MAX;
-    };
+    }
+
+    // The charge is committed; if the allocation itself fails, give it back.
+    match dma_alloc_charged(pages, out_ptr) {
+        Some(()) => 0,
+        None => {
+            crate::process::current_refund_untyped(need);
+            u64::MAX
+        }
+    }
+}
+
+/// Do the actual DMA allocation+mapping for `pages` pages, writing
+/// `[user_vaddr, phys]` to `out_ptr`. The caller has already charged the
+/// process's `Untyped` budget; returns `None` (so the caller refunds) on any
+/// failure.
+fn dma_alloc_charged(pages: u64, out_ptr: u64) -> Option<()> {
+    let phys = frame::alloc_contiguous(pages)?;
     // Zero the buffer through the HHDM before user code sees it.
     // SAFETY: freshly allocated contiguous frames, reachable via the HHDM.
     unsafe {
@@ -259,22 +285,20 @@ fn sys_dma_alloc(len: u64, out_ptr: u64) -> u64 {
     let va_base = *next;
     match va_base.checked_add(pages * PAGE) {
         Some(end) if end <= DMA_REGION_END => {}
-        _ => return u64::MAX,
+        _ => return None,
     }
     for i in 0..pages {
         if !arch::map_user(va_base + i * PAGE, phys + i * PAGE, true, false) {
-            return u64::MAX;
+            return None;
         }
     }
     *next = va_base + pages * PAGE;
     drop(next);
 
-    let Some(buf) = user_slice_mut(out_ptr, 16) else {
-        return u64::MAX;
-    };
+    let buf = user_slice_mut(out_ptr, 16)?;
     buf[0..8].copy_from_slice(&va_base.to_le_bytes());
     buf[8..16].copy_from_slice(&phys.to_le_bytes());
-    0
+    Some(())
 }
 
 /// Read an I/O port — but only if the calling process holds an `IoPort`

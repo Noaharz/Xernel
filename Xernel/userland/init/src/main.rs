@@ -403,6 +403,17 @@ fn cap_demo() {
         print_hex(m, 8);
         print("  (FEHLER: haette gesperrt sein muessen)\n");
     }
+    // Untyped: a 1 MiB DMA request exceeds our whole memory budget — a driver
+    // must not be able to pin unbounded physical memory.
+    let mut out = [0u64; 2];
+    let d = syscall3(SYS_DMA_ALLOC, 1 << 20, out.as_mut_ptr() as u64, 0);
+    if d == u64::MAX {
+        print("   dma(1 MiB)       -> VERWEIGERT (Untyped-Budget) — korrekt\n");
+    } else {
+        print("   dma(1 MiB)       -> 0x");
+        print_hex(out[0], 8);
+        print("  (FEHLER: haette gesperrt sein muessen)\n");
+    }
 }
 
 fn print(s: &str) {
