@@ -34,6 +34,10 @@ const PCI_IO_COUNT: u16 = 0x4000; // [0xc000, 0x10000)
 /// BARs but NOT real RAM (which lives far below) or the kernel.
 const PCI_MMIO_BASE: u64 = 0xc000_0000;
 const PCI_MMIO_LEN: u64 = 0x4000_0000; // [0xc000_0000, 0x1_0000_0000)
+/// DMA-allocation budget granted to the root driver task as an `Untyped`
+/// capability. Generous enough for real virtqueue/request buffers (tens of KiB),
+/// but bounded — a driver cannot pin unbounded physical memory for DMA.
+const DMA_BUDGET: u64 = 256 * 1024;
 const USER_STACK_VA: u64 = 0x80_0000;
 const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
@@ -129,6 +133,7 @@ fn seed_caps(pid: u64) -> CNode {
     if pid == 0 {
         let _ = caps.insert(0, CapEntry::io_port(PCI_IO_BASE, PCI_IO_COUNT));
         let _ = caps.insert(1, CapEntry::io_mem(PCI_MMIO_BASE, PCI_MMIO_LEN));
+        let _ = caps.insert(2, CapEntry::untyped(DMA_BUDGET));
     }
     caps
 }
@@ -150,6 +155,27 @@ pub fn current_authorizes_mmio(phys: u64, len: u64) -> bool {
     guard
         .as_ref()
         .is_some_and(|s| s.procs[s.current].caps.authorizes_mmio(phys, len))
+}
+
+/// Charge `amount` bytes against the current process's `Untyped` budget,
+/// returning `true` if it had enough. Consulted by `SYS_DMA_ALLOC` — a driver
+/// can pin only as much DMA memory as its budget allows.
+pub fn current_charge_untyped(amount: u64) -> bool {
+    let mut guard = SCHED.lock();
+    guard.as_mut().is_some_and(|s| {
+        let cur = s.current;
+        s.procs[cur].caps.charge_untyped(amount)
+    })
+}
+
+/// Refund `amount` bytes to the current process's `Untyped` budget, undoing a
+/// charge whose allocation later failed.
+pub fn current_refund_untyped(amount: u64) {
+    let mut guard = SCHED.lock();
+    if let Some(s) = guard.as_mut() {
+        let cur = s.current;
+        s.procs[cur].caps.refund_untyped(amount);
+    }
 }
 
 /// Make process at index `i` the active one: switch its address space and

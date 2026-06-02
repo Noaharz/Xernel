@@ -1,0 +1,130 @@
+================================================================================
+0.15.2 — CAPABILITIES STUFE 3: DMA HINTER EINEM UNTYPED-BUDGET
+================================================================================
+
+Zeitraum:      2026-06-02
+Ergebnis:      SYS_DMA_ALLOC ist gebunden — jede Allokation wird gegen ein
+               Untyped-Budget des Prozesses verrechnet. Der virtio-blk-Treiber
+               allokiert weiterhin seine Virtqueue- und Request-Puffer (innerhalb
+               des Budgets) und liest Sektor 0; eine 1-MiB-Anforderung, die das
+               ganze Budget übersteigt, wird verweigert. Damit sind ALLE drei
+               autoritätsgewährenden Treiber-Primitive cap-gated: Port-I/O,
+               MMIO-Mapping, DMA.
+
+
+--------------------------------------------------------------------------------
+EINE ANDERE ART VON CAPABILITY: EIN BUDGET, KEIN BEREICH
+--------------------------------------------------------------------------------
+
+IoPort und IoMem (Stufe 1/2) sind BEREICHS-Capabilities: sie decken einen festen
+Port- bzw. physischen Adressbereich ab, beliebig oft nutzbar, unverändert. Ein
+DMA-Budget ist anders — es ist VERBRAUCHBAR:
+
+  - object hält das verbleibende Budget in Bytes.
+  - Jede DMA-Allokation verrechnet pages*PAGE und SCHRUMPFT das Budget.
+  - Ist das Budget aufgebraucht, scheitert die nächste Allokation.
+
+Das ist die Capability-Form, die nicht "darfst du das anfassen?" beantwortet,
+sondern "wie VIEL darfst du noch?". Sie verhindert, dass ein Treiber unbegrenzt
+physischen Speicher für DMA festnagelt (eine klassische Erschöpfungs-/DoS-
+Gefahr).
+
+Hinweis zur Ehrlichkeit: ein vollwertiges seL4-Untyped benennt eine konkrete
+physische Region, die man per "retype" in typisierte Objekte umwandelt. Hier ist
+Untyped ein reines Byte-Budget — der Frame-Allocator des Kernels ist ein globaler
+Bump-Cursor ohne Free, also gibt es (noch) keine prozess-eigene physische Region.
+Das Budget modelliert die RESSOURCEN-Begrenzung, die die eigentliche
+Sicherheits-Eigenschaft ist.
+
+
+--------------------------------------------------------------------------------
+WAS EINE Untyped-CAPABILITY IST  (kernel/src/cap.rs)
+--------------------------------------------------------------------------------
+
+CapType::Untyped existierte schon (= 1, seit Phase 0.4). Neu sind die Operationen:
+
+  CapEntry::untyped(bytes)              -> Cap mit object = verbleibendes Budget
+  CNode::charge_untyped(amount)        -> erste Untyped-Cap mit genug Budget
+                                          finden, object -= amount, true; sonst
+                                          false (kein Budget -> keine Allokation)
+  CNode::refund_untyped(amount)        -> Budget zurückgeben (object += amount),
+                                          falls eine bereits verrechnete
+                                          Allokation später doch scheitert
+
+charge/refund brauchen &mut self (sie verändern die Cap) — anders als die
+read-only authorizes_*-Prüfungen der Bereichs-Caps.
+
+
+--------------------------------------------------------------------------------
+SEEDING + GATE  (kernel/src/process.rs, kernel/src/syscall.rs)
+--------------------------------------------------------------------------------
+
+  - seed_caps(pid): der Root-Task (pid 0) erhält zusätzlich eine Untyped-Cap mit
+    DMA_BUDGET = 256 KiB. Großzügig für echte Virtqueue-/Request-Puffer (zig KiB),
+    aber begrenzt.
+  - current_charge_untyped(amount) / current_refund_untyped(amount): verrechnen
+    gegen das Budget des laufenden Prozesses (beide nehmen die SCHED-Sperre mut).
+  - sys_dma_alloc: VOR der eigentlichen Allokation wird das Budget verrechnet:
+        if !current_charge_untyped(need) { DENY -> u64::MAX }
+    Die Allokation+Mapping selbst wandert in dma_alloc_charged(pages, out_ptr)
+    -> Option<()>; scheitert sie nach dem Verrechnen (kein RAM, VA-Region voll,
+    schlechter out_ptr), wird das Budget per current_refund_untyped
+    zurückgegeben. So bleibt das Budget bei transienten Fehlern korrekt.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (userland/init/src/main.rs, cap_demo)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     Sektor 0: "XERNEL-DISK: hello from virtio-blk sector 0!"   (DMA im Budget)
+     DMA: 4 KiB @ user 0x60004000 phys 0x00085000  ok            (DMA im Budget)
+     Capability-Check:
+    [cap] DENY port_in 0x70 (no IoPort capability)
+       port_in(0x70)    -> VERWEIGERT (keine IoPort-Cap) — korrekt
+    [cap] DENY iomap phys 0x100000 (no IoMem capability)
+       iomap(0x100000)  -> VERWEIGERT (keine IoMem-Cap) — korrekt
+    [cap] DENY dma_alloc 0x100000 bytes (Untyped budget exhausted)
+       dma(1 MiB)       -> VERWEIGERT (Untyped-Budget) — korrekt
+    xtask: boot-test PASSED
+
+Der virtio-blk-Treiber und dma_demo allokieren zusammen ~20 KiB — gedeckt vom
+256-KiB-Budget. Die 1-MiB-Anforderung übersteigt das GANZE Budget und wird
+verweigert. Derselbe Syscall, zwei Ergebnisse, der Unterschied ist allein das
+verbleibende Budget.
+
+
+--------------------------------------------------------------------------------
+ALLE DREI TREIBER-PRIMITIVE SIND JETZT GATED
+--------------------------------------------------------------------------------
+
+  SYS_PORT_IN/OUT  -> IoPort-Cap (Bereich)        Stufe 1 (0.15.0)
+  SYS_IOMAP        -> IoMem-Cap  (Bereich)         Stufe 2 (0.15.1)
+  SYS_DMA_ALLOC    -> Untyped-Cap (Budget)         Stufe 3 (0.15.2)
+
+Damit kann ein Treiber NUR die Hardware anfassen, mappen und so viel Speicher
+festnageln, wie ihm explizit gewährt wurde. Keine ambiente Hardware-Autorität
+mehr.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Delegation: invoke(cap, method, args) + copy/grant zwischen Prozessen, damit
+    ein Root-Server Caps (auch Teil-Budgets) an Kind-Treiber weiterreicht — der
+    Weg zum Treiber-als-eigener-Prozess.
+  - SYS_PCI_READ per Cap einschränken (aktuell ungated, nur lesende Discovery).
+  - Echtes Untyped: eine physische Region benennen und in typisierte Objekte
+    retypen (sobald der Frame-Allocator Regionen/Free kennt).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/cap.rs            untyped(), charge_untyped, refund_untyped
+  kernel/src/process.rs        Untyped-Seed (DMA_BUDGET), current_charge/refund
+  kernel/src/syscall.rs        sys_dma_alloc mit Budget-Gate + dma_alloc_charged
+  userland/init/src/main.rs    cap_demo (1-MiB-DMA über Budget -> verweigert)

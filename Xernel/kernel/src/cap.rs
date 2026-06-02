@@ -80,6 +80,15 @@ impl CapEntry {
         };
         phys >= self.object && end <= cap_end
     }
+
+    /// An `Untyped` capability with a `bytes`-large allocation budget. Unlike the
+    /// range caps above, this one is CONSUMABLE: `object` holds the remaining
+    /// budget and shrinks as memory is allocated against it. (A fuller seL4-style
+    /// `Untyped` would name a specific physical region to retype; here it is a
+    /// pure byte budget, which is what bounds a driver's DMA footprint.)
+    pub const fn untyped(bytes: u64) -> Self {
+        Self::new(CapType::Untyped, bytes)
+    }
 }
 
 /// A capability table: a fixed number of slots, each empty or holding one
@@ -153,6 +162,34 @@ impl CNode {
             .iter()
             .flatten()
             .any(|cap| cap.authorizes_mmio(phys, len))
+    }
+
+    /// Charge `amount` bytes against the first `Untyped` capability that still
+    /// has enough budget, decrementing it. Returns `true` if charged. This is
+    /// how `SYS_DMA_ALLOC` is bounded: a process can pin only as much physical
+    /// memory as its `Untyped` budget allows — no unbounded allocation.
+    pub fn charge_untyped(&mut self, amount: u64) -> bool {
+        for cap in self.slots.iter_mut().flatten() {
+            if cap.cap_type == CapType::Untyped && cap.object >= amount {
+                cap.object -= amount;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return `amount` bytes to the first `Untyped` capability — used to undo a
+    /// charge when the allocation it paid for later fails. Best-effort: a no-op
+    /// if the holder has no `Untyped` cap.
+    pub fn refund_untyped(&mut self, amount: u64) {
+        if let Some(cap) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|c| c.cap_type == CapType::Untyped)
+        {
+            cap.object = cap.object.saturating_add(amount);
+        }
     }
 }
 
