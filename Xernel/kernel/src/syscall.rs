@@ -75,6 +75,12 @@ pub const SYS_DMA_ALLOC: u64 = 14;
 pub const SYS_PORT_IN: u64 = 15;
 /// Write an I/O port. Args: port, size (1/2/4), value. Returns 0.
 pub const SYS_PORT_OUT: u64 = 16;
+/// Identify the capability in one of the caller's own CNode slots. Args: slot,
+/// out_ptr (pointer to a `[u64; 3]` the kernel fills with `[type, a, b]`, a
+/// normalized view — see `CapEntry::describe`). Returns 0 on success, `u64::MAX`
+/// if the slot is empty or out of range. Lets a process enumerate the authority
+/// it holds.
+pub const SYS_CAP_IDENTIFY: u64 = 17;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -122,6 +128,7 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_DMA_ALLOC => sys_dma_alloc(args[0], args[1]),
         SYS_PORT_IN => sys_port_in(args[0] as u16, args[1] as u8),
         SYS_PORT_OUT => sys_port_out(args[0] as u16, args[1] as u8, args[2] as u32),
+        SYS_CAP_IDENTIFY => sys_cap_identify(args[0], args[1]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -319,6 +326,23 @@ fn sys_port_out(port: u16, size: u8, value: u32) -> u64 {
         return u64::MAX;
     }
     arch::port_out(port, size, value);
+    0
+}
+
+/// Identify the capability in the caller's CNode slot `slot`, writing the
+/// normalized `[type, a, b]` triple to `out_ptr`. Returns 0 on success, or
+/// `u64::MAX` if the slot is empty/out of range or the buffer is bad. A process
+/// can only inspect its OWN capabilities — there is no global view.
+fn sys_cap_identify(slot: u64, out_ptr: u64) -> u64 {
+    let Some((ty, a, b)) = crate::process::current_cap_describe(slot as usize) else {
+        return u64::MAX;
+    };
+    let Some(buf) = user_slice_mut(out_ptr, 24) else {
+        return u64::MAX;
+    };
+    buf[0..8].copy_from_slice(&u64::from(ty).to_le_bytes());
+    buf[8..16].copy_from_slice(&a.to_le_bytes());
+    buf[16..24].copy_from_slice(&b.to_le_bytes());
     0
 }
 

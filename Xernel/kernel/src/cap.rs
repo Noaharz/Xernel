@@ -89,6 +89,24 @@ impl CapEntry {
     pub const fn untyped(bytes: u64) -> Self {
         Self::new(CapType::Untyped, bytes)
     }
+
+    /// A normalized, userspace-facing view of this capability: `(type, a, b)`,
+    /// where the meaning of `a`/`b` depends on the type — IoPort: (base, count);
+    /// IoMem: (base, len); Untyped: (remaining bytes, 0); otherwise raw
+    /// (object, badge). Lets a process enumerate its own authority via
+    /// `SYS_CAP_IDENTIFY` without knowing the kernel's internal bit-packing.
+    pub fn describe(&self) -> (u8, u64, u64) {
+        let ty = self.cap_type as u8;
+        match self.cap_type {
+            CapType::IoPort => (
+                ty,
+                u64::from((self.object >> 16) as u16),
+                u64::from(self.object as u16),
+            ),
+            CapType::Untyped => (ty, self.object, 0),
+            _ => (ty, self.object, self.badge),
+        }
+    }
 }
 
 /// A capability table: a fixed number of slots, each empty or holding one

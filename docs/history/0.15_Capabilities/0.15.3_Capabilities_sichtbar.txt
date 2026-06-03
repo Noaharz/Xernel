@@ -1,0 +1,100 @@
+================================================================================
+0.15.3 — CAPABILITIES SICHTBAR MACHEN: SYS_CAP_IDENTIFY
+================================================================================
+
+Zeitraum:      2026-06-03
+Ergebnis:      Ein Prozess kann zum ersten Mal seine EIGENE Capability-Tabelle
+               von Ring 3 aus aufzählen. Bisher HIELT init seine Capabilities,
+               konnte sie aber nicht sehen — nur indirekt erfahren ("Zugriff
+               erlaubt/verweigert"). Jetzt fragt es den Kernel direkt: "Was
+               halte ich in Slot N?" und druckt seine gesamte Autorität.
+
+
+--------------------------------------------------------------------------------
+WARUM SICHTBARKEIT DER NÄCHSTE SCHRITT IST
+--------------------------------------------------------------------------------
+
+Die Stufen 1–3 (0.15.0–0.15.2) haben Capabilities an Syscalls GEBUNDEN — der
+Kernel prüft sie, aber für den Prozess sind sie unsichtbar. Bevor man Caps
+DELEGIEREN kann (ein Root-Server reicht eine Cap an einen Kind-Treiber weiter),
+muss ein Prozess sie überhaupt benennen und ansehen können. SYS_CAP_IDENTIFY ist
+dieser erste Schritt der Capability-INVOCATION-Oberfläche, auf die die
+Kernel-Kommentare seit Phase 0.4 hinarbeiten ("jeder Syscall ist eine
+Capability-Invocation").
+
+Wichtig fürs Sicherheitsmodell: ein Prozess sieht NUR seine eigene CNode. Es gibt
+keine globale Sicht — kein "liste alle Capabilities im System". Das ist genau die
+seL4-Eigenschaft: Autorität ist lokal und unfälschbar.
+
+
+--------------------------------------------------------------------------------
+NORMALISIERTE SICHT  (kernel/src/cap.rs, CapEntry::describe)
+--------------------------------------------------------------------------------
+
+Der Kernel packt Bereiche intern verschieden (IoPort: base<<16|count in object;
+IoMem: object=base, badge=len; Untyped: object=Budget). Damit Userspace diese
+Packung NICHT kennen muss, liefert describe() ein normalisiertes Tripel
+(type, a, b):
+
+  IoPort   -> (10, base,      count)
+  IoMem    -> (11, base,      len)
+  Untyped  -> (1,  budget,    0)
+  sonst    -> (ty, object,    badge)
+
+So bleibt das interne Bit-Packing eine Kernel-Implementierungssache; die ABI
+gibt aussagekräftige Zahlen.
+
+
+--------------------------------------------------------------------------------
+DER SYSCALL  (kernel/src/syscall.rs, kernel/src/process.rs)
+--------------------------------------------------------------------------------
+
+  SYS_CAP_IDENTIFY = 17 (slot, out_ptr):
+      out_ptr zeigt auf ein [u64; 3], das der Kernel mit [type, a, b] füllt.
+      Rückgabe 0 bei Erfolg, u64::MAX wenn der Slot leer/außerhalb ist.
+
+  process::current_cap_describe(slot) -> Option<(u8,u64,u64)>:
+      liest die CNode des LAUFENDEN Prozesses (CNode::get + CapEntry::describe).
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (userland/init/src/main.rs, cap_list)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     Eigene Capabilities:
+       slot 0: IoPort   base 0xc000 count 0x4000
+       slot 1: IoMem    base 0xc0000000 len 0x40000000
+       slot 2: Untyped  budget 241664 bytes
+       port_in(0x70)    -> VERWEIGERT (keine IoPort-Cap) — korrekt
+       iomap(0x100000)  -> VERWEIGERT (keine IoMem-Cap) — korrekt
+       dma(1 MiB)       -> VERWEIGERT (Untyped-Budget) — korrekt
+    xtask: boot-test PASSED
+
+init liest Slots 0..8 und druckt jede belegte Capability. Es findet EXAKT die
+drei Caps, die seed_caps dem Root-Task gegeben hat — die Autorität ist greifbar.
+Das Untyped-Budget steht bei 241664 statt 262144 Bytes: die ~20 KiB, die der
+virtio-blk-Treiber und dma_demo schon allokiert haben, sind ABGEZOGEN. Der
+Live-Beweis, dass Untyped verbrauchbar ist (siehe 0.15.2).
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Delegation: jetzt wo ein Prozess seine Caps benennen kann, der nächste
+    Schritt — copy/grant einer Cap (oder eines Teil-Budgets) an einen anderen
+    Prozess, plus invoke(cap, method, args). Braucht einen zweiten Prozess +
+    Endpoint-IPC, das Caps trägt.
+  - SYS_PCI_READ per Cap einschränken (aktuell ungated, nur Discovery).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/cap.rs            CapEntry::describe (normalisierte Sicht)
+  kernel/src/process.rs        current_cap_describe
+  kernel/src/syscall.rs        SYS_CAP_IDENTIFY = 17, sys_cap_identify
+  userland/init/src/main.rs    cap_list (zählt eigene Capabilities auf)
