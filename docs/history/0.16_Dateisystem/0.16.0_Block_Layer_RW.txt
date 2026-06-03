@@ -1,0 +1,96 @@
+================================================================================
+0.16.0 — BLOCK-LAYER: SEKTOREN LESEN UND SCHREIBEN
+================================================================================
+
+Zeitraum:      2026-06-03
+Ergebnis:      Der virtio-blk-Treiber ist von einer einmaligen Sektor-0-Lese-
+               Demo zu einer wiederverwendbaren Block-Schicht ausgebaut:
+               beliebige Sektoren LESEN und SCHREIBEN, beliebig oft. Damit steht
+               der Unterbau für ein Dateisystem (Kapitel 0.16). Alles bleibt
+               reines Ring-3-Userland — der Kernel hat KEINE Zeile dazubekommen.
+
+
+--------------------------------------------------------------------------------
+WARUM ZUERST DER BLOCK-LAYER
+--------------------------------------------------------------------------------
+
+Ein Dateisystem braucht zwei Dinge vom Treiber, die die alte Demo (0.14.5) nicht
+bot: (1) SCHREIBEN (mkfs muss Superblock/Verzeichnis anlegen), (2) BELIEBIGE
+Sektoren, mehrfach (nicht nur einmal Sektor 0). Ein read-only-FS stünde auf Sand.
+Also wird der Treiber zuerst zu einer echten Block-Schicht mit einer sauberen
+read/write-API, auf der das FS dann sitzt.
+
+
+--------------------------------------------------------------------------------
+DIE API  (userland/init/src/main.rs)
+--------------------------------------------------------------------------------
+
+  struct Blk { io, q_va, used_off, n, avail_va, hdr/data/status va+phys, seq }
+        — ein hochgefahrenes Gerät mit fertiger Virtqueue 0 und Request-Puffern,
+          über Requests hinweg wiederverwendet.
+
+  blk_init(dev) -> Option<Blk>
+        — Status-Handshake, Feature-Negotiation, Virtqueue-Layout, Puffer-DMA.
+          Einmal pro Gerät. Gibt einen Blk-Handle zurück (oder None).
+
+  blk_rw(&mut Blk, sector, write, buf) -> bool
+        — EINE 512-Byte-Übertragung. write=false: Gerät schreibt in buf (Lesen);
+          write=true: wir füllen den Datenpuffer, Gerät liest ihn (Schreiben).
+          Pollt den Used-Ring auf Completion.
+
+Schlüssel-Unterschiede Lesen vs. Schreiben im virtio-Protokoll:
+  - Request-Header-Typ: BLK_T_IN (0, lesen) vs. BLK_T_OUT (1, schreiben).
+  - Daten-Descriptor-Flags: beim LESEN DESC_WRITE (Gerät schreibt in den Puffer);
+    beim SCHREIBEN OHNE DESC_WRITE (Gerät liest den Puffer).
+
+Wiederverwendung über Requests: blk_rw zählt `seq` (Anzahl abgesetzter Requests)
+hoch, schreibt den Descriptor-Kopf in den nächsten Available-Ring-Slot
+(seq % n) und pollt used.idx, bis er `seq` erreicht. So lassen sich beliebig
+viele Requests über dieselbe Queue/Puffer abwickeln (vorher: genau einer).
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (virtio_blk_demo)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     virtio-blk @ I/O 0xc000
+     Kapazität: 2048 Sektoren (1024 KiB)
+     Sektor 0: "XERNEL-DISK: hello from virtio-blk sector 0!"   (LESEN, Magic)
+     Block-R/W: Sektor 100 write+read ok                        (SCHREIBEN+LESEN)
+    xtask: boot-test PASSED
+
+Sektor 0 wird gelesen (das Magic aus disk.img bleibt unangetastet). Dann wird ein
+Muster ((i^0x5A) über 512 Bytes) nach Sektor 100 GESCHRIEBEN, zurückgelesen und
+byteweise verglichen — "ok". Die Disk ist in QEMU read-write angehängt
+(-drive ... ohne readonly), die Writes persistieren in target/disk.img.
+
+
+--------------------------------------------------------------------------------
+KERNEL: KEINE ÄNDERUNG  (Microkernel-Beweis)
+--------------------------------------------------------------------------------
+
+Schreiben braucht KEINEN neuen Syscall: derselbe Port-I/O- und DMA-Pfad wie beim
+Lesen, nur ein anderer Request-Typ und andere Descriptor-Flags — alles im
+User-Space entschieden. Der Kernel kennt weder "lesen" noch "schreiben" noch
+"virtio". Ein ganzer Block-Layer (und gleich ein Dateisystem) entsteht über den
+fünf generischen Primitiven, ohne den Kernel anzufassen.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - 0.16.1: On-Disk-Dateisystem (XernelFS) auf dem Block-Layer — Superblock,
+    Verzeichnis, Datei-API (format/create/read/list), runtime-mkfs-Demo.
+  - Später: FS als eigener User-Space-Prozess (nach Delegation), Unterverzeichnisse,
+    VFS-Abstraktion.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs    Blk, blk_init, blk_rw (ersetzt die inline-Demo);
+                               BLK_T_OUT; virtio_blk_demo (read Sektor 0 + R/W-Test)
