@@ -1,0 +1,97 @@
+================================================================================
+0.16.1 — XERNELFS: EIN DATEISYSTEM IM USER-SPACE
+================================================================================
+
+Zeitraum:      2026-06-03
+Ergebnis:      Auf dem Block-Layer (0.16.0) sitzt jetzt ein echtes, wenn auch
+               winziges Dateisystem. Es formatiert die Disk, legt Dateien an,
+               listet das Verzeichnis und liest Inhalte zurück — Schreib- UND
+               Lesepfad eines Dateisystems, vollständig in Ring 3. Der Kernel
+               weiß nichts von "Dateien"; er hat erneut KEINE Zeile dazubekommen.
+
+
+--------------------------------------------------------------------------------
+DAS ON-DISK-LAYOUT  (1 MiB = 2048 Sektoren à 512 B)
+--------------------------------------------------------------------------------
+
+  Sektor 0       reserviert (Boot/Magic — das FS fasst ihn nie an)
+  Sektor 1       Superblock:  magic("XERNFS01") | version | total_sectors | next_free
+  Sektor 2       Verzeichnis: 16 Einträge à 32 Byte
+  Sektor 3..     Datenregion: Dateien zusammenhängend gespeichert
+
+Ein Verzeichnis-Eintrag (32 B):
+  name[24] (NUL-gepolstert) | size: u32 | start_sector: u32
+
+Bewusst minimal: flacher Namensraum (keine Unterordner), Bump-Allokation
+(next_free wandert nur vorwärts), kein Reclaim beim Löschen, 16 Dateien max.
+Genug, um die Schreib-/Lese-Mechanik eines FS ehrlich zu zeigen.
+
+
+--------------------------------------------------------------------------------
+DIE API  (userland/init/src/main.rs, reines Ring-3 über blk_rw)
+--------------------------------------------------------------------------------
+
+  fs_format(b)               Superblock + leeres Verzeichnis schreiben.
+  fs_create(b, name, data)   freien Verzeichnis-Slot finden, nsec=ceil(len/512)
+                             Sektoren ab next_free bump-allokieren, Daten (letzter
+                             Sektor genullt) schreiben, Eintrag setzen, next_free
+                             im Superblock committen.
+  fs_find(dir, name)         Eintrag im geladenen Verzeichnis suchen -> (size,start).
+  fs_read(b, name, out)      Eintrag finden, seine Sektoren lesen, in out kopieren;
+                             gibt die Dateigröße zurück.
+  fs_list(b)                 alle belegten Einträge mit Größe ausgeben.
+
+Hilfsfunktionen rd_u32/wr_u32 für little-endian-Felder in Sektorpuffern. Keine
+Allokation nötig — feste [u8; 512]-Sektorpuffer auf dem Stack.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (fs_demo)
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+     XernelFS: formatiere Disk
+     Dateien:
+       hallo.txt  (19 B)
+       readme  (41 B)
+       lese hallo.txt: "Hallo von XernelFS!"
+    xtask: boot-test PASSED
+
+format (schreibt Superblock+Verzeichnis) -> create ×2 (schreibt Daten+Einträge)
+-> list (liest Verzeichnis) -> read (liest Daten zurück). "Hallo von XernelFS!"
+ist exakt der Inhalt, der vorher geschrieben wurde — der Roundtrip stimmt. Beide
+Geräte-Demos (Block-R/W und FS) teilen sich EINE blk_init-Bring-up.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS DIE MIKROKERNEL-VISION BESTÄTIGT
+--------------------------------------------------------------------------------
+
+Ein komplettes Dateisystem — Format, Allokation, Verzeichnis, Datei-I/O —
+entstand OHNE eine einzige Kernel-Änderung. Der Kernel liefert nur die fünf
+generischen Primitive (PCI/MMIO/DMA/Port-I/O); Treiber, Block-Layer und FS sind
+alle Ring-3-Policy. Genau das ist der Sinn: der Kernel bleibt klein und generisch,
+die Funktionalität wächst im User-Space. Ein FS-Bug kann den Kernel nicht crashen.
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Aktuell: flach, max. 16 Dateien, kein Löschen/Überschreiben, eine Disk.
+  - Nächster Architektur-Schritt: das FS aus init herauslösen in einen EIGENEN
+    User-Space-Prozess (Datei-Service), den andere Programme über IPC ansprechen
+    — das braucht die Delegation/Cap-tragende-IPC (das pausierte Kapitel).
+  - Dann: Unterverzeichnisse, Löschen + Freispeicher-Verwaltung, eine VFS-
+    Abstraktion (mehrere Backends), evtl. ein interoperables Format (FAT).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs    XernelFS: Layout-Konstanten, rd_u32/wr_u32,
+                               fs_format/create/find/read/list, fs_demo;
+                               blk_demo (umgebaut auf gemeinsame blk_init),
+                               _start ruft blk_demo + fs_demo über EINEN Blk
