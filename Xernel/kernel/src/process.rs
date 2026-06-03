@@ -178,6 +178,15 @@ pub fn current_refund_untyped(amount: u64) {
     }
 }
 
+/// A normalized description of the capability in slot `slot` of the current
+/// process, or `None` if the slot is empty/out of range. Backs
+/// `SYS_CAP_IDENTIFY`, letting a process enumerate its own authority.
+pub fn current_cap_describe(slot: usize) -> Option<(u8, u64, u64)> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    s.procs[s.current].caps.get(slot).ok().map(|c| c.describe())
+}
+
 /// Make process at index `i` the active one: switch its address space and
 /// syscall kernel stack. Returns its saved kernel stack pointer. Caller must
 /// hold the scheduler lock; the actual context switch happens after releasing

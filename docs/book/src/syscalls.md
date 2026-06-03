@@ -33,12 +33,17 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 10 | `GETPID` | — | pid | PID des aktuellen Prozesses. |
 | 11 | `YIELD` | — | 0 | Gibt die CPU an den nächsten bereiten Prozess ab (kooperativ). |
 | 12 | `PCI_READ` | bus, dev, func, offset | dword | Liest 32 Bit aus dem PCI-Config-Space (für User-Space-Treiber). |
-| 13 | `IOMAP` | phys, len | user-vaddr / `u64::MAX` | Mappt Geräte-MMIO (eine PCI-BAR) uncached in den aufrufenden Prozess. |
-| 14 | `DMA_ALLOC` | len, out_ptr | 0 / `u64::MAX` | Allokiert einen phys.-zusammenhängenden DMA-Puffer; schreibt `[user_vaddr, phys]` nach `out_ptr`. |
-| 15 | `PORT_IN` | port, size | wert | Liest einen I/O-Port (size 1/2/4) — für Legacy-Geräte-Treiber. |
-| 16 | `PORT_OUT` | port, size, value | 0 | Schreibt einen I/O-Port. |
+| 13 | `IOMAP` | phys, len | user-vaddr / `u64::MAX` | Mappt Geräte-MMIO (eine PCI-BAR) uncached in den aufrufenden Prozess. **Gated:** braucht eine `IoMem`-Capability über `[phys, phys+len)`. |
+| 14 | `DMA_ALLOC` | len, out_ptr | 0 / `u64::MAX` | Allokiert einen phys.-zusammenhängenden DMA-Puffer; schreibt `[user_vaddr, phys]` nach `out_ptr`. **Gated:** verrechnet gegen ein `Untyped`-Budget. |
+| 15 | `PORT_IN` | port, size | wert / `u64::MAX` | Liest einen I/O-Port (size 1/2/4). **Gated:** braucht eine `IoPort`-Capability über den Port. |
+| 16 | `PORT_OUT` | port, size, value | 0 / `u64::MAX` | Schreibt einen I/O-Port. **Gated:** braucht eine `IoPort`-Capability über den Port. |
+| 17 | `CAP_IDENTIFY` | slot, out_ptr | 0 / `u64::MAX` | Beschreibt die Capability im eigenen CNode-Slot; schreibt `[type, a, b]` (3×u64, normalisiert) nach `out_ptr`. |
 
-Unbekannte Nummern liefern `u64::MAX`.
+Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16) prüfen eine
+Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung, wenn
+sie fehlt — es gibt keine ambiente Hardware-Autorität. Mit `CAP_IDENTIFY` kann
+ein Prozess seine eigenen Capabilities aufzählen (nur die eigenen — keine
+globale Sicht).
 
 > Jeder Prozess läuft in seinem **eigenen Adressraum** (eigene Page-Table) —
 > Speicher ist zwischen Prozessen isoliert. Prozesse laufen **verzahnt**
