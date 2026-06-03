@@ -320,16 +320,12 @@ fn blk_rw(b: &mut Blk, sector: u64, write: bool, buf: *mut u8) -> bool {
     true
 }
 
-/// Demonstrate the user-space block layer: bring up virtio-blk, read sector 0
-/// (the disk's magic string), then write a scratch sector and read it back —
-/// proof of a full read/WRITE block device driven entirely from Ring 3.
-fn virtio_blk_demo(dev: u64) {
-    let Some(mut blk) = blk_init(dev) else {
-        return;
-    };
-
+/// Demonstrate the user-space block layer: read sector 0 (the disk's magic
+/// string), then write a scratch sector and read it back — proof of a full
+/// read/WRITE block device driven entirely from Ring 3.
+fn blk_demo(blk: &mut Blk) {
     let mut buf = [0u8; 512];
-    if blk_rw(&mut blk, 0, false, buf.as_mut_ptr()) {
+    if blk_rw(blk, 0, false, buf.as_mut_ptr()) {
         print(" Sektor 0: \"");
         for &c in buf.iter().take(64) {
             if c == 0 {
@@ -346,11 +342,201 @@ fn virtio_blk_demo(dev: u64) {
         *b = (i as u8) ^ 0x5A;
     }
     let mut rb = [0u8; 512];
-    let ok = blk_rw(&mut blk, SCRATCH, true, buf.as_mut_ptr())
-        && blk_rw(&mut blk, SCRATCH, false, rb.as_mut_ptr());
+    let ok = blk_rw(blk, SCRATCH, true, buf.as_mut_ptr())
+        && blk_rw(blk, SCRATCH, false, rb.as_mut_ptr());
     let good = ok && rb.iter().enumerate().all(|(i, &b)| b == (i as u8) ^ 0x5A);
     print(" Block-R/W: Sektor 100 write+read ");
     print(if good { "ok\n" } else { "FEHLER\n" });
+}
+
+// --- XernelFS: a minimal on-disk filesystem on top of the block layer ---
+//
+// Layout (512-byte sectors, 1 MiB disk = 2048 sectors):
+//   sector 0           reserved (boot/magic — the FS never touches it)
+//   sector 1           superblock: magic | version | total_sectors | next_free
+//   sector 2           directory: 16 entries × 32 bytes
+//   sectors 3..        data region (files stored contiguously)
+//
+// A directory entry: name[24] (NUL-padded) | size:u32 | start_sector:u32.
+// Flat namespace, bump allocation, no delete-reclaim — deliberately tiny. It is
+// pure Ring-3 code over `blk_rw`; the kernel knows nothing about files.
+const SECTOR: usize = 512;
+const FS_MAGIC: &[u8; 8] = b"XERNFS01";
+const SB_SECTOR: u64 = 1;
+const DIR_SECTOR: u64 = 2;
+const DATA_START: u64 = 3;
+const TOTAL_SECTORS: u64 = 2048;
+const DIR_ENTRIES: usize = 16;
+const ENT_SIZE: usize = 32;
+const NAME_LEN: usize = 24;
+
+fn rd_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn wr_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Write a fresh filesystem: superblock + empty directory. Returns false on I/O
+/// error.
+fn fs_format(b: &mut Blk) -> bool {
+    let mut sb = [0u8; SECTOR];
+    sb[..8].copy_from_slice(FS_MAGIC);
+    wr_u32(&mut sb, 8, 1); // version
+    wr_u32(&mut sb, 12, TOTAL_SECTORS as u32);
+    wr_u32(&mut sb, 16, DATA_START as u32); // next_free
+    let mut dir = [0u8; SECTOR];
+    blk_rw(b, SB_SECTOR, true, sb.as_mut_ptr()) && blk_rw(b, DIR_SECTOR, true, dir.as_mut_ptr())
+}
+
+/// Create a file `name` with contents `data`. Bump-allocates contiguous data
+/// sectors. Returns false if the directory or disk is full, or on I/O error.
+fn fs_create(b: &mut Blk, name: &[u8], data: &[u8]) -> bool {
+    let mut sb = [0u8; SECTOR];
+    if !blk_rw(b, SB_SECTOR, false, sb.as_mut_ptr()) || &sb[..8] != FS_MAGIC {
+        return false;
+    }
+    let mut next_free = u64::from(rd_u32(&sb, 16));
+
+    let mut dir = [0u8; SECTOR];
+    if !blk_rw(b, DIR_SECTOR, false, dir.as_mut_ptr()) {
+        return false;
+    }
+    let Some(slot) = (0..DIR_ENTRIES).find(|&i| dir[i * ENT_SIZE] == 0) else {
+        return false; // directory full
+    };
+
+    let nsec = data.len().div_ceil(SECTOR) as u64;
+    if next_free + nsec > TOTAL_SECTORS {
+        return false; // disk full
+    }
+    let start = next_free;
+
+    // Write the data, zero-padding the final sector.
+    let mut off = 0;
+    let mut s = start;
+    while off < data.len() {
+        let mut secbuf = [0u8; SECTOR];
+        let n = core::cmp::min(SECTOR, data.len() - off);
+        secbuf[..n].copy_from_slice(&data[off..off + n]);
+        if !blk_rw(b, s, true, secbuf.as_mut_ptr()) {
+            return false;
+        }
+        off += n;
+        s += 1;
+    }
+
+    // Fill the directory entry.
+    let base = slot * ENT_SIZE;
+    let nl = core::cmp::min(NAME_LEN, name.len());
+    dir[base..base + nl].copy_from_slice(&name[..nl]);
+    wr_u32(&mut dir, base + 24, data.len() as u32);
+    wr_u32(&mut dir, base + 28, start as u32);
+    if !blk_rw(b, DIR_SECTOR, true, dir.as_mut_ptr()) {
+        return false;
+    }
+
+    // Commit the bumped free pointer.
+    next_free += nsec;
+    wr_u32(&mut sb, 16, next_free as u32);
+    blk_rw(b, SB_SECTOR, true, sb.as_mut_ptr())
+}
+
+/// Look up `name` in a loaded directory sector. Returns (size, start_sector).
+fn fs_find(dir: &[u8], name: &[u8]) -> Option<(u32, u32)> {
+    (0..DIR_ENTRIES).find_map(|i| {
+        let base = i * ENT_SIZE;
+        if dir[base] == 0 {
+            return None;
+        }
+        let matches = (0..NAME_LEN).all(|x| {
+            let want = if x < name.len() { name[x] } else { 0 };
+            dir[base + x] == want
+        });
+        matches.then(|| (rd_u32(dir, base + 24), rd_u32(dir, base + 28)))
+    })
+}
+
+/// Read file `name` into `out`. Returns the file size (bytes copied is capped at
+/// `out.len()`), or None if not found / on I/O error.
+fn fs_read(b: &mut Blk, name: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut dir = [0u8; SECTOR];
+    if !blk_rw(b, DIR_SECTOR, false, dir.as_mut_ptr()) {
+        return None;
+    }
+    let (size, start) = fs_find(&dir, name)?;
+    let size = size as usize;
+    let mut off = 0;
+    let mut s = u64::from(start);
+    while off < size {
+        let mut secbuf = [0u8; SECTOR];
+        if !blk_rw(b, s, false, secbuf.as_mut_ptr()) {
+            return None;
+        }
+        let n = core::cmp::min(SECTOR, size - off);
+        if off + n <= out.len() {
+            out[off..off + n].copy_from_slice(&secbuf[..n]);
+        }
+        off += n;
+        s += 1;
+    }
+    Some(size)
+}
+
+/// Print every file in the directory with its size.
+fn fs_list(b: &mut Blk) {
+    let mut dir = [0u8; SECTOR];
+    if !blk_rw(b, DIR_SECTOR, false, dir.as_mut_ptr()) {
+        print(" fs: list FEHLER\n");
+        return;
+    }
+    print(" Dateien:\n");
+    for i in 0..DIR_ENTRIES {
+        let base = i * ENT_SIZE;
+        if dir[base] == 0 {
+            continue;
+        }
+        print("   ");
+        for &c in dir[base..base + NAME_LEN].iter() {
+            if c == 0 {
+                break;
+            }
+            write(&[c]);
+        }
+        print("  (");
+        print_u64(u64::from(rd_u32(&dir, base + 24)));
+        print(" B)\n");
+    }
+}
+
+/// End-to-end filesystem demo: format the disk, create two files, list the
+/// directory, then read one back — write and read paths of a real (if tiny)
+/// filesystem, entirely in Ring 3.
+fn fs_demo(b: &mut Blk) {
+    print(" XernelFS: formatiere Disk\n");
+    if !fs_format(b) {
+        print("   format FEHLER\n");
+        return;
+    }
+    let ok = fs_create(b, b"hallo.txt", b"Hallo von XernelFS!")
+        && fs_create(b, b"readme", b"Xernel filesystem v1 - flach, 16 Dateien.");
+    if !ok {
+        print("   create FEHLER\n");
+        return;
+    }
+    fs_list(b);
+    let mut buf = [0u8; 128];
+    if let Some(n) = fs_read(b, b"hallo.txt", &mut buf) {
+        print("   lese hallo.txt: \"");
+        for &c in buf.iter().take(core::cmp::min(n, buf.len())) {
+            if c == 0 {
+                break;
+            }
+            write(&[c]);
+        }
+        print("\"\n");
+    }
 }
 
 /// Write one virtqueue descriptor at index `i` of the table starting at `base`.
@@ -678,7 +864,10 @@ pub extern "C" fn _start() -> ! {
     let vdev = pci_scan();
     if vdev != 0xFF {
         iomap_demo(vdev);
-        virtio_blk_demo(vdev);
+        if let Some(mut blk) = blk_init(vdev) {
+            blk_demo(&mut blk);
+            fs_demo(&mut blk);
+        }
     }
     dma_demo();
     cap_list();
