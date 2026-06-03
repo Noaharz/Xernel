@@ -19,9 +19,10 @@ Stand: 2026-06-02. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   verbrauchbares `Untyped`-Budget gebunden. Keine ambiente Hardware-Autorität
   mehr (der virtio-Treiber darf seine Ports, seine BAR und sein DMA-Budget; ein
   System-Port wie CMOS, das Mappen von echtem RAM und unbegrenzte DMA-Allokation
-  werden verweigert).
+  werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
+  `CAP_IDENTIFY` aufzählen (keine globale Sicht).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 16 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 17 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.

@@ -26,6 +26,7 @@ const SYS_IOMAP: u64 = 13;
 const SYS_DMA_ALLOC: u64 = 14;
 const SYS_PORT_IN: u64 = 15;
 const SYS_PORT_OUT: u64 = 16;
+const SYS_CAP_IDENTIFY: u64 = 17;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -378,6 +379,68 @@ fn iomap_demo(dev: u64) {
     print("   keine Memory-BAR\n");
 }
 
+/// Human-readable name for a capability type tag (see `xabi::cap::CapType`).
+fn cap_type_name(ty: u64) -> &'static str {
+    match ty {
+        1 => "Untyped",
+        2 => "CNode",
+        3 => "Frame",
+        7 => "Endpoint",
+        8 => "Notification",
+        9 => "IrqHandler",
+        10 => "IoPort",
+        11 => "IoMem",
+        _ => "?",
+    }
+}
+
+/// Enumerate this process's own capability table and print each capability it
+/// holds — the process discovering exactly the authority it was granted. No
+/// global view exists: a process can only inspect its OWN CNode.
+fn cap_list() {
+    print(" Eigene Capabilities:\n");
+    for slot in 0..8u64 {
+        let mut out = [0u64; 3];
+        if syscall3(SYS_CAP_IDENTIFY, slot, out.as_mut_ptr() as u64, 0) == u64::MAX {
+            continue; // empty slot
+        }
+        let [ty, a, b] = out;
+        print("   slot ");
+        print_u64(slot);
+        print(": ");
+        print(cap_type_name(ty));
+        match ty {
+            10 => {
+                // IoPort: a = base, b = count
+                print("   base 0x");
+                print_hex(a, 4);
+                print(" count 0x");
+                print_hex(b, 4);
+            }
+            11 => {
+                // IoMem: a = base, b = len
+                print("    base 0x");
+                print_hex(a, 8);
+                print(" len 0x");
+                print_hex(b, 8);
+            }
+            1 => {
+                // Untyped: a = remaining budget
+                print("  budget ");
+                print_u64(a);
+                print(" bytes");
+            }
+            _ => {
+                print("  0x");
+                print_hex(a, 8);
+                print(" 0x");
+                print_hex(b, 8);
+            }
+        }
+        print("\n");
+    }
+}
+
 /// Demonstrate that hardware authority is capability-gated. The virtio-blk
 /// driver above only worked because this process holds an `IoPort` capability
 /// covering the PCI I/O window. A port OUTSIDE that range — here CMOS/RTC at
@@ -551,6 +614,7 @@ pub extern "C" fn _start() -> ! {
         virtio_blk_demo(vdev);
     }
     dma_demo();
+    cap_list();
     cap_demo();
 
     let _ = yield_now; // cooperative yield available for programs that want it
