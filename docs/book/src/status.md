@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-06-02. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-06-03. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -29,8 +29,9 @@ Stand: 2026-06-02. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 - **Dynamischer Speicher:** wachsender User-Heap via `SBRK`.
 - **Treiber im User-Space:** Kernel liefert nur Primitive (PCI-Config-Read,
   MMIO-Map, DMA-Alloc, Port-I/O). Ein **vollständiger virtio-blk-Treiber in
-  Ring 3** richtet eine Virtqueue ein und liest Sektor 0 von der Disk — der
-  Kernel kennt das Wort "virtio" nicht.
+  Ring 3** richtet eine Virtqueue ein und bildet eine **Block-Schicht**, die
+  beliebige Sektoren **liest und schreibt** (`blk_init`/`blk_rw`) — der Kernel
+  kennt das Wort "virtio" nicht und braucht für das Schreiben keinen neuen Syscall.
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -49,6 +50,7 @@ Stand: 2026-06-02. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.13 Preemption | timer-getriebenes preemptives Scheduling |
 | 0.14 TreiberFramework | User-Space-Treiber: PCI, MMIO, DMA, Port-I/O → virtio-blk liest Sektor 0 |
 | 0.15 Capabilities | Port-I/O (`IoPort`), MMIO (`IoMem`) und DMA (`Untyped`-Budget) cap-gated — Least-Privilege für Treiber |
+| 0.16 Dateisystem | Block-Layer: virtio-blk liest **und** schreibt beliebige Sektoren (Unterbau fürs FS) |
 
 ## XOS — das erste OS auf Xernel
 
