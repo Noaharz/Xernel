@@ -927,9 +927,86 @@ fn net_ping(n: &mut Net, dst_mac: [u8; 6], dst_ip: [u8; 4]) -> bool {
     }
 }
 
-/// Networking demo: resolve the gateway's MAC via ARP, then ping it. Proof that
-/// a user-space driver speaks Ethernet, ARP, IPv4 and ICMP with the outside.
+/// Obtain an IP address via DHCP: broadcast a DISCOVER, read the OFFER, return
+/// the offered address. Proof that UDP works — and the way a real machine boots
+/// onto a network. SLIRP answers DHCP entirely offline.
+fn net_dhcp(n: &mut Net) -> Option<[u8; 4]> {
+    let mut f = [0u8; 290];
+    // Ethernet: broadcast.
+    for i in 0..6 {
+        f[i] = 0xFF;
+        f[6 + i] = n.mac[i];
+    }
+    f[12] = 0x08;
+    f[13] = 0x00; // IPv4
+
+    // IPv4 (offset 14): UDP, src 0.0.0.0, dst 255.255.255.255.
+    let ip_len = 20 + 8 + 244;
+    f[14] = 0x45;
+    f[16] = (ip_len >> 8) as u8;
+    f[17] = ip_len as u8;
+    f[18] = 0x39;
+    f[19] = 0x03; // identification
+    f[22] = 64; // TTL
+    f[23] = 17; // protocol UDP
+    f[30] = 0xFF;
+    f[31] = 0xFF;
+    f[32] = 0xFF;
+    f[33] = 0xFF; // dst 255.255.255.255 (src stays 0.0.0.0)
+    let ipsum = inet_checksum(&f[14..34]);
+    f[24] = (ipsum >> 8) as u8;
+    f[25] = ipsum as u8;
+
+    // UDP (offset 34): src 68, dst 67, len, checksum 0 (optional for IPv4).
+    f[35] = 68;
+    f[37] = 67;
+    let udp_len = 8 + 244;
+    f[38] = (udp_len >> 8) as u8;
+    f[39] = udp_len as u8;
+
+    // DHCP/BOOTP (offset 42).
+    let b = 42;
+    f[b] = 1; // op = BOOTREQUEST
+    f[b + 1] = 1; // htype = Ethernet
+    f[b + 2] = 6; // hlen
+    f[b + 4..b + 8].copy_from_slice(&[0x39, 0x03, 0xF3, 0x26]); // xid
+    f[b + 10] = 0x80; // flags: broadcast (so the reply reaches us without an IP)
+    f[b + 28..b + 34].copy_from_slice(&n.mac); // chaddr
+    f[b + 236..b + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]); // magic cookie
+    // options: 53 (DHCP message type) = 1 (DISCOVER), 255 (end).
+    f[b + 240..b + 244].copy_from_slice(&[53, 1, 1, 255]);
+    let frame_len = 14 + ip_len;
+
+    net_rx_arm(n);
+    if !net_tx(n, &f[..frame_len]) {
+        print(" net: DHCP-TX-Timeout\n");
+        return None;
+    }
+    let mut r = [0u8; 128];
+    if !net_rx_wait(n, &mut r) {
+        print(" net: DHCP keine Antwort\n");
+        return None;
+    }
+    // IPv4/UDP from the DHCP server (src port 67), BOOTP reply (op = 2)?
+    if r[12] == 0x08 && r[13] == 0x00 && r[23] == 17 && r[35] == 67 && r[42] == 2 {
+        Some([r[58], r[59], r[60], r[61]]) // yiaddr (offered address)
+    } else {
+        None
+    }
+}
+
+/// Networking demo: get an IP via DHCP (UDP), resolve the gateway's MAC via ARP,
+/// then ping it. Proof that a user-space driver speaks Ethernet, ARP, IPv4, UDP
+/// and ICMP with the outside.
 fn net_demo(n: &mut Net) {
+    match net_dhcp(n) {
+        Some(ip) => {
+            print(" net: DHCP-Offer -> IP ");
+            print_ip(&ip);
+            print("\n");
+        }
+        None => print(" net: DHCP fehlgeschlagen\n"),
+    }
     match net_resolve(n, GW_IP) {
         Some(mac) => {
             print(" net: Gateway 10.0.2.2 -> MAC ");
