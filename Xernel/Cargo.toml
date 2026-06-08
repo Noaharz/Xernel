@@ -23,7 +23,7 @@ edition = "2021"
 version = "0.0.1"
 authors = ["Noah"]
 license = "TBD"
-repository = "https://github.com/noahschwarz0011/xernel"
+repository = "https://github.com/Noaharz/Xernel"
 rust-version = "1.80"
 
 [workspace.lints.rust]
