@@ -48,6 +48,10 @@ const DMA_BUDGET: u64 = 256 * 1024;
 /// client (a spawned process with no device authority) purely over IPC.
 const EP_SLOT: usize = 3;
 const REPLY_EP_SLOT: usize = 4;
+/// CNode slot holding the `Notification` capability every process is seeded with
+/// (notification 0) — the async readiness object a service signals and a client
+/// waits on.
+const NOTIF_SLOT: usize = 5;
 const USER_STACK_VA: u64 = 0x80_0000;
 const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
@@ -152,6 +156,7 @@ fn seed_caps(pid: u64) -> CNode {
     // starts with. Everything else it would gain by delegation over an endpoint.
     let _ = caps.insert(EP_SLOT, CapEntry::endpoint(0));
     let _ = caps.insert(REPLY_EP_SLOT, CapEntry::endpoint(1));
+    let _ = caps.insert(NOTIF_SLOT, CapEntry::notification(0));
     if pid == 0 {
         let _ = caps.insert(0, CapEntry::io_port(PCI_IO_BASE, PCI_IO_COUNT));
         let _ = caps.insert(1, CapEntry::io_mem(PCI_MMIO_BASE, PCI_MMIO_LEN));
@@ -217,6 +222,16 @@ pub fn current_endpoint_id(slot: usize) -> Option<u64> {
     let s = guard.as_ref()?;
     let cap = s.procs[s.current].caps.get(slot).ok()?;
     (cap.cap_type == CapType::Endpoint).then_some(cap.object)
+}
+
+/// If the current process holds a `Notification` capability in slot `slot`,
+/// return the notification id it names. Backs `SYS_SIGNAL`/`SYS_WAIT` — a process
+/// can only reach a notification it has a capability for.
+pub fn current_notification_id(slot: usize) -> Option<u64> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    let cap = s.procs[s.current].caps.get(slot).ok()?;
+    (cap.cap_type == CapType::Notification).then_some(cap.object)
 }
 
 /// Read (a copy of) the capability in slot `slot` of the current process, for
