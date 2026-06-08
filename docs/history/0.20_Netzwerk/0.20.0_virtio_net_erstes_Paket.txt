@@ -1,0 +1,112 @@
+================================================================================
+0.20.0 — VIRTIO-NET: NIC IM USER-SPACE, ERSTES PAKET AUF DEM DRAHT
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      Xernel hat Netzwerk. Ein vollständiger virtio-net-Treiber in
+               Ring 3 fährt die NIC hoch, sendet einen ARP-Request für das
+               Gateway 10.0.2.2 und empfängt dessen ARP-Antwort — ein echter
+               Paketaustausch mit der Aussenwelt (QEMUs SLIRP). Der erste
+               Schritt von Meilenstein M4 (TCP/IP). Wie beim Datei-Service:
+               KEIN neuer Syscall — der Treiber steht ganz auf den vorhandenen
+               Primitiven (PCI, Port-I/O, DMA via Untyped-Budget).
+
+
+--------------------------------------------------------------------------------
+WARUM NETZWERK ZUERST (VOR M5 IOMMU / M6 VT-X)
+--------------------------------------------------------------------------------
+
+Die Roadmap nennt drei grosse Brocken: M4 TCP/IP, M5 IOMMU, M6 VT-x/VMX. Nach
+dem Leitprinzip „nur universelle Fundamente" ist die Reihenfolge klar:
+
+  - Netzwerk braucht JEDES OS, das „überall läuft". Universell -> zuerst.
+  - IOMMU (sichere Geräte-Durchreichung) und VT-x (Virtualisierungs-Primitive)
+    dienen vor allem dem Cloud-/Virtualisierungs-Userland. Sie kommen NACH dem
+    Netz (VT-x ist ohnehin als „spät" markiert).
+
+Darum beginnt M4 hier — und zwar inkrementell, genau wie der Block-Treiber: erst
+die NIC hochfahren und ein Paket austauschen, dann darauf ARP-Tabelle, IP, UDP,
+TCP. Heute: das Fundament (Gerät + erstes Frame).
+
+
+--------------------------------------------------------------------------------
+DER TREIBER  (userland/init/src/main.rs)
+--------------------------------------------------------------------------------
+
+virtio-net benutzt denselben Legacy-virtio-Registerblock wie virtio-blk, aber
+ZWEI Virtqueues: queue 0 = receiveq (Gerät schreibt eingehende Frames hinein),
+queue 1 = transmitq. Ohne ausgehandelte Features ist jedem Puffer ein 10-Byte
+virtio_net_hdr vorangestellt.
+
+  vq_setup(io, idx) -> (ring, used_off, n, avail)
+      Legt EINE Legacy-Virtqueue in einem frischen DMA-Puffer aus (desc | avail |
+      pad | used) und schreibt die Page-Frame-Nummer ins Gerät. Wiederverwendet
+      für RX und TX — genau das Layout aus dem Block-Treiber, nur zweimal.
+
+  net_init(dev) -> Option<Net>
+      Status-Handshake (reset/ACK/DRIVER), Features = 0, MAC aus dem Device-
+      Config lesen (6 Bytes ab VIO_CONFIG), RX- und TX-Queue auslegen, EINEN
+      Empfangspuffer posten (DESC_WRITE, avail.idx=1), DRIVER_OK, RX-Queue
+      anstossen. Druckt I/O-Port und MAC.
+
+  net_arp_demo(net)
+      Baut im TX-Puffer: virtio_net_hdr (Nullen) | Ethernet (dst=broadcast,
+      src=eigene MAC, ethertype 0x0806) | ARP-Request (op=1, sender=uns,
+      target-IP=10.0.2.2). Descriptor setzen, avail.idx=1, transmitq notifizieren,
+      TX-used pollen. Dann RX-used pollen, virtio_net_hdr überspringen, die
+      Ethernet/ARP-Antwort parsen und die Sender-Hardware-Adresse (die Gateway-
+      MAC) ausgeben.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+QEMU bekam eine virtio-net-NIC am User-Mode-Netz (SLIRP):
+    -netdev user,id=net0  -device virtio-net-pci,netdev=net0
+SLIRP beantwortet ARP für sein Gateway 10.0.2.2 — der Test ist damit
+selbstständig (kein echtes Netz, keine Tap-Konfiguration nötig).
+
+    virtio-net @ I/O 0xc0c0, MAC 52:54:00:12:34:56
+    net: ARP-Request gesendet (wer hat 10.0.2.2?)
+    net: ARP-Antwort von 10.0.2.2 -> MAC 52:55:0a:00:02:02 — Netzwerk lebt!
+
+Wir haben ein Paket gesendet UND eine Antwort der Gegenstelle empfangen und
+korrekt geparst (52:55:0a:00:02:02 ist SLIRPs Gateway-MAC). Beide Richtungen der
+NIC funktionieren. Block-Treiber und Datei-Service laufen unverändert daneben.
+
+
+--------------------------------------------------------------------------------
+ZWEI GERÄTE — GEZIELT GEWÄHLT
+--------------------------------------------------------------------------------
+
+Mit virtio-blk UND virtio-net auf dem Bus reicht „erstes virtio-Gerät" nicht
+mehr. Neuer Helfer pci_find_virtio(devid) sucht ein virtio-Gerät anhand seiner
+Device-ID: 0x1001 = Block, 0x1000 = Netz. Der Block-Pfad nimmt jetzt gezielt
+0x1001, der Netz-Pfad 0x1000 — unabhängig von der PCI-Slot-Nummer.
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT (M4 weiter)
+--------------------------------------------------------------------------------
+
+  - Nur ein RX-Puffer, ein fester Ablauf. Ein echter Treiber hält einen RX-Ring
+    voller Puffer und recycelt sie.
+  - Noch KEIN Protokoll-Stack: ARP wird hier von Hand gebaut/geparst. Als
+    Nächstes: eine kleine ARP-Tabelle, dann IPv4 + ICMP (ping), dann UDP, dann
+    TCP — schrittweise, jedes als Ring-3-Code über diesen Treiber.
+  - Der Treiber lebt noch in init. Der saubere Schritt (nach dem Muster des
+    Datei-Service aus 0.19): ein NETZ-SERVICE als eigener Prozess, der Sockets
+    über einen Endpoint anbietet.
+  - Polling statt IRQ; pro Geschwindigkeit später ein IRQ-to-userspace-Pfad.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  xtask/src/main.rs           virtio-net-NIC am SLIRP-Netz an die QEMU-Zeile.
+  userland/init/src/main.rs   pci_find_virtio; struct Net; vq_setup; net_init;
+                              net_arp_demo; print_mac/wr_u8; _start (pid 0) fährt
+                              die NIC hoch und macht den ARP-Austausch. KEINE
+                              Kernel-Änderung.
