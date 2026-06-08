@@ -56,11 +56,14 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   sichtbar: ein Programm bekommt eine Leistung, ohne die Hardware-Autorität zu
   besitzen. Ganz ohne neuen Syscall — nur aus `SPAWN` + IPC + Capabilities.
 - **Netzwerk (virtio-net im User-Space):** ein vollständiger NIC-Treiber in
-  Ring 3 fährt die virtio-net-Karte hoch (zwei Virtqueues, RX + TX), **sendet
-  einen ARP-Request und empfängt die ARP-Antwort des Gateways** — ein echter
-  Paketaustausch mit der Aussenwelt (QEMU-SLIRP). Erster Schritt zum TCP/IP-
-  Stack; wie der Block-Treiber komplett auf den Primitiven (PCI, Port-I/O, DMA)
-  gebaut, ohne neuen Syscall.
+  Ring 3 (zwei Virtqueues, RX + TX) plus ein wachsender TCP/IP-Stack — alles in
+  einem Boot offline verifiziert: **DHCP** (UDP) holt eine IP, **ARP** löst das
+  Gateway auf, **ICMP** pingt es, und eine echte **TCP**-Verbindung (Drei-Wege-
+  Handshake, Datenstrom, Echo, FIN) zu einem Echo-Server steht. Wie der Block-
+  Treiber komplett auf den Primitiven (PCI, Port-I/O, DMA) gebaut, **ohne neuen
+  Syscall**. (Noch nicht produktionsreif: ein Connection, kein Retransmit/
+  Fenster, kein passives Öffnen, keine prozess-übergreifende Socket-API — das ist
+  die nächste Arbeit.)
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -86,6 +89,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.20 Netzwerk | **virtio-net** im User-Space: NIC hochgefahren, ARP-Request gesendet + Gateway-Antwort empfangen — erstes Paket auf dem Draht (M4-Start) |
 | 0.20.1 IPv4/ICMP | **ping** ans Gateway: ARP-Resolve + IPv4-Header mit Prüfsumme + ICMP-Echo — Request raus, Reply rein |
 | 0.20.2 UDP/DHCP | **DHCP** holt eine IP (10.0.2.15): UDP/BOOTP-DISCOVER raus, OFFER geparst — UDP funktioniert |
+| 0.20.3 TCP | **TCP-Handshake + Datenstrom**: SYN/SYN-ACK/ACK zu einem Echo-Server, Zeile gesendet + zurückbekommen, FIN — TCP funktioniert |
 
 ## XOS — das erste OS auf Xernel
 

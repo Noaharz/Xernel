@@ -294,9 +294,10 @@ fn run_qemu(
                 ))
                 .args(["-device", "virtio-blk-pci,drive=disk0"])
                 // A virtio-net NIC on QEMU's user-mode (SLIRP) network, for the
-                // user-space network driver. SLIRP answers ARP for the gateway
-                // 10.0.2.2, so the driver can do a real packet exchange offline.
-                .args(["-netdev", "user,id=net0"])
+                // user-space network driver. SLIRP answers ARP/ICMP/DHCP for the
+                // gateway offline; `guestfwd` runs `cat` as a TCP echo server at
+                // 10.0.2.100:9, so the driver can do a real, offline TCP exchange.
+                .args(["-netdev", "user,id=net0,guestfwd=tcp:10.0.2.100:9-cmd:cat"])
                 .args(["-device", "virtio-net-pci,netdev=net0"]);
             if test {
                 cmd.args([
