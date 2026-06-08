@@ -1,0 +1,71 @@
+================================================================================
+0.20.2 — UDP: DHCP HOLT EINE IP-ADRESSE
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      UDP funktioniert. Der User-Space-Treiber broadcastet einen
+               DHCP-DISCOVER (UDP/BOOTP), empfängt das DHCP-OFFER und liest die
+               zugewiesene Adresse (10.0.2.15) aus — genau der Weg, auf dem eine
+               echte Maschine ins Netz bootet. QEMUs SLIRP beantwortet DHCP
+               vollständig offline, der Test bleibt deterministisch.
+
+
+--------------------------------------------------------------------------------
+WARUM DHCP ALS UDP-BEWEIS
+--------------------------------------------------------------------------------
+
+Für UDP braucht es eine Gegenstelle, die zuverlässig OFFLINE antwortet — sonst
+wird der Boot-Test flaky. DNS (10.0.2.3) leitet ans Host-Resolver weiter und
+braucht Internet; DHCP dagegen beantwortet SLIRP selbst, lokal und immer. Und
+DHCP ist nicht nur ein UDP-Testfall, sondern die echte, universelle Art, eine
+IP zu bekommen — also ein Baustein, den jedes OS ohnehin braucht.
+
+
+--------------------------------------------------------------------------------
+DAS PAKET
+--------------------------------------------------------------------------------
+
+Ethernet (Broadcast) | IPv4 (proto 17 UDP, src 0.0.0.0, dst 255.255.255.255,
+Header-Prüfsumme) | UDP (src 68, dst 67, Prüfsumme 0 — für IPv4 erlaubt) |
+BOOTP/DHCP:
+  - op=1 (Request), htype=1, hlen=6, xid, flags=0x8000 (Broadcast-Antwort, weil
+    wir noch keine IP haben), chaddr = unsere MAC,
+  - Magic Cookie 0x63825363, Option 53 = 1 (DISCOVER), Option 255 (Ende).
+
+Die Antwort (OFFER) wird geprüft: IPv4/UDP vom Server-Port 67, BOOTP op=2; die
+zugewiesene Adresse steht im yiaddr-Feld (BOOTP-Offset 16).
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+    net: DHCP-Offer -> IP 10.0.2.15
+    net: Gateway 10.0.2.2 -> MAC 52:55:0a:00:02:02
+    net: ping-Antwort von 10.0.2.2 (seq 1) — IPv4 + ICMP funktionieren!
+
+Volle Kette: DHCP (UDP) -> ARP -> ping (ICMP). Drei Protokoll-Schichten, alle in
+Ring 3, alle offline verifiziert.
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Die IP wird empfangen, aber noch nicht in den Stack zurückgeschrieben (ARP/
+    ping nutzen weiter die feste 10.0.2.15, die zufällig genau die angebotene
+    ist). Eine echte DHCP-Konfiguration (IP/Gateway/Netmask übernehmen, Lease)
+    kommt mit dem Stack.
+  - UDP-Prüfsumme wird (erlaubt) auf 0 gesetzt; ein vollständiger Stack rechnet
+    sie mit Pseudo-Header.
+  - Als Nächstes der grosse Schritt: TCP (Drei-Wege-Handshake, Datenstrom,
+    Teardown) und darauf eine Socket-API.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs   net_dhcp (DISCOVER bauen, OFFER parsen, yiaddr
+                              zurückgeben); net_demo ruft es vor ARP/ping.
+                              KEINE Kernel-Änderung.
