@@ -1,0 +1,92 @@
+================================================================================
+0.17.1 — CAPABILITY-DELEGATION: AUTORITÄT WANDERT ZWISCHEN PROZESSEN
+================================================================================
+
+Zeitraum:      2026-06-04
+Ergebnis:      Eine Capability wird von einem Prozess an einen anderen
+               überreicht — über einen Endpoint. Das Kind hält anfangs NUR eine
+               Endpoint-Capability und darf keinen Port anfassen; nachdem der
+               Root ihm seine IoPort-Capability grantet, gelingt DERSELBE
+               Port-Zugriff. Das ist der Kern des Capability-Modells: Autorität
+               ist nicht ambient, sie wird explizit weitergegeben.
+
+
+--------------------------------------------------------------------------------
+WAS DELEGATION VOLLENDET
+--------------------------------------------------------------------------------
+
+0.17.0 brachte das Rohr (Endpoint-IPC für ein Wort). 0.17.1 schickt durch dasselbe
+Rohr eine CAPABILITY. Damit ist das letzte Stück des seL4-Modells da: ein Prozess
+kann einem anderen gezielt Autorität geben, ohne dass es eine zentrale Instanz
+gibt, die „allen alles" erlaubt. Genau so reicht später ein Root-Server einem
+Kind-Treiber das Recht auf SEINE BAR — und nur die.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS  (schon in 0.17.0 im Kernel angelegt)
+--------------------------------------------------------------------------------
+
+  SYS_SEND(ep_slot, word, cap_slot):
+      Ist cap_slot != u64::MAX, liest der Kernel die Capability aus diesem Slot
+      des Senders (current_cap_get) und legt sie als Teil der Nachricht in die
+      Endpoint-Queue. Der Sender BEHÄLT seine Cap (Grant = Kopie).
+  SYS_RECV(ep_slot, out_ptr, dst_slot):
+      Bringt die Nachricht eine Capability mit und ist dst_slot != u64::MAX,
+      installiert der Kernel sie in diesem Slot des Empfängers
+      (current_cap_install -> CNode::insert; schlägt fehl, wenn der Slot belegt
+      ist — Caps werden nie still überschrieben).
+
+Wichtig: Der Empfänger benennt mit dst_slot nur, WOHIN die Cap soll — er kann
+keine Cap erfinden. Es kommt genau das an, was der Sender hatte.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (userland/init/src/main.rs)
+--------------------------------------------------------------------------------
+
+Der Root (pid 0) hält IoPort/IoMem/Untyped/Endpoint. Das Kind (pid 1) hält NUR
+die Endpoint-Cap (Slot 3). Ablauf:
+
+  child:  port_in(0xc000) VOR Delegation   -> Kernel: [cap] DENY -> VERWEIGERT
+  child:  recv(EP_SLOT, &word, RX_SLOT=0)  -> blockiert
+  root:   send(EP_SLOT, 0x00C0FFEE, GRANT_SLOT=0)  -> grantet seine IoPort-Cap
+  child:  (Cap landet in Slot 0)
+  child:  port_in(0xc000) NACH Delegation  -> 0x79006e54  (gelingt!)
+
+    cargo xtask run --test
+
+    [init Kind] Port 0xc000 VOR Delegation:  VERWEIGERT (nur Endpoint-Cap)
+    [init Kind] warte auf Capability vom Root...
+     Delegation: Root grantet dem Kind seine IoPort-Capability
+    [init Kind] Port 0xc000 NACH Delegation: 0x79006e54 — Autorität erhalten!
+    xtask: boot-test PASSED
+
+Derselbe Syscall (SYS_PORT_IN auf 0xc000), zwei Ergebnisse — der Unterschied ist
+allein, dass das Kind die Capability nun BESITZT. Sie kam vom Root, über den
+Endpoint, in genau den Slot, den das Kind angegeben hat. (Der gelesene Wert
+0x79006e54 sind die virtio-Device-Features; entscheidend ist nur: kein u64::MAX,
+also nicht mehr verweigert.)
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Grant ist hier eine KOPIE (Sender behält). Noch offen: Move (Sender verliert
+    sie), Mint (verengte Rechte / Teil-Budget eines Untyped weitergeben),
+    Revoke (eine delegierte Cap zurückziehen).
+  - invoke(cap, method, args): die Vision „jeder Syscall ist eine Capability-
+    Invocation" — die hardwarenahen Syscalls würden zu Methoden auf Caps.
+  - Der praktische Lohn: ein Dienst als EIGENER Prozess. Ein Block-/Datei-Server
+    bekommt vom Root die Geräte-Caps delegiert und bedient andere über einen
+    Endpoint — das XernelFS (0.16.1) zöge dann aus init in einen Datei-Service um.
+  - Echtes Blockieren (Wait-Queues) statt busy-yield; ein spawn-Syscall.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs    delegation_parent (grantet IoPort-Cap aus Slot 0),
+                               child_main (Port-Test vor/nach dem Grant, recv mit
+                               RX_SLOT). Kernel-Cap-Pfad: schon in 0.17.0.
