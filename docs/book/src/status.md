@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-06-04. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -22,9 +22,15 @@ Stand: 2026-06-04. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
   `CAP_IDENTIFY` aufzählen (keine globale Sicht).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 19 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 20 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
+- **Prozesse zur Laufzeit (`SPAWN`):** der Kernel bootet nur noch **einen**
+  Prozess (den Root, pid 0); jeden weiteren erzeugt der Root selbst über
+  `SYS_SPAWN` — wie ein echtes init. Der Neuling bekommt einen eigenen
+  Adressraum, eigenen Heap und eine frisch gesäte Capability-Tabelle und wird
+  vom Scheduler aufgenommen. Erst dadurch wird Xernel zum OS: ein Programm ruft
+  ein anderes ins Leben.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.
 - **Dynamischer Speicher:** wachsender User-Heap via `SBRK`.
 - **Treiber im User-Space:** Kernel liefert nur Primitive (PCI-Config-Read,
@@ -63,6 +69,7 @@ Stand: 2026-06-04. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.15 Capabilities | Port-I/O (`IoPort`), MMIO (`IoMem`) und DMA (`Untyped`-Budget) cap-gated — Least-Privilege für Treiber |
 | 0.16 Dateisystem | Block-Layer (R/W) + **XernelFS**: Format/Verzeichnis/Datei-I/O — komplett im User-Space |
 | 0.17 IPC/Delegation | Endpoint-IPC + **Capability-Delegation**: der Root grantet dem Kind eine Cap, Autorität wandert zwischen Prozessen |
+| 0.18 Spawn | **`SYS_SPAWN`**: der Kernel bootet nur den Root; der Root erschafft jedes Kind selbst zur Laufzeit — Xernel wird zum OS |
 
 ## XOS — das erste OS auf Xernel
 
@@ -80,6 +87,8 @@ cargo xtask run --init /pfad/zu/xos-init.elf
   Prozessen), `PCI_READ` per Cap — Port-I/O, `IOMAP` und `DMA_ALLOC` sind bereits gated
 - Mehrere Prozesse + Adressraum-Trennung (dann: XMM-Save im Context-Switch)
 - Timer-Frequenz in Hz (LAPIC kalibrieren)
-- Framebuffer/GUI, Dateisystem-API, `fork`/`exec`
+- `SPAWN` existiert (ein Prozess erzeugt einen anderen); noch offen: mehrere
+  Programm-Images, Eltern/Kind-Beziehung, `wait`/Exit-Status, Caps beim Spawn
+  gezielt mitgeben
 - ELF-Loader vom Kernel in einen Root-Server verlagern
 - Tastatur: Shift/Modifier; IO-APIC-Basis aus ACPI statt hartkodiert

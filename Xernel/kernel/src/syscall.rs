@@ -92,6 +92,12 @@ pub const SYS_SEND: u64 = 18;
 /// `u64::MAX` to discard any). Returns 0, or `u64::MAX` on a missing endpoint
 /// cap / bad buffer / occupied destination slot.
 pub const SYS_RECV: u64 = 19;
+/// Spawn a new process. Arg 0 selects the program image (today only the boot
+/// init image, index 0, exists). The newcomer starts in a fresh address space
+/// with a freshly seeded capability space and is scheduled as ready. Returns the
+/// new PID, or `u64::MAX` on failure. The kernel boots only the root; every other
+/// process is created this way.
+pub const SYS_SPAWN: u64 = 20;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -142,6 +148,7 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_CAP_IDENTIFY => sys_cap_identify(args[0], args[1]),
         SYS_SEND => sys_send(args[0], args[1], args[2]),
         SYS_RECV => sys_recv(args[0], args[1], args[2]),
+        SYS_SPAWN => crate::process::spawn(args[0]).unwrap_or(u64::MAX),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX

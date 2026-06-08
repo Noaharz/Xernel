@@ -29,6 +29,7 @@ const SYS_PORT_OUT: u64 = 16;
 const SYS_CAP_IDENTIFY: u64 = 17;
 const SYS_SEND: u64 = 18;
 const SYS_RECV: u64 = 19;
+const SYS_SPAWN: u64 = 20;
 
 /// CNode slot where every process holds its `Endpoint` capability (seeded by the
 /// kernel). Sentinel for "no capability" in send/recv.
@@ -754,6 +755,13 @@ fn ipc_recv(ep_slot: u64, out: *mut u64, dst_slot: u64) -> u64 {
     syscall3(SYS_RECV, ep_slot, out as u64, dst_slot)
 }
 
+/// Spawn a new process from program image `module` (0 = the init image). Returns
+/// the new PID, or `u64::MAX` on failure. The kernel boots only the root; the
+/// root creates every other process itself through this call.
+fn spawn(module: u64) -> u64 {
+    syscall3(SYS_SPAWN, module, 0, 0)
+}
+
 /// The root task's half of the delegation demo: grant the child a copy of its
 /// own `IoPort` capability (from `GRANT_SLOT`) over the shared endpoint. After
 /// this, the child can do port I/O it could not do before.
@@ -910,9 +918,10 @@ fn fb_demo() {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // The kernel boots two copies of this binary for the delegation demo; each
-    // takes a role by its PID. pid 0 is the root/driver host below; any other
-    // pid is a minimal child that only waits for a delegated message.
+    // The kernel boots only ONE copy of this binary: the root (pid 0). The root
+    // SPAWNS its child itself (see below) — like a real init. Each copy takes a
+    // role by its PID: pid 0 is the root/driver host below; any other pid is a
+    // minimal child that only waits for a delegated message.
     let pid = getpid();
 
     print("\n[init pid ");
@@ -944,6 +953,18 @@ pub extern "C" fn _start() -> ! {
     dma_demo();
     cap_list();
     cap_demo();
+
+    // Spawn the child ourselves — the kernel booted only us (the root). The new
+    // process runs this same binary, takes the child role by its PID, and waits
+    // on the shared endpoint for the capability we grant it next.
+    let child = spawn(0);
+    if child == u64::MAX {
+        print(" spawn: FEHLER\n");
+    } else {
+        print(" spawn: Kind-Prozess erzeugt, pid ");
+        print_u64(child);
+        print("\n");
+    }
     delegation_parent();
 
     let _ = yield_now; // cooperative yield available for programs that want it
