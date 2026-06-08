@@ -31,14 +31,20 @@ const SYS_SEND: u64 = 18;
 const SYS_RECV: u64 = 19;
 const SYS_SPAWN: u64 = 20;
 
-/// CNode slot where every process holds its `Endpoint` capability (seeded by the
-/// kernel). Sentinel for "no capability" in send/recv.
+/// Endpoint capability slots (seeded by the kernel): `EP_SLOT` carries requests
+/// from a client to the file-service, `REPLY_EP_SLOT` carries replies back.
+/// `NO_CAP` is the send/recv sentinel for "no capability".
 const EP_SLOT: u64 = 3;
+const REPLY_EP_SLOT: u64 = 4;
 const NO_CAP: u64 = u64::MAX;
-/// Empty CNode slot in which the child installs the capability the root grants
-/// it. The root grants from its own slot 0 (its `IoPort` capability).
-const RX_SLOT: u64 = 0;
-const GRANT_SLOT: u64 = 0;
+
+/// File-service protocol. A request is one `u64`: the opcode in the top byte,
+/// its argument in the low 56 bits. Each request gets exactly one `u64` reply.
+const OP_BYE: u64 = 0; // stop serving (no reply)
+const OP_NFILES: u64 = 1; // -> number of files
+const OP_FSIZE: u64 = 2; // arg = index            -> file size in bytes
+const OP_NAMECH: u64 = 3; // arg = index<<8 | pos   -> one byte of the name
+const OP_DATACH: u64 = 4; // arg = index<<16 | off  -> one byte of the contents
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -332,35 +338,6 @@ fn blk_rw(b: &mut Blk, sector: u64, write: bool, buf: *mut u8) -> bool {
     true
 }
 
-/// Demonstrate the user-space block layer: read sector 0 (the disk's magic
-/// string), then write a scratch sector and read it back — proof of a full
-/// read/WRITE block device driven entirely from Ring 3.
-fn blk_demo(blk: &mut Blk) {
-    let mut buf = [0u8; 512];
-    if blk_rw(blk, 0, false, buf.as_mut_ptr()) {
-        print(" Sektor 0: \"");
-        for &c in buf.iter().take(64) {
-            if c == 0 {
-                break;
-            }
-            write(&[c]);
-        }
-        print("\"\n");
-    }
-
-    // Write a scratch sector and read it back — exercises BLK_T_OUT.
-    const SCRATCH: u64 = 100;
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i as u8) ^ 0x5A;
-    }
-    let mut rb = [0u8; 512];
-    let ok = blk_rw(blk, SCRATCH, true, buf.as_mut_ptr())
-        && blk_rw(blk, SCRATCH, false, rb.as_mut_ptr());
-    let good = ok && rb.iter().enumerate().all(|(i, &b)| b == (i as u8) ^ 0x5A);
-    print(" Block-R/W: Sektor 100 write+read ");
-    print(if good { "ok\n" } else { "FEHLER\n" });
-}
-
 // --- XernelFS: a minimal on-disk filesystem on top of the block layer ---
 //
 // Layout (512-byte sectors, 1 MiB disk = 2048 sectors):
@@ -522,32 +499,96 @@ fn fs_list(b: &mut Blk) {
     }
 }
 
-/// End-to-end filesystem demo: format the disk, create two files, list the
-/// directory, then read one back — write and read paths of a real (if tiny)
-/// filesystem, entirely in Ring 3.
-fn fs_demo(b: &mut Blk) {
-    print(" XernelFS: formatiere Disk\n");
+/// Prepare the disk the file-service will serve: format it and create a couple
+/// of files, then print the catalogue. Returns false on any I/O error.
+fn fs_setup(b: &mut Blk) -> bool {
+    print(" XernelFS: formatiere und befuelle Disk\n");
     if !fs_format(b) {
         print("   format FEHLER\n");
-        return;
+        return false;
     }
-    let ok = fs_create(b, b"hallo.txt", b"Hallo von XernelFS!")
-        && fs_create(b, b"readme", b"Xernel filesystem v1 - flach, 16 Dateien.");
-    if !ok {
+    if !(fs_create(b, b"hallo.txt", b"Hallo von XernelFS!")
+        && fs_create(b, b"readme", b"Xernel filesystem v1 - flach, 16 Dateien."))
+    {
         print("   create FEHLER\n");
-        return;
+        return false;
     }
     fs_list(b);
-    let mut buf = [0u8; 128];
-    if let Some(n) = fs_read(b, b"hallo.txt", &mut buf) {
-        print("   lese hallo.txt: \"");
-        for &c in buf.iter().take(core::cmp::min(n, buf.len())) {
-            if c == 0 {
-                break;
+    true
+}
+
+/// Answer one file-service request: do the real disk I/O the client cannot do
+/// itself (it holds no device authority) and return a single `u64` result.
+fn serve_one(b: &mut Blk, op: u64, arg: u64) -> u64 {
+    let mut dir = [0u8; SECTOR];
+    if !blk_rw(b, DIR_SECTOR, false, dir.as_mut_ptr()) {
+        return u64::MAX;
+    }
+    match op {
+        // Number of files = non-empty directory entries.
+        OP_NFILES => (0..DIR_ENTRIES).filter(|&i| dir[i * ENT_SIZE] != 0).count() as u64,
+        // Size of file `arg`.
+        OP_FSIZE => {
+            let i = arg as usize;
+            if i >= DIR_ENTRIES || dir[i * ENT_SIZE] == 0 {
+                u64::MAX
+            } else {
+                u64::from(rd_u32(&dir, i * ENT_SIZE + 24))
             }
-            write(&[c]);
         }
-        print("\"\n");
+        // One byte of file `arg>>8`'s name at position `arg & 0xFF`.
+        OP_NAMECH => {
+            let i = (arg >> 8) as usize;
+            let pos = (arg & 0xFF) as usize;
+            if i >= DIR_ENTRIES || pos >= NAME_LEN || dir[i * ENT_SIZE] == 0 {
+                0
+            } else {
+                u64::from(dir[i * ENT_SIZE + pos])
+            }
+        }
+        // One byte of file `arg>>16`'s contents at offset `arg & 0xFFFF`. Reads
+        // the file through the existing read path, keyed by the entry's name.
+        OP_DATACH => {
+            let i = (arg >> 16) as usize;
+            let off = (arg & 0xFFFF) as usize;
+            if i >= DIR_ENTRIES || dir[i * ENT_SIZE] == 0 {
+                return 0;
+            }
+            let mut name = [0u8; NAME_LEN];
+            name.copy_from_slice(&dir[i * ENT_SIZE..i * ENT_SIZE + NAME_LEN]);
+            let mut buf = [0u8; SECTOR];
+            match fs_read(b, &name, &mut buf) {
+                Some(size) if off < size && off < buf.len() => u64::from(buf[off]),
+                _ => 0,
+            }
+        }
+        _ => u64::MAX,
+    }
+}
+
+/// The file-service loop: receive a request on the request endpoint, do the disk
+/// I/O, reply on the reply endpoint. Returns when a client says goodbye. This is
+/// Xernel's first real microkernel server — a filesystem living in its OWN
+/// process, reachable only by message-passing.
+fn file_service(b: &mut Blk) {
+    print(" Datei-Service: bereit, warte auf Anfragen\n");
+    loop {
+        let mut req = 0u64;
+        if ipc_recv(EP_SLOT, &mut req, NO_CAP) != 0 {
+            print(" Datei-Service: recv FEHLER\n");
+            return;
+        }
+        let op = req >> 56;
+        let arg = req & ((1u64 << 56) - 1);
+        if op == OP_BYE {
+            print(" Datei-Service: Abschied — beende\n");
+            return;
+        }
+        let reply = serve_one(b, op, arg);
+        if ipc_send(REPLY_EP_SLOT, reply, NO_CAP) != 0 {
+            print(" Datei-Service: send FEHLER\n");
+            return;
+        }
     }
 }
 
@@ -762,47 +803,70 @@ fn spawn(module: u64) -> u64 {
     syscall3(SYS_SPAWN, module, 0, 0)
 }
 
-/// The root task's half of the delegation demo: grant the child a copy of its
-/// own `IoPort` capability (from `GRANT_SLOT`) over the shared endpoint. After
-/// this, the child can do port I/O it could not do before.
-fn delegation_parent() {
-    print(" Delegation: Root grantet dem Kind seine IoPort-Capability\n");
-    if ipc_send(EP_SLOT, 0x00C0_FFEE, GRANT_SLOT) != 0 {
-        print("   send FEHLER\n");
+/// Client helper: send one request to the file-service and block for its
+/// one-word reply. The client holds no device authority — every answer comes
+/// from the service doing the disk work on its behalf.
+fn request(op: u64, arg: u64) -> u64 {
+    if ipc_send(EP_SLOT, (op << 56) | arg, NO_CAP) != 0 {
+        return u64::MAX;
     }
+    let mut r = 0u64;
+    if ipc_recv(REPLY_EP_SLOT, &mut r, NO_CAP) != 0 {
+        return u64::MAX;
+    }
+    r
 }
 
-/// The child process (pid != 0): it starts holding ONLY an `Endpoint`
-/// capability — so port I/O is denied. It blocks until the root grants it an
-/// `IoPort` capability, then the very same port read succeeds. The visible proof
-/// that authority moved between processes. Never returns.
-fn child_main() -> ! {
-    // Before delegation: no IoPort capability -> the kernel refuses the access.
-    print("[init Kind] Port 0xc000 VOR Delegation:  ");
+/// The spawned client (pid != 0): it holds ONLY endpoint capabilities, no device
+/// authority — so it cannot touch the disk. It reads the filesystem entirely by
+/// asking the file-service over IPC: it learns the file count, reconstructs each
+/// name and size, then pulls one file's contents back byte by byte. The visible
+/// proof that a client gets filesystem service without any hardware capability.
+/// Never returns.
+fn file_client() -> ! {
+    // Prove we have no device authority: a port the service may touch, we cannot.
+    print("[Client] eigene Geraete-Autoritaet? Port 0xc000: ");
     if syscall3(SYS_PORT_IN, 0xc000, 4, 0) == u64::MAX {
-        print("VERWEIGERT (nur Endpoint-Cap)\n");
+        print("VERWEIGERT (korrekt — nur Endpoint-Caps)\n");
     } else {
         print("erlaubt (?!)\n");
     }
 
-    // Receive the granted capability into RX_SLOT.
-    print("[init Kind] warte auf Capability vom Root...\n");
-    let mut word = 0u64;
-    if ipc_recv(EP_SLOT, &mut word, RX_SLOT) != 0 {
-        print("[init Kind] recv FEHLER\n");
-        exit(1);
+    let n = request(OP_NFILES, 0);
+    print("[Client] Datei-Service meldet ");
+    print_u64(n);
+    print(" Dateien — alles via IPC, ohne Disk-Autoritaet:\n");
+    for i in 0..n {
+        print("   ");
+        for pos in 0..(NAME_LEN as u64) {
+            let c = request(OP_NAMECH, (i << 8) | pos) as u8;
+            if c == 0 {
+                break;
+            }
+            write(&[c]);
+        }
+        print("  (");
+        print_u64(request(OP_FSIZE, i));
+        print(" B)\n");
     }
 
-    // After delegation: the SAME port read now succeeds.
-    print("[init Kind] Port 0xc000 NACH Delegation: ");
-    let r = syscall3(SYS_PORT_IN, 0xc000, 4, 0);
-    if r == u64::MAX {
-        print("VERWEIGERT (?!)\n");
-    } else {
-        print("0x");
-        print_hex(r, 8);
-        print(" — Autorität erhalten!\n");
+    // Pull file 0's contents back byte by byte, purely through the service.
+    let size0 = request(OP_FSIZE, 0);
+    if size0 != u64::MAX {
+        print("[Client] lese Datei 0 ueber den Service: \"");
+        for off in 0..size0 {
+            let c = request(OP_DATACH, off) as u8; // index 0: arg = off
+            if c == 0 {
+                break;
+            }
+            write(&[c]);
+        }
+        print("\"\n");
     }
+
+    // Tell the service to stop — goodbye expects no reply.
+    ipc_send(EP_SLOT, OP_BYE << 56, NO_CAP);
+    print("[Client] fertig\n");
     exit(0);
 }
 
@@ -919,9 +983,10 @@ fn fb_demo() {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // The kernel boots only ONE copy of this binary: the root (pid 0). The root
-    // SPAWNS its child itself (see below) — like a real init. Each copy takes a
-    // role by its PID: pid 0 is the root/driver host below; any other pid is a
-    // minimal child that only waits for a delegated message.
+    // brings up the disk, becomes a FILE-SERVICE, and SPAWNS a client itself
+    // (like a real init). Each copy takes a role by its PID: pid 0 is the
+    // service/driver host below; any other pid is a client that holds no device
+    // authority and reaches the filesystem only by asking the service over IPC.
     let pid = getpid();
 
     print("\n[init pid ");
@@ -929,7 +994,7 @@ pub extern "C" fn _start() -> ! {
     print("] hello — eigener Adressraum, eigener Heap\n");
 
     if pid != 0 {
-        child_main(); // never returns
+        file_client(); // never returns
     }
 
     heap_check(8192);
@@ -943,29 +1008,33 @@ pub extern "C" fn _start() -> ! {
     // so writing pixels works in any process — not just the first caller.
     fb_demo();
     let vdev = pci_scan();
+    let mut service_blk = None;
     if vdev != 0xFF {
         iomap_demo(vdev);
-        if let Some(mut blk) = blk_init(vdev) {
-            blk_demo(&mut blk);
-            fs_demo(&mut blk);
-        }
+        service_blk = blk_init(vdev);
     }
     dma_demo();
     cap_list();
     cap_demo();
 
-    // Spawn the child ourselves — the kernel booted only us (the root). The new
-    // process runs this same binary, takes the child role by its PID, and waits
-    // on the shared endpoint for the capability we grant it next.
-    let child = spawn(0);
-    if child == u64::MAX {
-        print(" spawn: FEHLER\n");
+    // Become the file-service: format the disk, spawn a client that has NO
+    // device authority, then answer its file requests over IPC — the first
+    // Xernel service living in its own process.
+    if let Some(mut blk) = service_blk {
+        if fs_setup(&mut blk) {
+            let client = spawn(0);
+            if client == u64::MAX {
+                print(" spawn: FEHLER\n");
+            } else {
+                print(" spawn: Datei-Client erzeugt, pid ");
+                print_u64(client);
+                print("\n");
+            }
+            file_service(&mut blk);
+        }
     } else {
-        print(" spawn: Kind-Prozess erzeugt, pid ");
-        print_u64(child);
-        print("\n");
+        print(" kein virtio-blk — kein Datei-Service\n");
     }
-    delegation_parent();
 
     let _ = yield_now; // cooperative yield available for programs that want it
     print("[init] fertig\n");

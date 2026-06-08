@@ -1,0 +1,148 @@
+================================================================================
+0.19.0 — DATEI-SERVICE: DAS DATEISYSTEM ALS EIGENER PROZESS
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      Das XernelFS lebt nicht mehr als Bibliothek im selben Programm,
+               sondern als EIGENER Prozess — ein Datei-Service, der über IPC
+               bedient wird. Ein gespawnter Client OHNE jede Geräte-Capability
+               liest das komplette Dateisystem (Dateianzahl, Namen, Größen,
+               Inhalte), indem er den Service fragt. Der Service hält die
+               Geräte-Autorität und macht die echte Disk-Arbeit; der Client hält
+               nur zwei Endpoint-Caps. Das ist Xernels erster echter
+               Mikrokernel-Server.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS DER MOMENT IST, IN DEM XERNEL WIE EIN MIKROKERNEL AUSSIEHT
+--------------------------------------------------------------------------------
+
+Bisher steckte alles in einem Programm: derselbe Prozess, der die Disk-Caps
+hielt, formatierte auch das FS und las die Dateien. Das BEWIES die Vision (FS in
+Ring 3), war aber noch kein Mikrokernel-MUSTER — es gab nur einen Akteur.
+
+Ein Mikrokernel ist gerade die Trennung: Funktionalität wandert in Dienste, die
+als eigene Prozesse laufen, und Klienten erreichen sie NUR über Nachrichten —
+nicht, indem sie selbst Autorität halten. Genau das steht jetzt:
+
+  - Der Datei-Service (pid 0) hält IoPort/IoMem/Untyped und kann die Disk anfassen.
+  - Der Client (pid 1) hält NUR zwei Endpoint-Caps. Er kann KEINEN Port anfassen
+    (im Boot-Log: Port 0xc000 -> VERWEIGERT). Trotzdem liest er das Dateisystem —
+    weil der Service die Arbeit für ihn macht.
+
+Das ist die zentrale Mikrokernel-Eigenschaft, sichtbar gemacht: ein Programm
+bekommt eine Leistung (Dateizugriff), ohne die zugrundeliegende Autorität
+(Hardware) zu besitzen. Wird der Service kompromittiert, ist nur er betroffen,
+nicht der Kernel.
+
+Bemerkenswert: KEIN neuer Syscall. Das gesamte Muster steht auf den drei
+Bausteinen der letzten Kapitel — spawn (0.18.0), Endpoint-IPC (0.17.0) und die
+Capability-Trennung (0.15.x). Die einzige Kernel-Änderung ist ein zweiter
+geseedeter Endpoint.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS: ANFRAGE / ANTWORT ÜBER ZWEI ENDPOINTS
+--------------------------------------------------------------------------------
+
+IPC trägt pro Nachricht genau ein u64-Wort (+ optional eine Cap). Das reicht für
+ein kleines Protokoll, wenn man Daten Byte für Byte abholt.
+
+  Endpoint 0 (Slot 3):  Anfragen  Client -> Service
+  Endpoint 1 (Slot 4):  Antworten Service -> Client
+
+Zwei UNIDIREKTIONALE Endpoints, jeder mit genau einem Schreiber und einem Leser —
+so kann der Service nie versehentlich seine eigene Antwort zurücklesen (das
+passierte, hätte man einen einzigen Endpoint für beide Richtungen benutzt).
+
+Anfrage-Wort:  (opcode << 56) | argument
+  OP_NFILES (1)              -> Anzahl Dateien
+  OP_FSIZE  (2)  arg=index   -> Dateigröße in Bytes
+  OP_NAMECH (3)  arg=idx<<8|pos   -> ein Byte des Namens
+  OP_DATACH (4)  arg=idx<<16|off  -> ein Byte des Inhalts
+  OP_BYE    (0)              -> Service beenden (keine Antwort)
+
+Jede Anfrage bekommt genau eine u64-Antwort. Der Service tut bei JEDER Anfrage
+echte Disk-I/O (blk_rw): er liest das Verzeichnis, bei OP_DATACH die Datei. Der
+Client setzt aus den Einzel-Bytes Namen und Inhalt wieder zusammen.
+
+Liveness mit busy-yield: Service und Client rendezvousen über yield_now. Der
+Service blockiert (busy-yield) auf Endpoint 0, der Client auf Endpoint 1; jede
+Seite läuft, sobald die andere etwas in die FIFO-Queue gelegt hat. Der Client
+beendet mit OP_BYE (ohne auf Antwort zu warten); der Service bricht seine
+Schleife ab und beendet sich.
+
+
+--------------------------------------------------------------------------------
+ROLLEN  (userland/init/src/main.rs, Rolle per PID)
+--------------------------------------------------------------------------------
+
+  pid 0  Datei-Service:
+         heap/banner/fb, PCI-Scan, MMIO-Map, virtio-blk hochfahren (blk_init),
+         DMA-/Capability-Demos, dann fs_setup (formatieren + zwei Dateien
+         anlegen + Katalog ausgeben), spawn(0) für den Client, file_service()
+         (Serve-Schleife bis OP_BYE), exit.
+
+  pid 1  Client (file_client):
+         beweist zuerst die fehlende Geräte-Autorität (Port 0xc000 -> VERWEIGERT),
+         fragt dann den Service: Dateianzahl, je Datei Name (Byte-weise) + Größe,
+         schließlich Datei 0 Inhalt (Byte-weise). Sendet OP_BYE, exit.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+    XernelFS: formatiere und befuelle Disk
+    Dateien:
+      hallo.txt  (19 B)
+      readme  (41 B)
+    spawn: Datei-Client erzeugt, pid 1
+    Datei-Service: bereit, warte auf Anfragen
+
+    [init pid 1] hello — eigener Adressraum, eigener Heap
+    [Client] eigene Geraete-Autoritaet? Port 0xc000: VERWEIGERT (korrekt — nur Endpoint-Caps)
+    [Client] Datei-Service meldet 2 Dateien — alles via IPC, ohne Disk-Autoritaet:
+      hallo.txt  (19 B)
+      readme  (41 B)
+    [Client] lese Datei 0 ueber den Service: "Hallo von XernelFS!"
+    [Client] fertig
+    Datei-Service: Abschied — beende
+    xtask: boot-test PASSED
+
+Der Client kennt die Dateien hallo.txt/readme, ihre Größen und den Inhalt von
+hallo.txt — und hat dabei nie ein Geräte-Register angefasst (sein einziger
+Port-Versuch wurde verweigert). Jedes Byte kam vom Service.
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Ein Wort pro Nachricht ist langsam: ganze Dateien werden Byte für Byte
+    geholt, und der Service liest pro Anfrage das Verzeichnis neu. Der nächste
+    grosse Schritt ist ein SHARED-MEMORY-Puffer (per Frame/DMA-Cap delegiert),
+    über den ganze Blöcke auf einmal wandern — das u64-Wort wird dann nur noch
+    Türklingel/Opcode (so macht es ein echter Mikrokernel mit IPC-Puffern).
+  - Der Service kennt seine Disk-Caps fest (geseedet). Sauberer wäre, sie ihm
+    beim Spawn oder per Delegation zu geben — dann hängt nicht mehr an der PID,
+    wer Autorität hat.
+  - Nur ein Client, fester Ablauf. Mehrere Klienten, echtes Blockieren
+    (Wait-Queues) statt busy-yield, und benannte Dienste (ein Name-Service, der
+    Endpoints vermittelt) sind die natürlichen Folgeschritte.
+  - Damit ist das Fundament für weitere Dienste gelegt: ein Netz-Service, ein
+    Konsolen-/TTY-Service nach demselben Muster.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs       REPLY_EP_SLOT = 4; seed_caps seeded jetzt BEIDE
+                              Endpoints (0 in Slot 3, 1 in Slot 4) für jeden
+                              Prozess. Sonst keine Kernel-Änderung.
+  userland/init/src/main.rs   Protokoll-Opcodes; serve_one + file_service
+                              (Service-Seite, echte Disk-I/O je Anfrage); request
+                              + file_client (Client-Seite, kein Geräte-Recht);
+                              fs_setup ersetzt fs_demo; blk_demo entfernt; _start
+                              spaltet Rollen Service (pid 0) / Client (pid != 0).
