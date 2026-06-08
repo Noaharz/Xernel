@@ -41,9 +41,13 @@ const PCI_MMIO_LEN: u64 = 0x4000_0000; // [0xc000_0000, 0x1_0000_0000)
 /// capability. Generous enough for real virtqueue/request buffers (tens of KiB),
 /// but bounded — a driver cannot pin unbounded physical memory for DMA.
 const DMA_BUDGET: u64 = 256 * 1024;
-/// CNode slot in which every process holds its `Endpoint` capability for the
-/// delegation demo. Both the root and its child are seeded with endpoint 0 here.
+/// CNode slots holding the two `Endpoint` capabilities every process is seeded
+/// with: endpoint 0 (slot 3) carries requests from a client to a service, and
+/// endpoint 1 (slot 4) carries the service's replies back. A request/reply pair
+/// of unidirectional endpoints is what lets the file-service (pid 0) answer a
+/// client (a spawned process with no device authority) purely over IPC.
 const EP_SLOT: usize = 3;
+const REPLY_EP_SLOT: usize = 4;
 const USER_STACK_VA: u64 = 0x80_0000;
 const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
@@ -143,10 +147,11 @@ fn create(pid: u64, module: &[u8]) -> Option<Process> {
 /// rather than hardcoding them.
 fn seed_caps(pid: u64) -> CNode {
     let mut caps = CNode::new(CAP_SLOTS);
-    // Both the root and its child share endpoint 0 so they can rendezvous; this
-    // is the one capability the child starts with. Everything else it gains only
-    // by delegation over that endpoint.
+    // Every process shares the request/reply endpoint pair so a client and a
+    // service can rendezvous; these are the only capabilities a spawned client
+    // starts with. Everything else it would gain by delegation over an endpoint.
     let _ = caps.insert(EP_SLOT, CapEntry::endpoint(0));
+    let _ = caps.insert(REPLY_EP_SLOT, CapEntry::endpoint(1));
     if pid == 0 {
         let _ = caps.insert(0, CapEntry::io_port(PCI_IO_BASE, PCI_IO_COUNT));
         let _ = caps.insert(1, CapEntry::io_mem(PCI_MMIO_BASE, PCI_MMIO_LEN));

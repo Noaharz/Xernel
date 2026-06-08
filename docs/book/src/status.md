@@ -47,8 +47,14 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   eine `Endpoint`-Capability. Eine Nachricht kann eine **Capability tragen**: der
   Root grantet dem Kind seine `IoPort`-Cap, woraufhin das Kind denselben Port
   lesen darf, der ihm vorher verweigert wurde — Autorität wandert explizit
-  zwischen Prozessen. Grundlage für Mikrokernel-Dienste (Datei-/Block-/Netz-
-  Service als eigene Prozesse).
+  zwischen Prozessen.
+- **Datei-Service (erster Mikrokernel-Server):** das XernelFS läuft als
+  **eigener Prozess**, der über ein Anfrage/Antwort-Endpoint-Paar bedient wird.
+  Ein gespawnter Client **ohne jede Geräte-Capability** liest das komplette
+  Dateisystem (Anzahl, Namen, Größen, Inhalte) — rein per IPC, während der
+  Service die echte Disk-Arbeit macht. Die zentrale Mikrokernel-Eigenschaft
+  sichtbar: ein Programm bekommt eine Leistung, ohne die Hardware-Autorität zu
+  besitzen. Ganz ohne neuen Syscall — nur aus `SPAWN` + IPC + Capabilities.
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -70,6 +76,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.16 Dateisystem | Block-Layer (R/W) + **XernelFS**: Format/Verzeichnis/Datei-I/O — komplett im User-Space |
 | 0.17 IPC/Delegation | Endpoint-IPC + **Capability-Delegation**: der Root grantet dem Kind eine Cap, Autorität wandert zwischen Prozessen |
 | 0.18 Spawn | **`SYS_SPAWN`**: der Kernel bootet nur den Root; der Root erschafft jedes Kind selbst zur Laufzeit — Xernel wird zum OS |
+| 0.19 Datei-Service | XernelFS als **eigener Prozess**: ein Client ohne Geräte-Caps liest Dateien rein per IPC — erster echter Mikrokernel-Server |
 
 ## XOS — das erste OS auf Xernel
 
