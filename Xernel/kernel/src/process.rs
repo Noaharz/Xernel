@@ -13,6 +13,7 @@
 //! same primitive the milestone-2.0 kernel threads used). This is cooperative —
 //! a process yields voluntarily; timer-driven preemption is the next step.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -48,15 +49,13 @@ const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
 const HEAP_MAX: u64 = 0x2000_0000;
 const KSTACK_WORDS: usize = 4096; // 32 KiB kernel stack per process
-/// How many processes to start from the init module at boot. Real systems boot
-/// exactly ONE init, which then spawns its own children; launching several
-/// copies that fight over the framebuffer breaks real userland. We boot TWO for
-/// the delegation demo: the same init binary takes a role by its PID — pid 0 is
-/// the root/driver host (does the device work), pid 1 is a minimal child that
-/// only participates in the IPC/delegation demo and never touches the
-/// framebuffer, so they do not collide. A real system would have the root
-/// *spawn* the child; that (and a spawn syscall) comes later.
-const NUM_PROCESSES: u64 = 2;
+/// How many processes the kernel starts at boot. Like a real system, the kernel
+/// boots exactly ONE init (the root, pid 0); the root then `spawn`s every other
+/// process itself (see [`spawn`] / `SYS_SPAWN`). The same init binary takes a
+/// role by its PID — pid 0 is the root/driver host (does the device work), any
+/// other pid is a minimal child that only participates in the IPC/delegation
+/// demo and never touches the framebuffer, so they do not collide.
+const NUM_PROCESSES: u64 = 1;
 
 #[derive(PartialEq, Eq)]
 enum State {
@@ -78,8 +77,15 @@ struct Process {
 }
 
 struct Scheduler {
-    procs: Vec<Process>,
+    /// Processes are **boxed** so a `Process` never moves once created: the
+    /// scheduler keeps saved kernel-stack pointers and switches contexts into
+    /// these structs, and `spawn` grows this vector at runtime — a reallocation
+    /// must not relocate existing processes.
+    procs: Vec<Box<Process>>,
     current: usize,
+    /// Monotonic PID counter. The kernel boots pid 0; every `spawn` hands out the
+    /// next id. Never reused (exited processes stay in `procs`, marked `Done`).
+    next_pid: u64,
 }
 
 static SCHED: Mutex<Option<Scheduler>> = Mutex::new(None);
@@ -263,12 +269,16 @@ pub fn run() -> ! {
             "[xernel] process {} ready: cr3={:#x} entry={:#x}",
             pid, p.space, p.entry
         );
-        procs.push(p);
+        procs.push(Box::new(p));
     }
 
     let first_ksp = {
         let mut guard = SCHED.lock();
-        *guard = Some(Scheduler { procs, current: 0 });
+        *guard = Some(Scheduler {
+            procs,
+            current: 0,
+            next_pid: NUM_PROCESSES,
+        });
         activate(guard.as_mut().unwrap(), 0)
     };
     let mut discard = 0u64;
@@ -276,6 +286,28 @@ pub fn run() -> ! {
     // `trampoline`; the boot context is abandoned.
     unsafe { arch::switch_context(&mut discard, first_ksp) };
     unreachable!("returned to abandoned boot context");
+}
+
+/// Create a new process at runtime and add it to the scheduler as `Ready`,
+/// returning its PID. This is how userland grows the process table: the kernel
+/// boots only the root, which `spawn`s every other process. The newcomer runs
+/// in its own fresh address space with a freshly seeded capability space
+/// (`seed_caps`); it is picked up by the round-robin scheduler the next time the
+/// caller yields, blocks, or exits.
+///
+/// `_module_index` selects which program to launch. Today only the boot init
+/// image (index 0) exists, so any value loads it — but the parameter is already
+/// part of the ABI so a future root-server can resolve a name to one of several
+/// programs. Returns `None` if the image is missing or process creation fails.
+pub fn spawn(_module_index: u64) -> Option<u64> {
+    let module = arch::init_module()?;
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut()?;
+    let pid = s.next_pid;
+    let p = create(pid, module)?;
+    s.procs.push(Box::new(p));
+    s.next_pid += 1;
+    Some(pid)
 }
 
 /// Yield the CPU to the next ready process.
@@ -293,7 +325,8 @@ pub fn yield_now() {
         (save_ptr, next_ksp)
     };
     // SAFETY: both stack pointers belong to processes whose kernel stacks live
-    // in the shared higher half; the table never reallocates after `run`.
+    // in the shared higher half; processes are boxed, so growing the table via
+    // `spawn` never relocates them and `save_ptr` stays valid.
     unsafe { arch::switch_context(save_ptr, next_ksp) };
 }
 

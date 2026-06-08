@@ -1,0 +1,128 @@
+================================================================================
+0.18.0 — SPAWN: EIN PROZESS ERSCHAFFT EINEN ANDEREN
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      Der Kernel bootet nur noch EINEN Prozess — den Root (pid 0). Jeden
+               weiteren Prozess erzeugt der Root selbst zur Laufzeit über einen
+               neuen Syscall SYS_SPAWN. Vorher legte der Kernel statisch zwei
+               Kopien des init-Binaries an; jetzt entsteht das Kind erst, wenn
+               Userland es anfordert — wie ein echtes init seine Kinder startet.
+
+
+--------------------------------------------------------------------------------
+WARUM SPAWN DER KEYSTONE IST
+--------------------------------------------------------------------------------
+
+Bis hierher war die Prozesstabelle ein Fakt: der Kernel entschied beim Boot, wie
+viele Prozesse es gibt (NUM_PROCESSES = 2), und nichts konnte das danach ändern.
+Das ist kein Betriebssystem — ein OS ist gerade die Fähigkeit, dass ein Programm
+ein anderes ins Leben ruft. Ohne spawn gibt es keinen Root-Server, keine
+Dienste-als-Prozesse, keine Shell, die Programme startet. spawn ist die Tür, durch
+die alles Weitere geht.
+
+Wichtig: spawn ist KEINE neue Forschung, sondern genau derselbe Mechanismus, den
+der Boot schon benutzt hat (Adressraum anlegen, ELF laden, Stack mappen, Caps
+säen, in den Scheduler hängen) — nur jetzt auf Anforderung aus Ring 3, nicht
+fest verdrahtet beim Boot. Der Unterschied ist, WER die Entscheidung trifft:
+nicht mehr der Kernel allein, sondern Userland.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  SYS_SPAWN(module_index) -> pid | u64::MAX        (Syscall 20)
+
+      Der Kernel ruft process::spawn(module_index):
+        - holt das Programm-Image (heute nur das Boot-init-Image, Index 0),
+        - vergibt die nächste PID aus einem monotonen Zähler (next_pid),
+        - create(pid, module): neuer Adressraum (vspace_new), ELF laden,
+          User-Stack mappen, Kernel-Stack + Kernel-Thread anlegen, seed_caps(pid),
+        - hängt den fertigen Prozess als Ready in die Scheduler-Tabelle,
+        - gibt die neue PID zurück.
+
+      Der Neuling läuft, sobald der Aufrufer das nächste Mal yielded, blockiert
+      oder exit() macht — der bestehende Round-Robin-Scheduler holt ihn ab. Kein
+      neuer Scheduler-Code nötig.
+
+DER ARGUMENT-PLATZHALTER  module_index
+      Heute existiert nur ein Programm (das init-Image), also lädt jeder Wert
+      dasselbe. Der Parameter ist trotzdem schon Teil der ABI, damit später ein
+      Root-Server einen Namen auf eines von mehreren Images auflösen kann, ohne
+      die ABI zu brechen.
+
+
+--------------------------------------------------------------------------------
+EINE SICHERHEITS-SUBTILITÄT: PROZESSE WERDEN GEBOXT
+--------------------------------------------------------------------------------
+
+Bisher stand im Scheduler "die Tabelle realloziert nach run() nie" — und genau
+darauf verließen sich die unsafe-Kontextwechsel: der Scheduler hält gespeicherte
+Kernel-Stack-Zeiger (ksp) und springt in diese Process-Strukturen. spawn lässt
+die Tabelle aber WACHSEN, und ein Vec kann beim Wachsen seinen Speicher
+umlagern — dann würden bestehende Process-Strukturen verschoben.
+
+Lösung: procs ist jetzt Vec<Box<Process>>. Die Boxen liegen einzeln auf dem Heap;
+wächst der äussere Vec, wandern nur die Zeiger, nie die Process-Strukturen selbst.
+Damit bleiben gespeicherte ksp-Zeiger und die laufende Kernel-Stack-Adresse über
+ein spawn hinweg gültig. Der alte, jetzt falsche SAFETY-Kommentar wurde
+entsprechend korrigiert.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+Der Root (pid 0) macht zuerst seine Geräte-/Capability-Arbeit, erzeugt DANN sein
+Kind und grantet ihm eine Cap. Das Kind (pid 1) existierte zur Boot-Zeit gar
+nicht — es entstand durch den spawn-Aufruf:
+
+    spawn: Kind-Prozess erzeugt, pid 1
+    Delegation: Root grantet dem Kind seine IoPort-Capability
+    [init] fertig
+    [user pid 0] exit(0)
+
+    [init pid 1] hello — eigener Adressraum, eigener Heap
+    [init Kind] Port 0xc000 VOR Delegation:  VERWEIGERT (nur Endpoint-Cap)
+    [init Kind] warte auf Capability vom Root...
+    [init Kind] Port 0xc000 NACH Delegation: 0x79006e54 — Autorität erhalten!
+    [user pid 1] exit(0)
+    [xernel] all processes exited.
+    xtask: boot-test PASSED
+
+pid 1 hat einen EIGENEN Adressraum und einen EIGENEN Heap (eigenes "hello"), eine
+frisch gesäte Capability-Tabelle (nur die Endpoint-Cap), und durchläuft die
+komplette Delegation korrekt — alles, obwohl der Kernel ihn nie selbst angelegt
+hat. Die Delegation aus 0.17.1 ist unverändert; sie läuft jetzt nur auf einem
+Kind, das Userland selbst erschaffen hat.
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Nur ein Programm-Image. spawn lädt immer das init-Binary; ein echtes spawn
+    wählt zwischen mehreren Programmen (per Name/Modul-Index). Voraussetzung:
+    mehrere User-Programme als Module — oder ein Root-Server, der Images hält.
+  - Keine Eltern-Kind-Beziehung, kein wait/exit-Status, kein Zurückgewinnen der
+    Slots eines beendeten Prozesses (Done-Einträge bleiben in der Tabelle).
+  - spawn erbt/überreicht noch keine Caps an das Kind ausser dem, was seed_caps
+    fest vergibt; der natürliche nächste Schritt ist, dem Kind beim Erzeugen
+    gezielt Capabilities mitzugeben (statt erst per Delegation nachzureichen).
+  - Der grosse Lohn liegt direkt vor uns: einen Dienst (z. B. das XernelFS aus
+    0.16.1) aus init herauslösen und als EIGENEN, gespawnten Prozess laufen
+    lassen, der über einen Endpoint bedient wird — der erste echte
+    Mikrokernel-Server.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs    NUM_PROCESSES = 1; Scheduler.next_pid; procs als
+                           Vec<Box<Process>>; neue pub fn spawn(); SAFETY-
+                           Kommentar in yield_now korrigiert.
+  kernel/src/syscall.rs    SYS_SPAWN = 20 (Konstante + Dispatch).
+  userland/init/src/main.rs  spawn()-Wrapper; Root ruft spawn(0) vor der
+                           Delegation; _start-Kommentar (Kernel bootet nur 1).
