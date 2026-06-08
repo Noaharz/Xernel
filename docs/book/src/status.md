@@ -84,6 +84,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.18 Spawn | **`SYS_SPAWN`**: der Kernel bootet nur den Root; der Root erschafft jedes Kind selbst zur Laufzeit — Xernel wird zum OS |
 | 0.19 Datei-Service | XernelFS als **eigener Prozess**: ein Client ohne Geräte-Caps liest Dateien rein per IPC — erster echter Mikrokernel-Server |
 | 0.20 Netzwerk | **virtio-net** im User-Space: NIC hochgefahren, ARP-Request gesendet + Gateway-Antwort empfangen — erstes Paket auf dem Draht (M4-Start) |
+| 0.20.1 IPv4/ICMP | **ping** ans Gateway: ARP-Resolve + IPv4-Header mit Prüfsumme + ICMP-Echo — Request raus, Reply rein |
 
 ## XOS — das erste OS auf Xernel
 

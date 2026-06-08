@@ -1,0 +1,88 @@
+================================================================================
+0.20.1 — IPv4 + ICMP: PING ANS GATEWAY
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      Xernel kann pingen. Der User-Space-Treiber löst per ARP die MAC
+               des Gateways auf, baut ein vollständiges IPv4-Paket mit korrekter
+               Header-Prüfsumme und einer ICMP-Echo-Request, sendet es und
+               empfängt die Echo-Reply. Schicht 3 (IP) + ICMP funktionieren —
+               der nächste Baustein Richtung TCP/IP (Meilenstein M4).
+
+
+--------------------------------------------------------------------------------
+WAS NEU IST GEGENÜBER 0.20.0
+--------------------------------------------------------------------------------
+
+0.20.0 sendete ein ARP-Frame und las die Antwort — ein einzelner, fest
+verdrahteter Austausch. 0.20.1 macht daraus eine kleine, wiederverwendbare
+Netz-Schicht und legt IPv4+ICMP darauf:
+
+  - Empfangs-Puffer werden jetzt PRO AUSTAUSCH frisch gepostet (net_rx_arm),
+    statt einmalig beim Init. rx_posted/tx_posted zählen die übergebenen Puffer;
+    net_rx_wait/net_tx warten, bis der Used-Ring den Zählerstand erreicht. So
+    lassen sich beliebig viele Pakete nacheinander austauschen (erst ARP, dann
+    Ping, später UDP/TCP).
+  - net_tx(frame) nimmt ein fertiges Ethernet-Frame (der virtio_net_hdr wird
+    vorangestellt); net_rx_wait kopiert das empfangene Frame in einen Puffer zum
+    Parsen. Die Frames werden in normalen Stack-Arrays gebaut/geparst statt per
+    Volatile-Einzelschreibung — die Prüfsumme rechnet sich so sauber.
+  - inet_checksum: die Internet-Prüfsumme (RFC 1071), Einerkomplement-Summe der
+    16-Bit-Worte, für IPv4-Header UND ICMP-Nachricht.
+
+
+--------------------------------------------------------------------------------
+DER ABLAUF  (net_demo)
+--------------------------------------------------------------------------------
+
+  net_resolve(gw):  ARP-Request für 10.0.2.2 -> Gateway-MAC aus der Antwort.
+  net_ping(mac,ip): Ethernet(IPv4) | IPv4-Header (TTL 64, proto 1, Prüfsumme) |
+                    ICMP Echo-Request (type 8, id/seq, 32 B Payload, Prüfsumme).
+                    Senden, Echo-Reply empfangen, prüfen (ethertype 0x0800,
+                    proto 1, ICMP-type 0) und die Quell-IP ausgeben.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+    virtio-net @ I/O 0xc0c0, MAC 52:54:00:12:34:56
+    net: Gateway 10.0.2.2 -> MAC 52:55:0a:00:02:02
+    net: ping-Antwort von 10.0.2.2 (seq 1) — IPv4 + ICMP funktionieren!
+
+Ein echter ICMP-Round-Trip mit der Gegenstelle: Request raus, Reply rein und
+korrekt als Echo-Reply von 10.0.2.2 geparst. QEMUs SLIRP beantwortet Pings ans
+Gateway, der Test bleibt selbstständig.
+
+
+--------------------------------------------------------------------------------
+NEBENBEI: 0 WARNUNGEN
+--------------------------------------------------------------------------------
+
+Sechs verwaiste, ungenutzte Helfer in init (uptime/sysinfo-Demo, längst nicht
+mehr im _start) entfernt — SYS_GET_TICKS/SYS_SYSINFO/INFO_RAM_*-Konstanten und
+die Funktionen ticks()/sysinfo(). init baut wieder warnungsfrei.
+
+
+--------------------------------------------------------------------------------
+GRENZEN & WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Noch kein UDP/TCP. Als Nächstes: UDP (Datagramme — z. B. ein DNS- oder
+    Echo-Test), dann ein minimaler TCP (Handshake, Retransmit, Teardown) und
+    darauf eine Socket-API (connect/listen/accept/send/recv).
+  - Ein RX-Puffer, fester id/seq. Ein echter Stack hält einen RX-Ring und
+    multiplext mehrere Verbindungen.
+  - Der Treiber lebt in init; später ein Netz-Service als eigener Prozess
+    (Sockets über Endpoints, nach dem Muster des Datei-Service 0.19).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs   inet_checksum, print_ip; net_rx_arm/net_rx_wait/
+                              net_tx (Queue-Helfer mit rx_posted/tx_posted);
+                              net_resolve (ARP), net_ping (IPv4/ICMP), net_demo;
+                              Net um rx_avail/rx_buf_phys/Zähler erweitert; sechs
+                              tote Items entfernt. KEINE Kernel-Änderung.
