@@ -98,6 +98,17 @@ pub const SYS_RECV: u64 = 19;
 /// new PID, or `u64::MAX` on failure. The kernel boots only the root; every other
 /// process is created this way.
 pub const SYS_SPAWN: u64 = 20;
+/// Signal a notification: OR `bits` (arg 1) into the notification named by the
+/// `Notification` cap in `notif_slot` (arg 0). Non-blocking, never loses bits.
+/// Returns 0, or `u64::MAX` if the slot holds no notification capability. The
+/// async readiness primitive — a service signals readiness, a waiter wakes.
+pub const SYS_SIGNAL: u64 = 21;
+/// Wait on a notification: block (by yielding) until the notification named by
+/// the `Notification` cap in `notif_slot` (arg 0) has non-zero bits, then return
+/// those bits and clear them. Returns the bits (always non-zero on success), or
+/// 0 if the slot holds no notification capability. One wait can cover many
+/// readiness sources (each sets its own bit) — the `epoll`/`kqueue` shape.
+pub const SYS_WAIT: u64 = 22;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -149,6 +160,8 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_SEND => sys_send(args[0], args[1], args[2]),
         SYS_RECV => sys_recv(args[0], args[1], args[2]),
         SYS_SPAWN => crate::process::spawn(args[0]).unwrap_or(u64::MAX),
+        SYS_SIGNAL => sys_signal(args[0], args[1]),
+        SYS_WAIT => sys_wait(args[0]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -413,6 +426,37 @@ fn sys_recv(ep_slot: u64, out_ptr: u64, dst_slot: u64) -> u64 {
             return 0;
         }
         // Nothing yet — let other processes (including the sender) run.
+        crate::process::yield_now();
+    }
+}
+
+/// Signal the notification named by the `Notification` cap in `notif_slot`,
+/// OR-ing `bits` into its word. Non-blocking. Returns 0, or `u64::MAX` if the cap
+/// is missing.
+fn sys_signal(notif_slot: u64, bits: u64) -> u64 {
+    let Some(id) = crate::process::current_notification_id(notif_slot as usize) else {
+        println!("[cap] DENY signal (no Notification capability in slot {notif_slot})");
+        return u64::MAX;
+    };
+    if crate::notification::signal(id as usize, bits) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// Wait on the notification named by the `Notification` cap in `notif_slot`,
+/// blocking (by yielding the CPU) until its bits are non-zero, then returning and
+/// clearing them. Returns the bits (non-zero), or 0 if the cap is missing.
+fn sys_wait(notif_slot: u64) -> u64 {
+    let Some(id) = crate::process::current_notification_id(notif_slot as usize) else {
+        println!("[cap] DENY wait (no Notification capability in slot {notif_slot})");
+        return 0;
+    };
+    loop {
+        if let Some(bits) = crate::notification::poll_take(id as usize) {
+            return bits;
+        }
         crate::process::yield_now();
     }
 }

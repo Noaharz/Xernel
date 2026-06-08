@@ -97,6 +97,13 @@ impl CapEntry {
         Self::new(CapType::Endpoint, id)
     }
 
+    /// A `Notification` capability naming kernel notification `id` — the async
+    /// readiness object. The holder may signal it and wait on it; without the
+    /// capability there is no way to name it.
+    pub const fn notification(id: u64) -> Self {
+        Self::new(CapType::Notification, id)
+    }
+
     /// A normalized, userspace-facing view of this capability: `(type, a, b)`,
     /// where the meaning of `a`/`b` depends on the type — IoPort: (base, count);
     /// IoMem: (base, len); Untyped: (remaining bytes, 0); otherwise raw

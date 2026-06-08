@@ -28,13 +28,19 @@ const SYS_CAP_IDENTIFY: u64 = 17;
 const SYS_SEND: u64 = 18;
 const SYS_RECV: u64 = 19;
 const SYS_SPAWN: u64 = 20;
+const SYS_SIGNAL: u64 = 21;
+const SYS_WAIT: u64 = 22;
 
 /// Endpoint capability slots (seeded by the kernel): `EP_SLOT` carries requests
 /// from a client to the file-service, `REPLY_EP_SLOT` carries replies back.
 /// `NO_CAP` is the send/recv sentinel for "no capability".
 const EP_SLOT: u64 = 3;
 const REPLY_EP_SLOT: u64 = 4;
+const NOTIF_SLOT: u64 = 5;
 const NO_CAP: u64 = u64::MAX;
+
+/// Readiness bit the file-service raises on the notification once it is up.
+const READY_BIT: u64 = 0x1;
 
 /// File-service protocol. A request is one `u64`: the opcode in the top byte,
 /// its argument in the low 56 bits. Each request gets exactly one `u64` reply.
@@ -1368,6 +1374,17 @@ fn cap_demo() {
     }
 }
 
+/// Signal a notification: OR `bits` into the notification in `notif_slot`.
+fn notify(notif_slot: u64, bits: u64) -> u64 {
+    syscall3(SYS_SIGNAL, notif_slot, bits, 0)
+}
+
+/// Block on the notification in `notif_slot` until its bits are non-zero; return
+/// (and clear) them. One wait can cover many readiness sources.
+fn wait_notif(notif_slot: u64) -> u64 {
+    syscall3(SYS_WAIT, notif_slot, 0, 0)
+}
+
 /// Send `word` (and optionally a capability) over the endpoint in `ep_slot`.
 fn ipc_send(ep_slot: u64, word: u64, cap_slot: u64) -> u64 {
     syscall3(SYS_SEND, ep_slot, word, cap_slot)
@@ -1414,6 +1431,13 @@ fn file_client() -> ! {
     } else {
         print("erlaubt (?!)\n");
     }
+
+    // Wait until the service signals it is ready (async readiness primitive).
+    print("[Client] warte auf Service-Bereitschaft (wait)...\n");
+    let bits = wait_notif(NOTIF_SLOT);
+    print("[Client] Service bereit (Signal-Bits 0x");
+    print_hex(bits, 1);
+    print(")\n");
 
     let n = request(OP_NFILES, 0);
     print("[Client] Datei-Service meldet ");
@@ -1617,6 +1641,10 @@ pub extern "C" fn _start() -> ! {
                 print_u64(client);
                 print("\n");
             }
+            // Signal readiness so the client may proceed (async readiness
+            // primitive — the seL4-style notification, epoll's building block).
+            notify(NOTIF_SLOT, READY_BIT);
+            print(" Datei-Service: Bereitschaft signalisiert (notify)\n");
             file_service(&mut blk);
         }
     } else {

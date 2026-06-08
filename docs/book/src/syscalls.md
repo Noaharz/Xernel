@@ -41,6 +41,8 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 18 | `SEND` | ep_slot, word, cap_slot | 0 / `u64::MAX` | Sendet `word` (+ optional die Cap in `cap_slot`, sonst `u64::MAX`) über den Endpoint in `ep_slot`. Nicht blockierend. |
 | 19 | `RECV` | ep_slot, out_ptr, dst_slot | 0 / `u64::MAX` | Blockiert bis eine Nachricht da ist; schreibt das Wort nach `out_ptr`, installiert eine mitgeschickte Cap in `dst_slot` (`u64::MAX` = verwerfen). |
 | 20 | `SPAWN` | module | pid / `u64::MAX` | Erzeugt einen neuen Prozess aus Programm-Image `module` (heute nur 0 = init-Image): eigener Adressraum, frisch gesäte Caps, als bereit eingehängt. Der Kernel bootet nur den Root; jeder weitere Prozess entsteht so. |
+| 21 | `SIGNAL` | notif_slot, bits | 0 / `u64::MAX` | Signalisiert eine Notification: ODER-t `bits` in ihr Signal-Wort (nicht blockierend, akkumuliert). Braucht eine `Notification`-Capability in `notif_slot`. |
+| 22 | `WAIT` | notif_slot | bits (≠0) / 0 | Blockiert, bis die Notification in `notif_slot` Bits ≠ 0 hat, gibt sie zurück und löscht sie. Das Readiness-Primitiv (epoll/kqueue-Form): ein `WAIT` deckt viele Quellen ab. `0` = keine Cap. |
 
 Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16) prüfen eine
 Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung, wenn

@@ -1,0 +1,107 @@
+================================================================================
+0.21.0 — NOTIFICATION: DAS ASYNCHRONE READINESS-PRIMITIV (epoll-Baustein)
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      Xernel hat ein asynchrones Readiness-Primitiv: das Notification-
+               Objekt (seL4-Stil). Ein Prozess SIGNALISIERT eine Notification
+               (Bits werden ODER-verknüpft, nie verloren), ein anderer WARTET
+               darauf (blockiert bis Bits ≠ 0, bekommt sie und löscht sie). Ein
+               einziges wait kann viele Quellen abdecken, weil jede Quelle ihr
+               eigenes Bit setzt — genau die Form eines epoll/kqueue-Signals.
+               Der erste Baustein des Socket-API-Meilensteins (Release v0.18.0).
+
+
+--------------------------------------------------------------------------------
+WARUM DIESES PRIMITIV (NexusCloud-Anforderung, universell gelöst)
+--------------------------------------------------------------------------------
+
+NexusClouds Socket-Wünsche, nach Priorität: (1) non-blocking Primitive, (2)
+Multiplex + ein effizientes „warte auf N" (epoll/kqueue-Äquivalent), (3) auf der
+Endpoint-IPC. Das ist KEIN Sonderwunsch, sondern eine universelle OS-Anforderung:
+ein Server (ihr gRPC-Beispiel) hält hunderte Verbindungen und braucht EIN
+Warte-Primitiv, das alle abdeckt.
+
+Die mikrokernel-korrekte Antwort stand schon in der ABI: CapType::Notification
+(=8) war reserviert. In seL4 ist eine Notification genau ein asynchrones
+Signal-Wort — das Readiness-Primitiv. Wir haben es jetzt implementiert. Es nützt
+ALLEM (jeder Service kann Bereitschaft/Ereignisse signalisieren), nicht nur dem
+Netz — also ein echtes universelles Fundament.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  kernel/src/notification.rs: feste Tabelle (NUM_NOTIFICATIONS=4) von je einem
+  u64-Signal-Wort.
+    signal(id, bits):    *word |= bits     (nicht-blockierend, akkumuliert)
+    poll_take(id):       wenn word≠0 -> nimm+lösche (mem::take), sonst None
+
+  SYS_SIGNAL (21)  (notif_slot, bits): ODER-t bits in die Notification, die die
+                   Notification-Cap im Slot benennt. Nicht-blockierend. 0 / MAX.
+  SYS_WAIT   (22)  (notif_slot): blockiert per busy-yield bis Bits≠0, gibt sie
+                   zurück und löscht sie. Rückgabe = Bits (immer ≠0 bei Erfolg),
+                   oder 0 wenn keine Notification-Cap.
+
+  cap.rs: CapEntry::notification(id) (CapType::Notification, object=id).
+  process.rs: jeder Prozess wird mit Notification 0 in Slot NOTIF_SLOT=5
+              geseedet; current_notification_id(slot) prüft die Cap.
+
+Cap-gated wie alles andere: ohne Notification-Cap im Slot -> "[cap] DENY". Es gibt
+keinen ambienten Weg, eine Notification zu erreichen.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+Der Datei-Service (pid 0) signalisiert nach dem Spawn seine Bereitschaft; der
+Client (pid 1) WARTET darauf, bevor er Anfragen stellt — echte Readiness:
+
+    spawn: Datei-Client erzeugt, pid 1
+    Datei-Service: Bereitschaft signalisiert (notify)
+    [Client] warte auf Service-Bereitschaft (wait)...
+    [Client] Service bereit (Signal-Bits 0x1)
+    [Client] Datei-Service meldet 2 Dateien ...
+
+Der Client blockiert, bis das Signal kommt, und liest die Bits (0x1) korrekt aus.
+Das Signal kam vor dem Warten — die Bits blieben in der Notification erhalten, bis
+der Client sie nahm (akkumulierende Semantik, kein verlorenes Ereignis).
+
+
+--------------------------------------------------------------------------------
+WIE DAS ZUR SOCKET-API WIRD (nächste Phasen, Release v0.18.0)
+--------------------------------------------------------------------------------
+
+  - Ein NETZ-SERVICE-Prozess besitzt NIC + TCP/IP und vergibt Socket-Handles
+    (Muster wie der Datei-Service 0.19).
+  - send/recv non-blocking: kehren sofort zurück (würde-blockieren-Signal).
+  - Readiness: der Service signalisiert EINE Notification, sobald irgendein
+    Socket lesbar/schreibbar wird; ein wait deckt hunderte Sockets ab. Die
+    Ready-Menge transportiert entweder eine Bitmaske im Signal-Wort (bis 64
+    Sockets) oder ein Shared-Memory-Readiness-Ring (skaliert wie epoll) —
+    Designfrage an NexusCloud.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+  - Busy-yield-Wait (wie bei Endpoints), noch keine echten Wait-Queues; der
+    blockierte Waiter gibt die CPU ab, statt wirklich zu schlafen.
+  - Feste Tabelle von 4 Notifications; pro-Prozess/dynamische Allokation später.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/notification.rs   NEU: Signal-Wort-Tabelle, signal/poll_take.
+  kernel/src/main.rs           mod notification.
+  kernel/src/cap.rs            CapEntry::notification(id).
+  kernel/src/process.rs        NOTIF_SLOT=5, seed Notification 0,
+                               current_notification_id.
+  kernel/src/syscall.rs        SYS_SIGNAL=21, SYS_WAIT=22 + Handler.
+  userland/init/src/main.rs    notify/wait_notif; Service signalisiert
+                               Bereitschaft, Client wartet darauf.

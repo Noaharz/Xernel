@@ -22,7 +22,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
   `CAP_IDENTIFY` aufzählen (keine globale Sicht).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 20 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 22 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Prozesse zur Laufzeit (`SPAWN`):** der Kernel bootet nur noch **einen**
@@ -90,6 +90,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.20.1 IPv4/ICMP | **ping** ans Gateway: ARP-Resolve + IPv4-Header mit Prüfsumme + ICMP-Echo — Request raus, Reply rein |
 | 0.20.2 UDP/DHCP | **DHCP** holt eine IP (10.0.2.15): UDP/BOOTP-DISCOVER raus, OFFER geparst — UDP funktioniert |
 | 0.20.3 TCP | **TCP-Handshake + Datenstrom**: SYN/SYN-ACK/ACK zu einem Echo-Server, Zeile gesendet + zurückbekommen, FIN — TCP funktioniert |
+| 0.21.0 Readiness | **Notification-Objekt** (`SIGNAL`/`WAIT`): seL4-Async-Signal, der epoll/kqueue-Baustein — ein Service signalisiert Bereitschaft, ein Client wartet darauf |
 
 ## XOS — das erste OS auf Xernel
 
