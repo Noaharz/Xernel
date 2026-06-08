@@ -1,0 +1,97 @@
+================================================================================
+0.20.3 — TCP: DREI-WEGE-HANDSHAKE UND DATENSTROM
+================================================================================
+
+Zeitraum:      2026-06-08
+Ergebnis:      Xernel spricht TCP. Der User-Space-Treiber öffnet aktiv eine
+               TCP-Verbindung (SYN / SYN-ACK / ACK), sendet eine Zeile, empfängt
+               sie vom Echo-Server zurück und schließt mit FIN — ein echter
+               TCP-Datenstrom, alles in Ring 3, deterministisch offline. Damit
+               steht die Protokoll-Schichtung komplett: Ethernet, ARP, IPv4,
+               ICMP, UDP und TCP.
+
+
+--------------------------------------------------------------------------------
+DER DETERMINISTISCHE OFFLINE-TEST
+--------------------------------------------------------------------------------
+
+TCP braucht eine Gegenstelle, die einen Handshake offline und reproduzierbar
+abschliesst. Lösung über QEMUs SLIRP-`guestfwd`:
+
+    -netdev user,id=net0,guestfwd=tcp:10.0.2.100:9-cmd:cat
+
+SLIRP nimmt TCP-Verbindungen an 10.0.2.100:9 an und verbindet den Datenstrom mit
+der Standardein-/-ausgabe von `cat` — also ein TCP-Echo-Server, ganz ohne Netz
+und ohne externen Host. SLIRP wickelt den Handshake selbst ab.
+
+
+--------------------------------------------------------------------------------
+DER ABLAUF  (net_tcp_echo)
+--------------------------------------------------------------------------------
+
+  1. SYN          seq=ISN, flags=SYN.
+  2. <- SYN/ACK   Server-ISN auslesen; our_ack = ihre_ISN + 1.
+  3. ACK          seq=ISN+1, ack=their_ISN+1 — Verbindung steht.
+  4. PSH/ACK      "HELLO XERNEL TCP\n" senden.
+  5. <- Daten     bis zu 4 Segmente empfangen (der Server schickt evtl. erst ein
+                  reines ACK, dann die Echo-Daten); das Echo mit dem Gesendeten
+                  vergleichen.
+  6. FIN/ACK      von unserer Seite schliessen.
+
+Die TCP-Prüfsumme deckt einen Pseudo-Header (Quell-/Ziel-IP, Protokoll 6, TCP-
+Länge) plus das Segment ab (tcp_checksum). net_tcp_send baut Ethernet/IPv4/TCP
+ohne Optionen; die festen Felder (Seq bei Offset 38, Flags bei 47) liegen
+unabhängig von Optionen im 20-Byte-Fixteil, sodass auch das SYN/ACK mit MSS-
+Option korrekt geparst wird.
+
+SLIRP bedient alle seine Adressen hinter EINER MAC (der des Gateways) — darum
+erreichen wir 10.0.2.100 über dieselbe MAC, die wir für den Ping aufgelöst haben;
+keine zweite ARP-Anfrage nötig.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+    net: DHCP-Offer -> IP 10.0.2.15
+    net: Gateway 10.0.2.2 -> MAC 52:55:0a:00:02:02
+    net: ping-Antwort von 10.0.2.2 (seq 1) — IPv4 + ICMP funktionieren!
+    net: TCP-Echo bestätigt — Handshake + Datenstrom funktionieren!
+
+Vier Protokoll-Ebenen in einem Boot, alle in Ring 3, alle offline verifiziert.
+
+
+--------------------------------------------------------------------------------
+EHRLICHE GRENZEN (WICHTIG)
+--------------------------------------------------------------------------------
+
+Das ist ein FUNKTIONIERENDER, aber noch KEIN produktionsreifer TCP:
+
+  - Eine Verbindung, festes ISN, kein echtes Retransmit/Timeout-Handling, kein
+    Fenster-/Congestion-Management, keine Out-of-Order-Reassemblierung.
+  - Active-Open (Client). LISTEN/accept (passiv) fehlt noch.
+  - Der Treiber lebt in init; es gibt noch KEINE prozess-übergreifende Socket-API
+    (connect/listen/accept/send/recv für andere Prozesse).
+
+Für einen belastbaren Stack, auf dem z. B. gRPC läuft, sind diese Punkte die
+nächste, eigene Arbeit — sie gehören ehrlich benannt, nicht versteckt.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - Socket-API als eigener NETZ-SERVICE-Prozess (Sockets über Endpoints, nach dem
+    Muster des Datei-Service 0.19) — die universelle, mikrokernel-korrekte Form.
+  - Retransmit/Fenster/Teardown robust; passives Öffnen (Server-Sockets).
+  - DHCP-Ergebnis wirklich übernehmen (IP/Gateway/Netmask konfigurieren).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  xtask/src/main.rs           guestfwd -> `cat` als TCP-Echo-Server (10.0.2.100:9).
+  userland/init/src/main.rs   TCP-Flags-Konstanten, ECHO_IP; tcp_checksum (Pseudo-
+                              Header), net_tcp_send, net_tcp_echo; net_demo ruft
+                              es nach dem Ping. KEINE Kernel-Änderung.

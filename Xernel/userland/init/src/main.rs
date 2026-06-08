@@ -616,6 +616,13 @@ const NET_BUF: u64 = 2048; // per-direction packet buffer
 
 const OUR_IP: [u8; 4] = [10, 0, 2, 15]; // our address on the SLIRP network
 const GW_IP: [u8; 4] = [10, 0, 2, 2]; // the SLIRP gateway
+const ECHO_IP: [u8; 4] = [10, 0, 2, 100]; // SLIRP guestfwd -> a `cat` TCP echo
+
+// TCP control-bit flags.
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
 
 /// A brought-up virtio-net device. `rx_posted`/`tx_posted` are the running
 /// counts of buffers handed to each queue; an exchange arms a receive buffer,
@@ -927,6 +934,153 @@ fn net_ping(n: &mut Net, dst_mac: [u8; 6], dst_ip: [u8; 4]) -> bool {
     }
 }
 
+/// TCP checksum: the Internet checksum over a pseudo-header (src/dst IP, proto,
+/// TCP length) followed by the TCP segment `seg`.
+fn tcp_checksum(src: [u8; 4], dst: [u8; 4], seg: &[u8]) -> u16 {
+    let mut buf = [0u8; 128];
+    buf[0..4].copy_from_slice(&src);
+    buf[4..8].copy_from_slice(&dst);
+    buf[9] = 6; // protocol TCP (byte 8 stays zero)
+    let len = seg.len();
+    buf[10] = (len >> 8) as u8;
+    buf[11] = len as u8;
+    buf[12..12 + len].copy_from_slice(seg);
+    inet_checksum(&buf[..12 + len])
+}
+
+/// Build and transmit one TCP segment (Ethernet/IPv4/TCP, no options) carrying
+/// `data`. Returns false on a transmit timeout.
+#[allow(clippy::too_many_arguments)]
+fn net_tcp_send(
+    n: &mut Net,
+    dmac: [u8; 6],
+    dip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    data: &[u8],
+) -> bool {
+    let tcp_len = 20 + data.len();
+    let ip_len = 20 + tcp_len;
+    let frame_len = 14 + ip_len;
+    let mut f = [0u8; 14 + 20 + 20 + 64];
+
+    for i in 0..6 {
+        f[i] = dmac[i];
+        f[6 + i] = n.mac[i];
+    }
+    f[12] = 0x08;
+    f[13] = 0x00; // IPv4
+
+    f[14] = 0x45;
+    f[16] = (ip_len >> 8) as u8;
+    f[17] = ip_len as u8;
+    f[18] = 0x42; // identification
+    f[22] = 64; // TTL
+    f[23] = 6; // protocol TCP
+    f[26..30].copy_from_slice(&OUR_IP);
+    f[30..34].copy_from_slice(&dip);
+    let ipsum = inet_checksum(&f[14..34]);
+    f[24] = (ipsum >> 8) as u8;
+    f[25] = ipsum as u8;
+
+    // TCP header at offset 34.
+    f[34] = (sport >> 8) as u8;
+    f[35] = sport as u8;
+    f[36] = (dport >> 8) as u8;
+    f[37] = dport as u8;
+    f[38..42].copy_from_slice(&seq.to_be_bytes());
+    f[42..46].copy_from_slice(&ack.to_be_bytes());
+    f[46] = 5 << 4; // data offset = 5 (20 bytes), no options
+    f[47] = flags;
+    f[48] = 0x40; // window 0x4000
+    for (i, b) in data.iter().enumerate() {
+        f[54 + i] = *b;
+    }
+    let cks = tcp_checksum(OUR_IP, dip, &f[34..34 + tcp_len]);
+    f[50] = (cks >> 8) as u8;
+    f[51] = cks as u8;
+
+    net_tx(n, &f[..frame_len])
+}
+
+/// Open a TCP connection to `dip` (reachable at `dmac`), send a line, and verify
+/// the echo server sends it back — a real three-way handshake, data stream and
+/// close, all in Ring 3. Returns true if the echo matched.
+fn net_tcp_echo(n: &mut Net, dmac: [u8; 6], dip: [u8; 4]) -> bool {
+    let (sport, dport) = (49152u16, 9u16);
+    let isn = 0x0000_1000u32;
+
+    // 1. SYN.
+    net_rx_arm(n);
+    if !net_tcp_send(n, dmac, dip, sport, dport, isn, 0, TCP_SYN, &[]) {
+        return false;
+    }
+    let mut r = [0u8; 128];
+    if !net_rx_wait(n, &mut r) {
+        print(" net: TCP keine SYN/ACK\n");
+        return false;
+    }
+    if !(r[12] == 0x08 && r[13] == 0x00 && r[23] == 6 && (r[47] & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK))
+    {
+        print(" net: TCP-Handshake fehlgeschlagen\n");
+        return false;
+    }
+    let their_isn = u32::from_be_bytes([r[38], r[39], r[40], r[41]]);
+    let our_seq = isn + 1;
+    let our_ack = their_isn + 1;
+
+    // 2. ACK to finish the handshake.
+    if !net_tcp_send(n, dmac, dip, sport, dport, our_seq, our_ack, TCP_ACK, &[]) {
+        return false;
+    }
+
+    // 3. Send a line, armed to receive the echo.
+    let payload = b"HELLO XERNEL TCP\n";
+    net_rx_arm(n);
+    if !net_tcp_send(n, dmac, dip, sport, dport, our_seq, our_ack, TCP_PSH | TCP_ACK, payload) {
+        return false;
+    }
+    let our_seq2 = our_seq + payload.len() as u32;
+
+    // 4. Receive segments until one carries our echoed bytes (the server may ACK
+    //    first and send the data in a later segment).
+    let mut ok = false;
+    let mut their_end = our_ack;
+    for attempt in 0..4 {
+        let mut e = [0u8; 256];
+        if !net_rx_wait(n, &mut e) {
+            break;
+        }
+        let ip_total = (usize::from(e[16]) << 8) | usize::from(e[17]);
+        let plen = ip_total.saturating_sub(40); // 20 IP + 20 TCP
+        let seg_seq = u32::from_be_bytes([e[38], e[39], e[40], e[41]]);
+        if plen > 0 {
+            their_end = seg_seq + plen as u32;
+            let want = payload.len().min(plen);
+            if e[54..54 + want] == payload[..want] {
+                ok = true;
+            }
+            break;
+        }
+        if attempt < 3 {
+            net_rx_arm(n);
+        }
+    }
+
+    // 5. Close from our side (best effort, no wait).
+    net_tcp_send(n, dmac, dip, sport, dport, our_seq2, their_end, TCP_FIN | TCP_ACK, &[]);
+
+    if ok {
+        print(" net: TCP-Echo bestätigt — Handshake + Datenstrom funktionieren!\n");
+    } else {
+        print(" net: TCP verbunden, aber Echo kam nicht an\n");
+    }
+    ok
+}
+
 /// Obtain an IP address via DHCP: broadcast a DISCOVER, read the OFFER, return
 /// the offered address. Proof that UDP works — and the way a real machine boots
 /// onto a network. SLIRP answers DHCP entirely offline.
@@ -1013,6 +1167,9 @@ fn net_demo(n: &mut Net) {
             print_mac(&mac);
             print("\n");
             net_ping(n, mac, GW_IP);
+            // SLIRP serves all its addresses behind the gateway's MAC, so we can
+            // reach the guestfwd echo server (10.0.2.100) via the same MAC.
+            net_tcp_echo(n, mac, ECHO_IP);
         }
         None => print(" net: ARP fehlgeschlagen\n"),
     }
