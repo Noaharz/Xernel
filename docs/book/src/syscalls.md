@@ -40,6 +40,7 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 17 | `CAP_IDENTIFY` | slot, out_ptr | 0 / `u64::MAX` | Beschreibt die Capability im eigenen CNode-Slot; schreibt `[type, a, b]` (3×u64, normalisiert) nach `out_ptr`. |
 | 18 | `SEND` | ep_slot, word, cap_slot | 0 / `u64::MAX` | Sendet `word` (+ optional die Cap in `cap_slot`, sonst `u64::MAX`) über den Endpoint in `ep_slot`. Nicht blockierend. |
 | 19 | `RECV` | ep_slot, out_ptr, dst_slot | 0 / `u64::MAX` | Blockiert bis eine Nachricht da ist; schreibt das Wort nach `out_ptr`, installiert eine mitgeschickte Cap in `dst_slot` (`u64::MAX` = verwerfen). |
+| 20 | `SPAWN` | module | pid / `u64::MAX` | Erzeugt einen neuen Prozess aus Programm-Image `module` (heute nur 0 = init-Image): eigener Adressraum, frisch gesäte Caps, als bereit eingehängt. Der Kernel bootet nur den Root; jeder weitere Prozess entsteht so. |
 
 Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16) prüfen eine
 Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung, wenn
@@ -114,8 +115,10 @@ lazy gemappt (nur Angefasstes kostet RAM).
 - **SSE/FPU verfügbar** (normaler x86_64-Build möglich, kein Soft-float-Zwang).
 - Stack: 64 KiB, ABI-korrekt ausgerichtet (`rsp % 16 == 8` bei Eintritt).
 - Kein `std`. `alloc` ist über `SBRK` möglich.
-- Noch **nicht** verfügbar: Dateisystem, Framebuffer/GUI, Prozesse (fork/exec),
-  Timer-Frequenz in Hz.
+- Prozesse: `SPAWN` erzeugt einen neuen Prozess (noch kein `fork`/`exec`, kein
+  `wait`).
+- Noch **nicht** verfügbar: Dateisystem-*Syscalls* (XernelFS ist eine Ring-3-
+  Bibliothek über die Block-Primitive), Timer-Frequenz in Hz.
 
 ## Speicher-Layout (User-Sicht)
 
