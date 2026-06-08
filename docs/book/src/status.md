@@ -85,6 +85,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.19 Datei-Service | XernelFS als **eigener Prozess**: ein Client ohne Geräte-Caps liest Dateien rein per IPC — erster echter Mikrokernel-Server |
 | 0.20 Netzwerk | **virtio-net** im User-Space: NIC hochgefahren, ARP-Request gesendet + Gateway-Antwort empfangen — erstes Paket auf dem Draht (M4-Start) |
 | 0.20.1 IPv4/ICMP | **ping** ans Gateway: ARP-Resolve + IPv4-Header mit Prüfsumme + ICMP-Echo — Request raus, Reply rein |
+| 0.20.2 UDP/DHCP | **DHCP** holt eine IP (10.0.2.15): UDP/BOOTP-DISCOVER raus, OFFER geparst — UDP funktioniert |
 
 ## XOS — das erste OS auf Xernel
 
