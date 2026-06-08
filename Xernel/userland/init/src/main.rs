@@ -139,6 +139,19 @@ fn pci_scan() -> u64 {
     virtio
 }
 
+/// Find the PCI bus-0 slot of the virtio device with device-id `devid`
+/// (0x1001 = block, 0x1000 = network), or 0xFF if absent. Lets us pick a
+/// specific virtio device now that several are present.
+fn pci_find_virtio(devid: u16) -> u64 {
+    for dev in 0..32u64 {
+        let id = pci_read(0, dev, 0, 0);
+        if (id & 0xFFFF) as u16 == 0x1af4 && (id >> 16) as u16 == devid {
+            return dev;
+        }
+    }
+    0xFF
+}
+
 fn iomap(phys: u64, len: u64) -> u64 {
     syscall3(SYS_IOMAP, phys, len, 0)
 }
@@ -592,6 +605,222 @@ fn file_service(b: &mut Blk) {
     }
 }
 
+// --- virtio-net: a user-space NIC driver (first networking) ---
+//
+// Same legacy virtio register block as virtio-blk, but two virtqueues: queue 0
+// is the receiveq (device writes incoming frames), queue 1 the transmitq. With
+// no features negotiated, each buffer is prefixed by a 10-byte virtio_net_hdr.
+// We bring the device up, send an ARP request for the SLIRP gateway 10.0.2.2,
+// and read back the ARP reply — a real packet exchange, entirely in Ring 3.
+
+const VNET_RX: u16 = 0; // receiveq index
+const VNET_TX: u16 = 1; // transmitq index
+const VNET_HDR_LEN: u64 = 10; // legacy virtio_net_hdr, no MRG_RXBUF
+const NET_BUF: u64 = 2048; // per-direction packet buffer
+
+/// A brought-up virtio-net device: both virtqueues are laid out and one receive
+/// buffer is posted. Holds enough to transmit a frame and poll for a reply.
+struct Net {
+    io: u16,
+    mac: [u8; 6],
+    rx_ring: u64,
+    rx_used_off: u64,
+    rx_buf_va: u64,
+    tx_ring: u64,
+    tx_used_off: u64,
+    tx_avail: u64,
+    tx_buf_va: u64,
+    tx_buf_phys: u64,
+}
+
+/// Lay out one legacy virtqueue `idx` in a fresh DMA buffer and tell the device
+/// its page frame. Returns (ring_va, used_off, n, avail_va).
+fn vq_setup(io: u16, idx: u16) -> Option<(u64, u64, u64, u64)> {
+    port_out(io + VIO_QUEUE_SELECT, 2, u32::from(idx));
+    let n = u64::from(port_in(io + VIO_QUEUE_SIZE, 2));
+    if n == 0 {
+        return None;
+    }
+    let desc_sz = 16 * n;
+    let used_off = align_up(desc_sz + 6 + 2 * n, QALIGN);
+    let total = used_off + 6 + 8 * n;
+    let (q_va, q_phys) = dma_alloc(total);
+    if q_va == u64::MAX {
+        return None;
+    }
+    port_out(io + VIO_QUEUE_PFN, 4, (q_phys >> 12) as u32);
+    Some((q_va, used_off, n, q_va + desc_sz))
+}
+
+/// Bring up virtio-net device `dev`: status handshake, read the MAC, lay out the
+/// receive and transmit queues, post one receive buffer, go live. Returns a
+/// handle, or `None` on failure.
+fn net_init(dev: u64) -> Option<Net> {
+    let bar0 = pci_read(0, dev, 0, 0x10);
+    if (bar0 & 1) != 1 {
+        print(" virtio-net: BAR0 ist kein I/O-Port\n");
+        return None;
+    }
+    let io = (bar0 & 0xFFFC) as u16;
+
+    port_out(io + VIO_STATUS, 1, 0);
+    port_out(io + VIO_STATUS, 1, ST_ACK);
+    port_out(io + VIO_STATUS, 1, ST_ACK | ST_DRIVER);
+
+    // Accept no optional features -> plain 10-byte header, no offloads.
+    let _ = port_in(io + VIO_DEVICE_FEATURES, 4);
+    port_out(io + VIO_GUEST_FEATURES, 4, 0);
+
+    // Device config begins at VIO_CONFIG; the first 6 bytes are the MAC.
+    let mut mac = [0u8; 6];
+    for (i, b) in mac.iter_mut().enumerate() {
+        *b = port_in(io + VIO_CONFIG + i as u16, 1) as u8;
+    }
+
+    // Receive queue: lay it out and post one buffer the device can write into.
+    let (rx_ring, rx_used_off, _rx_n, rx_avail) = vq_setup(io, VNET_RX)?;
+    let (rx_buf_va, rx_buf_phys) = dma_alloc(NET_BUF);
+    if rx_buf_va == u64::MAX {
+        return None;
+    }
+    // SAFETY: rx_ring/rx_avail point into our mapped DMA queue buffer.
+    unsafe {
+        write_desc(rx_ring, 0, rx_buf_phys, NET_BUF as u32, DESC_WRITE, 0);
+        ((rx_avail + 4) as *mut u16).write_volatile(0); // ring[0] -> desc 0
+        ((rx_avail + 2) as *mut u16).write_volatile(1); // avail.idx = 1
+    }
+
+    // Transmit queue: laid out, buffer allocated, filled per send.
+    let (tx_ring, tx_used_off, _tx_n, tx_avail) = vq_setup(io, VNET_TX)?;
+    let (tx_buf_va, tx_buf_phys) = dma_alloc(NET_BUF);
+    if tx_buf_va == u64::MAX {
+        return None;
+    }
+
+    port_out(io + VIO_STATUS, 1, ST_ACK | ST_DRIVER | ST_DRIVER_OK);
+    port_out(io + VIO_QUEUE_NOTIFY, 2, u32::from(VNET_RX)); // RX buffer is ready
+
+    print(" virtio-net @ I/O 0x");
+    print_hex(u64::from(io), 4);
+    print(", MAC ");
+    print_mac(&mac);
+    print("\n");
+    Some(Net {
+        io,
+        mac,
+        rx_ring,
+        rx_used_off,
+        rx_buf_va,
+        tx_ring,
+        tx_used_off,
+        tx_avail,
+        tx_buf_va,
+        tx_buf_phys,
+    })
+}
+
+/// Write one byte to a DMA buffer.
+///
+/// # Safety
+/// `va` must be a mapped, writable DMA address.
+unsafe fn wr_u8(va: u64, v: u8) {
+    (va as *mut u8).write_volatile(v);
+}
+
+/// Print a 6-byte MAC address as `xx:xx:xx:xx:xx:xx`.
+fn print_mac(mac: &[u8; 6]) {
+    for (i, b) in mac.iter().enumerate() {
+        if i > 0 {
+            print(":");
+        }
+        print_hex(u64::from(*b), 2);
+    }
+}
+
+/// Send an ARP request for the SLIRP gateway 10.0.2.2 and read the reply — a
+/// real round-trip on the network, driven entirely from Ring 3. Prints the
+/// gateway's hardware address on success.
+fn net_arp_demo(n: &mut Net) {
+    let our_ip = [10u8, 0, 2, 15];
+    let gw_ip = [10u8, 0, 2, 2];
+
+    // Build virtio_net_hdr (zeros) + Ethernet header + ARP request.
+    // SAFETY: every address is inside our mapped TX DMA buffer.
+    unsafe {
+        let base = n.tx_buf_va;
+        for i in 0..VNET_HDR_LEN {
+            wr_u8(base + i, 0);
+        }
+        let eth = base + VNET_HDR_LEN;
+        for i in 0..6 {
+            wr_u8(eth + i, 0xFF); // dst = broadcast
+            wr_u8(eth + 6 + i, n.mac[i as usize]); // src = us
+        }
+        wr_u8(eth + 12, 0x08);
+        wr_u8(eth + 13, 0x06); // ethertype ARP
+        let arp = eth + 14;
+        // htype=1, ptype=0x0800, hlen=6, plen=4, op=1 (request)
+        for (i, b) in [0u8, 1, 0x08, 0x00, 6, 4, 0, 1].iter().enumerate() {
+            wr_u8(arp + i as u64, *b);
+        }
+        for i in 0..6 {
+            wr_u8(arp + 8 + i, n.mac[i as usize]); // sender HW
+            wr_u8(arp + 18 + i, 0); // target HW = unknown
+        }
+        for i in 0..4 {
+            wr_u8(arp + 14 + i, our_ip[i as usize]); // sender IP
+            wr_u8(arp + 24 + i, gw_ip[i as usize]); // target IP
+        }
+        let total = VNET_HDR_LEN + 14 + 28;
+        write_desc(n.tx_ring, 0, n.tx_buf_phys, total as u32, 0, 0);
+        ((n.tx_avail + 4) as *mut u16).write_volatile(0);
+        ((n.tx_avail + 2) as *mut u16).write_volatile(1);
+    }
+    port_out(n.io + VIO_QUEUE_NOTIFY, 2, u32::from(VNET_TX));
+
+    // Poll the transmit queue's used ring for completion.
+    let tx_used = (n.tx_ring + n.tx_used_off + 2) as *const u16;
+    let mut spins = 0u64;
+    while unsafe { tx_used.read_volatile() } != 1 {
+        spins += 1;
+        if spins > 200_000_000 {
+            print(" net: TX-Timeout\n");
+            return;
+        }
+    }
+    print(" net: ARP-Request gesendet (wer hat 10.0.2.2?)\n");
+
+    // Poll the receive queue for the gateway's reply.
+    let rx_used = (n.rx_ring + n.rx_used_off + 2) as *const u16;
+    let mut spins = 0u64;
+    while unsafe { rx_used.read_volatile() } != 1 {
+        spins += 1;
+        if spins > 800_000_000 {
+            print(" net: keine Antwort (RX-Timeout)\n");
+            return;
+        }
+    }
+
+    // Skip the virtio-net header; parse the Ethernet frame.
+    let pkt = n.rx_buf_va + VNET_HDR_LEN;
+    let et = (unsafe { (pkt + 12) as *const u8 }, unsafe {
+        (pkt + 13) as *const u8
+    });
+    let is_arp = unsafe { et.0.read_volatile() } == 0x08 && unsafe { et.1.read_volatile() } == 0x06;
+    if is_arp {
+        let mut smac = [0u8; 6];
+        for (i, b) in smac.iter_mut().enumerate() {
+            // ARP sender hardware address = Ethernet payload + 8.
+            *b = unsafe { ((pkt + 14 + 8 + i as u64) as *const u8).read_volatile() };
+        }
+        print(" net: ARP-Antwort von 10.0.2.2 -> MAC ");
+        print_mac(&smac);
+        print(" — Netzwerk lebt!\n");
+    } else {
+        print(" net: Frame empfangen, aber kein ARP\n");
+    }
+}
+
 /// Write one virtqueue descriptor at index `i` of the table starting at `base`.
 ///
 /// # Safety
@@ -1007,15 +1236,27 @@ pub extern "C" fn _start() -> ! {
     // Framebuffer: now mapped into THIS process's address space (per-process),
     // so writing pixels works in any process — not just the first caller.
     fb_demo();
-    let vdev = pci_scan();
+    pci_scan(); // print the bus; pick specific devices by id below
+    let bdev = pci_find_virtio(0x1001); // virtio-blk
     let mut service_blk = None;
-    if vdev != 0xFF {
-        iomap_demo(vdev);
-        service_blk = blk_init(vdev);
+    if bdev != 0xFF {
+        iomap_demo(bdev);
+        service_blk = blk_init(bdev);
     }
     dma_demo();
     cap_list();
     cap_demo();
+
+    // Networking: bring up the virtio-net NIC and do a real ARP exchange with
+    // the gateway — proof that a user-space driver can talk to the network.
+    let ndev = pci_find_virtio(0x1000); // virtio-net
+    if ndev != 0xFF {
+        if let Some(mut net) = net_init(ndev) {
+            net_arp_demo(&mut net);
+        }
+    } else {
+        print(" kein virtio-net gefunden\n");
+    }
 
     // Become the file-service: format the disk, spawn a client that has NO
     // device authority, then answer its file requests over IPC — the first

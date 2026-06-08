@@ -55,6 +55,12 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Service die echte Disk-Arbeit macht. Die zentrale Mikrokernel-Eigenschaft
   sichtbar: ein Programm bekommt eine Leistung, ohne die Hardware-Autorität zu
   besitzen. Ganz ohne neuen Syscall — nur aus `SPAWN` + IPC + Capabilities.
+- **Netzwerk (virtio-net im User-Space):** ein vollständiger NIC-Treiber in
+  Ring 3 fährt die virtio-net-Karte hoch (zwei Virtqueues, RX + TX), **sendet
+  einen ARP-Request und empfängt die ARP-Antwort des Gateways** — ein echter
+  Paketaustausch mit der Aussenwelt (QEMU-SLIRP). Erster Schritt zum TCP/IP-
+  Stack; wie der Block-Treiber komplett auf den Primitiven (PCI, Port-I/O, DMA)
+  gebaut, ohne neuen Syscall.
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -77,6 +83,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.17 IPC/Delegation | Endpoint-IPC + **Capability-Delegation**: der Root grantet dem Kind eine Cap, Autorität wandert zwischen Prozessen |
 | 0.18 Spawn | **`SYS_SPAWN`**: der Kernel bootet nur den Root; der Root erschafft jedes Kind selbst zur Laufzeit — Xernel wird zum OS |
 | 0.19 Datei-Service | XernelFS als **eigener Prozess**: ein Client ohne Geräte-Caps liest Dateien rein per IPC — erster echter Mikrokernel-Server |
+| 0.20 Netzwerk | **virtio-net** im User-Space: NIC hochgefahren, ARP-Request gesendet + Gateway-Antwort empfangen — erstes Paket auf dem Draht (M4-Start) |
 
 ## XOS — das erste OS auf Xernel
 
