@@ -31,6 +31,7 @@ mod elf;
 mod endpoint;
 mod ipc;
 mod mm;
+mod notification;
 mod panic;
 mod process;
 mod sched;
