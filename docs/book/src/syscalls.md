@@ -38,6 +38,8 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 15 | `PORT_IN` | port, size | wert / `u64::MAX` | Liest einen I/O-Port (size 1/2/4). **Gated:** braucht eine `IoPort`-Capability über den Port. |
 | 16 | `PORT_OUT` | port, size, value | 0 / `u64::MAX` | Schreibt einen I/O-Port. **Gated:** braucht eine `IoPort`-Capability über den Port. |
 | 17 | `CAP_IDENTIFY` | slot, out_ptr | 0 / `u64::MAX` | Beschreibt die Capability im eigenen CNode-Slot; schreibt `[type, a, b]` (3×u64, normalisiert) nach `out_ptr`. |
+| 18 | `SEND` | ep_slot, word, cap_slot | 0 / `u64::MAX` | Sendet `word` (+ optional die Cap in `cap_slot`, sonst `u64::MAX`) über den Endpoint in `ep_slot`. Nicht blockierend. |
+| 19 | `RECV` | ep_slot, out_ptr, dst_slot | 0 / `u64::MAX` | Blockiert bis eine Nachricht da ist; schreibt das Wort nach `out_ptr`, installiert eine mitgeschickte Cap in `dst_slot` (`u64::MAX` = verwerfen). |
 
 Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16) prüfen eine
 Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung, wenn

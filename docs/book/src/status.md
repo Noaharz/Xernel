@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-06-03. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-06-04. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -22,7 +22,7 @@ Stand: 2026-06-03. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
   `CAP_IDENTIFY` aufzählen (keine globale Sicht).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 17 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 19 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.
@@ -36,6 +36,10 @@ Stand: 2026-06-03. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Superblock, Verzeichnis (16 Dateien, flach), `format`/`create`/`read`/`list`.
   Formatiert die Disk, legt Dateien an und liest sie zurück — **komplett in
   Ring 3, ohne jede Kernel-Änderung**.
+- **Inter-Prozess-IPC (Endpoints):** zwei Prozesse tauschen über einen Endpoint
+  Nachrichten aus (`SEND`/`RECV`), benannt nur über eine `Endpoint`-Capability.
+  Grundlage für Mikrokernel-Dienste (Datei-/Block-/Netz-Service als eigene
+  Prozesse) und für Capability-Delegation.
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -55,6 +59,7 @@ Stand: 2026-06-03. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.14 TreiberFramework | User-Space-Treiber: PCI, MMIO, DMA, Port-I/O → virtio-blk liest Sektor 0 |
 | 0.15 Capabilities | Port-I/O (`IoPort`), MMIO (`IoMem`) und DMA (`Untyped`-Budget) cap-gated — Least-Privilege für Treiber |
 | 0.16 Dateisystem | Block-Layer (R/W) + **XernelFS**: Format/Verzeichnis/Datei-I/O — komplett im User-Space |
+| 0.17 IPC/Delegation | Endpoint-IPC zwischen zwei Prozessen (`SEND`/`RECV`) — Grundlage für Dienste + Delegation |
 
 ## XOS — das erste OS auf Xernel
 

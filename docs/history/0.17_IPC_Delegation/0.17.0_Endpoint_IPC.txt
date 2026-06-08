@@ -1,0 +1,132 @@
+================================================================================
+0.17.0 — ENDPOINT-IPC: ZWEI PROZESSE REDEN MITEINANDER
+================================================================================
+
+Zeitraum:      2026-06-04
+Ergebnis:      Xernel bootet erstmals ZWEI verschiedene Prozesse, die über einen
+               Endpoint Nachrichten austauschen. Der Root-Prozess (pid 0) sendet
+               ein Wort, das Kind (pid 1) empfängt es — der erste Schritt zur
+               Capability-Delegation (Cap-Transfer folgt in 0.17.1). Dabei kam
+               ein latenter Kernel-Bug ans Licht, der gefixt wurde (siehe unten).
+
+
+--------------------------------------------------------------------------------
+WARUM IPC DER SCHLÜSSEL ZUR MIKROKERNEL-VISION IST
+--------------------------------------------------------------------------------
+
+Ein Mikrokernel-Dienst (Block-Service, Datei-Service, Netz-Stack) ist ein EIGENER
+Prozess, den andere über IPC ansprechen. Bisher lief alles in EINEM Prozess
+(init). Damit aus dem Dateisystem (0.16.1) ein echter Datei-Service wird, müssen
+sich Prozesse Nachrichten — und Capabilities — schicken können. Das ist der Bau-
+stein, den dieses Kapitel liefert.
+
+
+--------------------------------------------------------------------------------
+DER ENDPOINT  (kernel/src/endpoint.rs)
+--------------------------------------------------------------------------------
+
+Ein Endpoint ist ein Kernel-Objekt, auf dem sich zwei Prozesse treffen: einer
+SENDET, einer EMPFÄNGT. Eine feste Tabelle (NUM_ENDPOINTS) von FIFO-Queues, jede
+trägt (u64-Wort, Option<CapEntry>) — das Wort jetzt, die Capability ab 0.17.1.
+
+  endpoint::send(id, word, cap)   -> Nachricht in Queue id legen (nie blockierend)
+  endpoint::try_recv(id)          -> eine Nachricht entnehmen (oder None)
+
+Ein Prozess benennt einen Endpoint NUR über eine Endpoint-Capability (CapType::
+Endpoint, object = id) — keine ambiente Erreichbarkeit. Beide Prozesse werden
+mit einer Endpoint-Cap über Endpoint 0 in CNode-Slot 3 geseedet.
+
+
+--------------------------------------------------------------------------------
+DIE SYSCALLS  (kernel/src/syscall.rs)
+--------------------------------------------------------------------------------
+
+  SYS_SEND = 18 (ep_slot, word, cap_slot):
+      Endpoint über die Cap in ep_slot auflösen, Wort (+ optional Cap aus
+      cap_slot) in die Queue legen. cap_slot == u64::MAX = keine Cap.
+  SYS_RECV = 19 (ep_slot, out_ptr, dst_slot):
+      blockiert (busy-yield), bis eine Nachricht da ist; schreibt das Wort nach
+      out_ptr, installiert eine mitgeschickte Cap in dst_slot.
+
+Blockieren OHNE Scheduler-Umbau: sys_recv pollt try_recv und ruft sonst
+process::yield_now() — derselbe busy-yield wie der Meilenstein-2.0-Channel. Echte
+Wait-Queues (Blocked-Zustand) sind eine spätere Verfeinerung.
+
+
+--------------------------------------------------------------------------------
+ZWEI PROZESSE, ROLLE PER PID  (kernel/src/process.rs, init)
+--------------------------------------------------------------------------------
+
+NUM_PROCESSES = 2: der Kernel bootet dieselbe init-Binary zweimal. init verzweigt
+über getpid(): pid 0 = Root/Treiber-Host (macht die ganze Geräte-Arbeit), pid 1 =
+minimales Kind, das nur am IPC-Demo teilnimmt und den Framebuffer NICHT anfasst
+(damit sie sich nicht in die Quere kommen). Ein echtes System ließe den Root das
+Kind SPAWNEN; ein spawn-Syscall kommt später.
+
+
+--------------------------------------------------------------------------------
+DER GEFIXTE LATENTE BUG: GLOBALES user_rsp  (arch/x86_64/syscall.rs)
+--------------------------------------------------------------------------------
+
+Beim ersten Lauf empfing das Kind 0x00000000 statt 0x12345678. Der Kernel
+LIEFERTE nachweislich das richtige Wort an die richtige Adresse (Readback im
+Kernel = 0x12345678), aber nach dem sysret las das Kind 0.
+
+Ursache: Der Syscall-Entry-Stub sicherte den User-RSP im GLOBALEN PERCPU-Feld
+(gs:[8]). Solange zwei Prozesse mit GLEICHER Stacktiefe im Gleichschritt liefen
+(die alte Demo bootete 3× dieselbe init), war der Wert zufällig identisch — der
+Bug blieb verborgen. Jetzt blockiert das Kind in sys_recv, während der Root
+ANDERE Syscalls macht und gs:[8] mit SEINEM user_rsp überschreibt. Beim sysret
+des Kindes wurde so der FALSCHE user_rsp geladen → die Locals des Kindes (word)
+lagen am falschen Stack-Offset → 0.
+
+Fix: user_rsp wird pro Aufruf auf dem PROZESS-EIGENEN Kernel-Stack gesichert
+(push qword ptr gs:[8] direkt nach dem Stack-Wechsel), nicht im geteilten Feld.
+Beim Exit wird er von dort restauriert (mov rsp, [rsp]). gs:[8] bleibt nur noch
+transientes Scratch. Eine zusätzliche push hält die 10 Pushes 16-Byte-aligned, das
+sub/add rsp,8 um den call entfällt. Der Bug betraf NUR den Syscall-Pfad; die
+Preemption (Timer-ISR) sichert den Frame ohnehin pro Prozess auf dem Kernel-Stack.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS
+--------------------------------------------------------------------------------
+
+    cargo xtask run --test
+
+    [init Kind] warte auf Nachricht vom Root...
+     Delegation: Root sendet eine Nachricht an das Kind
+    [user pid 0] exit(0)
+    [init Kind] empfangen: 0x12345678
+    [user pid 1] exit(0)
+    xtask: boot-test PASSED
+
+Das Kind blockiert (busy-yield) bis der Root sendet, empfängt 0x12345678, beide
+Prozesse beenden sauber. Alle bestehenden Demos (Block-Layer, XernelFS,
+Capability-Checks) laufen unverändert.
+
+
+--------------------------------------------------------------------------------
+WAS ALS NÄCHSTES KOMMT
+--------------------------------------------------------------------------------
+
+  - 0.17.1: Capability-DELEGATION — SEND grantet eine Capability, RECV installiert
+    sie. Beweis: das Kind darf einen Port erst NACH dem Grant. Autorität wandert
+    zwischen Prozessen.
+  - Später: echtes Blockieren (Wait-Queues statt busy-yield), spawn-Syscall, ein
+    Dienst (Block/Datei) als eigener Prozess.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/endpoint.rs           NEU: Endpoint-Tabelle, send/try_recv
+  kernel/src/main.rs               mod endpoint
+  kernel/src/cap.rs                CapEntry::endpoint(id)
+  kernel/src/process.rs            NUM_PROCESSES=2, Endpoint-Seed (Slot 3),
+                                   current_endpoint_id/cap_get/cap_install
+  kernel/src/syscall.rs            SYS_SEND=18, SYS_RECV=19 + Handler
+  kernel/src/arch/x86_64/syscall.rs  FIX: user_rsp auf dem Kernel-Stack sichern
+  userland/init/src/main.rs        Rolle per pid: child_main, delegation_parent,
+                                   ipc_send/ipc_recv
