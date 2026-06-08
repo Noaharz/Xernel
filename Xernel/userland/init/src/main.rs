@@ -27,6 +27,13 @@ const SYS_DMA_ALLOC: u64 = 14;
 const SYS_PORT_IN: u64 = 15;
 const SYS_PORT_OUT: u64 = 16;
 const SYS_CAP_IDENTIFY: u64 = 17;
+const SYS_SEND: u64 = 18;
+const SYS_RECV: u64 = 19;
+
+/// CNode slot where every process holds its `Endpoint` capability (seeded by the
+/// kernel). Sentinel for "no capability" in send/recv.
+const EP_SLOT: u64 = 3;
+const NO_CAP: u64 = u64::MAX;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -732,6 +739,41 @@ fn cap_demo() {
     }
 }
 
+/// Send `word` (and optionally a capability) over the endpoint in `ep_slot`.
+fn ipc_send(ep_slot: u64, word: u64, cap_slot: u64) -> u64 {
+    syscall3(SYS_SEND, ep_slot, word, cap_slot)
+}
+
+/// Block until a message arrives on the endpoint in `ep_slot`; the message word
+/// is written to `*out`. A granted capability lands in `dst_slot`.
+fn ipc_recv(ep_slot: u64, out: *mut u64, dst_slot: u64) -> u64 {
+    syscall3(SYS_RECV, ep_slot, out as u64, dst_slot)
+}
+
+/// The root task's half of the delegation demo: send a message word to the
+/// child over the shared endpoint. (Stage 2 will also grant a capability here.)
+fn delegation_parent() {
+    print(" Delegation: Root sendet eine Nachricht an das Kind\n");
+    if ipc_send(EP_SLOT, 0x1234_5678, NO_CAP) != 0 {
+        print("   send FEHLER\n");
+    }
+}
+
+/// The child process (pid != 0): it holds only an `Endpoint` capability. It
+/// blocks until the root sends a message, prints it, and exits. Never returns.
+fn child_main() -> ! {
+    print("[init Kind] warte auf Nachricht vom Root...\n");
+    let mut word = 0u64;
+    if ipc_recv(EP_SLOT, &mut word, NO_CAP) == 0 {
+        print("[init Kind] empfangen: 0x");
+        print_hex(word, 8);
+        print("\n");
+    } else {
+        print("[init Kind] recv FEHLER\n");
+    }
+    exit(0);
+}
+
 fn print(s: &str) {
     write(s.as_bytes());
 }
@@ -844,12 +886,18 @@ fn fb_demo() {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Exactly one init process now (the kernel no longer launches copies).
+    // The kernel boots two copies of this binary for the delegation demo; each
+    // takes a role by its PID. pid 0 is the root/driver host below; any other
+    // pid is a minimal child that only waits for a delegated message.
     let pid = getpid();
 
     print("\n[init pid ");
     print_u64(pid);
     print("] hello — eigener Adressraum, eigener Heap\n");
+
+    if pid != 0 {
+        child_main(); // never returns
+    }
 
     heap_check(8192);
 
@@ -872,6 +920,7 @@ pub extern "C" fn _start() -> ! {
     dma_demo();
     cap_list();
     cap_demo();
+    delegation_parent();
 
     let _ = yield_now; // cooperative yield available for programs that want it
     print("[init] fertig\n");

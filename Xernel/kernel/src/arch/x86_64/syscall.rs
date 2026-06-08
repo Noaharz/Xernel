@@ -137,8 +137,14 @@ pub unsafe fn enter_user(entry: u64, user_stack_top: u64) -> ! {
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
         "swapgs",                 // GS.base -> per-CPU scratch
-        "mov gs:[8], rsp",        // PERCPU.user_rsp = user rsp
-        "mov rsp, gs:[0]",        // rsp = PERCPU.kernel_rsp
+        "mov gs:[8], rsp",        // transiently stash user rsp in PERCPU
+        "mov rsp, gs:[0]",        // rsp = PERCPU.kernel_rsp (this process's)
+        // Persist the user rsp on THIS process's kernel stack, not in the shared
+        // PERCPU field: a process can block in-kernel (e.g. a blocking recv)
+        // while another process runs its own syscalls and overwrites gs:[8]. A
+        // per-invocation copy on the kernel stack survives those context
+        // switches; the global field is only a transient scratch above.
+        "push qword ptr gs:[8]",  // user rsp (restored at exit via [rsp])
         "push r11",               // user RFLAGS
         "push rcx",               // user RIP
         "push rax",               // syscall nr (return value slot)
@@ -147,11 +153,9 @@ unsafe extern "C" fn syscall_entry() {
         "push rdx",
         "push r10",
         "push r8",
-        "push r9",
-        "mov rdi, rsp",           // &SyscallFrame
-        "sub rsp, 8",             // re-align to 16 for the call
+        "push r9",                // 10 pushes total -> rsp stays 16-aligned
+        "mov rdi, rsp",           // &SyscallFrame (r9..r11; user rsp sits above)
         "call {dispatch}",
-        "add rsp, 8",
         "pop r9",
         "pop r8",
         "pop r10",
@@ -161,7 +165,7 @@ unsafe extern "C" fn syscall_entry() {
         "pop rax",                // return value
         "pop rcx",                // user RIP
         "pop r11",                // user RFLAGS
-        "mov rsp, gs:[8]",        // restore user rsp
+        "mov rsp, [rsp]",         // restore user rsp from the kernel-stack copy
         "swapgs",
         "sysretq",
         dispatch = sym dispatch,

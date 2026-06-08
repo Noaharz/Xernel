@@ -18,6 +18,8 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
+use xabi::cap::CapType;
+
 use crate::cap::{CapEntry, CNode};
 use crate::{arch, elf, println};
 
@@ -38,6 +40,9 @@ const PCI_MMIO_LEN: u64 = 0x4000_0000; // [0xc000_0000, 0x1_0000_0000)
 /// capability. Generous enough for real virtqueue/request buffers (tens of KiB),
 /// but bounded — a driver cannot pin unbounded physical memory for DMA.
 const DMA_BUDGET: u64 = 256 * 1024;
+/// CNode slot in which every process holds its `Endpoint` capability for the
+/// delegation demo. Both the root and its child are seeded with endpoint 0 here.
+const EP_SLOT: usize = 3;
 const USER_STACK_VA: u64 = 0x80_0000;
 const USER_STACK_PAGES: u64 = 16;
 const HEAP_START: u64 = 0x1000_0000;
@@ -45,11 +50,13 @@ const HEAP_MAX: u64 = 0x2000_0000;
 const KSTACK_WORDS: usize = 4096; // 32 KiB kernel stack per process
 /// How many processes to start from the init module at boot. Real systems boot
 /// exactly ONE init, which then spawns its own children; launching several
-/// copies of init (as an early multitasking demo did) breaks real userland —
-/// every copy fights over the framebuffer and other shared state. Multiple
-/// processes remain fully supported; they are created on demand, not by running
-/// init N times.
-const NUM_PROCESSES: u64 = 1;
+/// copies that fight over the framebuffer breaks real userland. We boot TWO for
+/// the delegation demo: the same init binary takes a role by its PID — pid 0 is
+/// the root/driver host (does the device work), pid 1 is a minimal child that
+/// only participates in the IPC/delegation demo and never touches the
+/// framebuffer, so they do not collide. A real system would have the root
+/// *spawn* the child; that (and a spawn syscall) comes later.
+const NUM_PROCESSES: u64 = 2;
 
 #[derive(PartialEq, Eq)]
 enum State {
@@ -130,6 +137,10 @@ fn create(pid: u64, module: &[u8]) -> Option<Process> {
 /// rather than hardcoding them.
 fn seed_caps(pid: u64) -> CNode {
     let mut caps = CNode::new(CAP_SLOTS);
+    // Both the root and its child share endpoint 0 so they can rendezvous; this
+    // is the one capability the child starts with. Everything else it gains only
+    // by delegation over that endpoint.
+    let _ = caps.insert(EP_SLOT, CapEntry::endpoint(0));
     if pid == 0 {
         let _ = caps.insert(0, CapEntry::io_port(PCI_IO_BASE, PCI_IO_COUNT));
         let _ = caps.insert(1, CapEntry::io_mem(PCI_MMIO_BASE, PCI_MMIO_LEN));
@@ -185,6 +196,35 @@ pub fn current_cap_describe(slot: usize) -> Option<(u8, u64, u64)> {
     let guard = SCHED.lock();
     let s = guard.as_ref()?;
     s.procs[s.current].caps.get(slot).ok().map(|c| c.describe())
+}
+
+/// If the current process holds an `Endpoint` capability in slot `slot`, return
+/// the endpoint id it names. Backs `SYS_SEND`/`SYS_RECV` — a process can only
+/// reach an endpoint it has a capability for.
+pub fn current_endpoint_id(slot: usize) -> Option<u64> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    let cap = s.procs[s.current].caps.get(slot).ok()?;
+    (cap.cap_type == CapType::Endpoint).then_some(cap.object)
+}
+
+/// Read (a copy of) the capability in slot `slot` of the current process, for
+/// granting it over an endpoint. `None` if the slot is empty/out of range.
+pub fn current_cap_get(slot: usize) -> Option<CapEntry> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    s.procs[s.current].caps.get(slot).ok()
+}
+
+/// Install a delegated capability into slot `slot` of the current process.
+/// Returns false if the slot is occupied or out of range (capabilities are
+/// never silently overwritten). This is the receiving half of delegation.
+pub fn current_cap_install(slot: usize, cap: CapEntry) -> bool {
+    let mut guard = SCHED.lock();
+    guard.as_mut().is_some_and(|s| {
+        let cur = s.current;
+        s.procs[cur].caps.insert(slot, cap).is_ok()
+    })
 }
 
 /// Make process at index `i` the active one: switch its address space and

@@ -28,6 +28,7 @@ mod arch;
 mod cap;
 mod demo;
 mod elf;
+mod endpoint;
 mod ipc;
 mod mm;
 mod panic;
