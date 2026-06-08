@@ -34,6 +34,10 @@ const SYS_RECV: u64 = 19;
 /// kernel). Sentinel for "no capability" in send/recv.
 const EP_SLOT: u64 = 3;
 const NO_CAP: u64 = u64::MAX;
+/// Empty CNode slot in which the child installs the capability the root grants
+/// it. The root grants from its own slot 0 (its `IoPort` capability).
+const RX_SLOT: u64 = 0;
+const GRANT_SLOT: u64 = 0;
 
 const STDOUT: u64 = 1;
 const INFO_RAM_TOTAL: u64 = 0;
@@ -750,26 +754,46 @@ fn ipc_recv(ep_slot: u64, out: *mut u64, dst_slot: u64) -> u64 {
     syscall3(SYS_RECV, ep_slot, out as u64, dst_slot)
 }
 
-/// The root task's half of the delegation demo: send a message word to the
-/// child over the shared endpoint. (Stage 2 will also grant a capability here.)
+/// The root task's half of the delegation demo: grant the child a copy of its
+/// own `IoPort` capability (from `GRANT_SLOT`) over the shared endpoint. After
+/// this, the child can do port I/O it could not do before.
 fn delegation_parent() {
-    print(" Delegation: Root sendet eine Nachricht an das Kind\n");
-    if ipc_send(EP_SLOT, 0x1234_5678, NO_CAP) != 0 {
+    print(" Delegation: Root grantet dem Kind seine IoPort-Capability\n");
+    if ipc_send(EP_SLOT, 0x00C0_FFEE, GRANT_SLOT) != 0 {
         print("   send FEHLER\n");
     }
 }
 
-/// The child process (pid != 0): it holds only an `Endpoint` capability. It
-/// blocks until the root sends a message, prints it, and exits. Never returns.
+/// The child process (pid != 0): it starts holding ONLY an `Endpoint`
+/// capability — so port I/O is denied. It blocks until the root grants it an
+/// `IoPort` capability, then the very same port read succeeds. The visible proof
+/// that authority moved between processes. Never returns.
 fn child_main() -> ! {
-    print("[init Kind] warte auf Nachricht vom Root...\n");
-    let mut word = 0u64;
-    if ipc_recv(EP_SLOT, &mut word, NO_CAP) == 0 {
-        print("[init Kind] empfangen: 0x");
-        print_hex(word, 8);
-        print("\n");
+    // Before delegation: no IoPort capability -> the kernel refuses the access.
+    print("[init Kind] Port 0xc000 VOR Delegation:  ");
+    if syscall3(SYS_PORT_IN, 0xc000, 4, 0) == u64::MAX {
+        print("VERWEIGERT (nur Endpoint-Cap)\n");
     } else {
+        print("erlaubt (?!)\n");
+    }
+
+    // Receive the granted capability into RX_SLOT.
+    print("[init Kind] warte auf Capability vom Root...\n");
+    let mut word = 0u64;
+    if ipc_recv(EP_SLOT, &mut word, RX_SLOT) != 0 {
         print("[init Kind] recv FEHLER\n");
+        exit(1);
+    }
+
+    // After delegation: the SAME port read now succeeds.
+    print("[init Kind] Port 0xc000 NACH Delegation: ");
+    let r = syscall3(SYS_PORT_IN, 0xc000, 4, 0);
+    if r == u64::MAX {
+        print("VERWEIGERT (?!)\n");
+    } else {
+        print("0x");
+        print_hex(r, 8);
+        print(" — Autorität erhalten!\n");
     }
     exit(0);
 }
