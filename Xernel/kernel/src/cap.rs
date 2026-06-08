@@ -90,6 +90,13 @@ impl CapEntry {
         Self::new(CapType::Untyped, bytes)
     }
 
+    /// An `Endpoint` capability naming kernel endpoint `id` — the rendezvous
+    /// point for IPC. The holder may send to and receive from that endpoint;
+    /// without the capability there is no way to name it.
+    pub const fn endpoint(id: u64) -> Self {
+        Self::new(CapType::Endpoint, id)
+    }
+
     /// A normalized, userspace-facing view of this capability: `(type, a, b)`,
     /// where the meaning of `a`/`b` depends on the type — IoPort: (base, count);
     /// IoMem: (base, len); Untyped: (remaining bytes, 0); otherwise raw

@@ -81,6 +81,17 @@ pub const SYS_PORT_OUT: u64 = 16;
 /// if the slot is empty or out of range. Lets a process enumerate the authority
 /// it holds.
 pub const SYS_CAP_IDENTIFY: u64 = 17;
+/// Send a message over an endpoint. Args: ep_slot (CNode slot holding an
+/// `Endpoint` cap), word, cap_slot (CNode slot whose capability to grant the
+/// receiver, or `u64::MAX` for none). Non-blocking. Returns 0, or `u64::MAX` if
+/// the endpoint cap is missing or `cap_slot` names no capability.
+pub const SYS_SEND: u64 = 18;
+/// Receive a message from an endpoint, blocking until one arrives. Args: ep_slot
+/// (CNode slot holding an `Endpoint` cap), out_ptr (pointer to a `u64` for the
+/// message word), dst_slot (CNode slot to install a granted capability into, or
+/// `u64::MAX` to discard any). Returns 0, or `u64::MAX` on a missing endpoint
+/// cap / bad buffer / occupied destination slot.
+pub const SYS_RECV: u64 = 19;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -129,6 +140,8 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_PORT_IN => sys_port_in(args[0] as u16, args[1] as u8),
         SYS_PORT_OUT => sys_port_out(args[0] as u16, args[1] as u8, args[2] as u32),
         SYS_CAP_IDENTIFY => sys_cap_identify(args[0], args[1]),
+        SYS_SEND => sys_send(args[0], args[1], args[2]),
+        SYS_RECV => sys_recv(args[0], args[1], args[2]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -344,6 +357,57 @@ fn sys_cap_identify(slot: u64, out_ptr: u64) -> u64 {
     buf[8..16].copy_from_slice(&a.to_le_bytes());
     buf[16..24].copy_from_slice(&b.to_le_bytes());
     0
+}
+
+/// Send `word` (and optionally the capability in `cap_slot`) over the endpoint
+/// named by the `Endpoint` cap in `ep_slot`. Non-blocking — the message waits in
+/// the endpoint queue for a receiver.
+fn sys_send(ep_slot: u64, word: u64, cap_slot: u64) -> u64 {
+    let Some(id) = crate::process::current_endpoint_id(ep_slot as usize) else {
+        println!("[cap] DENY send (no Endpoint capability in slot {ep_slot})");
+        return u64::MAX;
+    };
+    let cap = if cap_slot == u64::MAX {
+        None
+    } else {
+        match crate::process::current_cap_get(cap_slot as usize) {
+            Some(c) => Some(c),
+            None => return u64::MAX, // nothing to grant from that slot
+        }
+    };
+    if crate::endpoint::send(id as usize, word, cap) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// Receive one message from the endpoint named by the `Endpoint` cap in
+/// `ep_slot`, blocking (by yielding the CPU) until one arrives. Writes the
+/// message word to `out_ptr` and installs any granted capability into
+/// `dst_slot` (or discards it if `dst_slot == u64::MAX`).
+fn sys_recv(ep_slot: u64, out_ptr: u64, dst_slot: u64) -> u64 {
+    let Some(id) = crate::process::current_endpoint_id(ep_slot as usize) else {
+        println!("[cap] DENY recv (no Endpoint capability in slot {ep_slot})");
+        return u64::MAX;
+    };
+    loop {
+        if let Some((word, cap)) = crate::endpoint::try_recv(id as usize) {
+            if let Some(c) = cap {
+                if dst_slot != u64::MAX && !crate::process::current_cap_install(dst_slot as usize, c)
+                {
+                    return u64::MAX; // destination slot occupied/invalid
+                }
+            }
+            let Some(buf) = user_slice_mut(out_ptr, 8) else {
+                return u64::MAX;
+            };
+            buf.copy_from_slice(&word.to_le_bytes());
+            return 0;
+        }
+        // Nothing yet — let other processes (including the sender) run.
+        crate::process::yield_now();
+    }
 }
 
 fn sysinfo(which: u64) -> u64 {
