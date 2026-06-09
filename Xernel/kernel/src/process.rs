@@ -234,6 +234,16 @@ pub fn current_notification_id(slot: usize) -> Option<u64> {
     (cap.cap_type == CapType::Notification).then_some(cap.object)
 }
 
+/// If the current process holds a `Frame` capability in slot `slot`, return the
+/// physical base and page count it names (`(phys, pages)`). Backs
+/// `SYS_MAP_FRAME` — a process can only map a frame it has a capability for.
+pub fn current_frame_cap(slot: usize) -> Option<(u64, u64)> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    let cap = s.procs[s.current].caps.get(slot).ok()?;
+    (cap.cap_type == CapType::Frame).then_some((cap.object, cap.badge))
+}
+
 /// Read (a copy of) the capability in slot `slot` of the current process, for
 /// granting it over an endpoint. `None` if the slot is empty/out of range.
 pub fn current_cap_get(slot: usize) -> Option<CapEntry> {

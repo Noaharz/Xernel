@@ -109,10 +109,35 @@ pub const SYS_SIGNAL: u64 = 21;
 /// 0 if the slot holds no notification capability. One wait can cover many
 /// readiness sources (each sets its own bit) — the `epoll`/`kqueue` shape.
 pub const SYS_WAIT: u64 = 22;
+/// Allocate a physically-contiguous, zeroed run of `pages` (arg 0) 4 KiB frames,
+/// map it into the caller (cached, RW, NX), install a `Frame` capability naming
+/// it into CNode slot `cap_slot` (arg 1), and write the mapped user virtual
+/// address to `out_ptr` (arg 2). Returns 0 on success, or `u64::MAX` on failure
+/// (or if the allocation exceeds the caller's `Untyped` budget). The Frame cap
+/// can then be GRANTED over an endpoint; whoever receives it and maps it (via
+/// `SYS_MAP_FRAME`) shares the very same physical memory — the bulk-data path.
+pub const SYS_FRAME_ALLOC: u64 = 23;
+/// Map a frame named by the `Frame` capability in CNode slot `cap_slot` (arg 0)
+/// into the caller's address space (cached, RW, NX) and write the mapped user
+/// virtual address to `out_ptr` (arg 1). Returns 0 on success, `u64::MAX` if the
+/// slot holds no Frame cap or mapping fails. This is the receiving half of
+/// shared memory: two processes that both map the same delegated Frame cap see
+/// the same RAM.
+pub const SYS_MAP_FRAME: u64 = 24;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
 const DMA_REGION_END: u64 = 0x7000_0000;
+
+/// Next free virtual address for shared-memory frame mappings
+/// (`SYS_FRAME_ALLOC` / `SYS_MAP_FRAME`). Like the MMIO/DMA windows this is a
+/// single monotonic allocator across processes — each process maps into its OWN
+/// address space, so the same VA in different spaces does not collide.
+static NEXT_SHARED_VA: Mutex<u64> = Mutex::new(0x7000_0000);
+const SHARED_REGION_END: u64 = 0x8000_0000;
+/// Upper bound on a single shared-frame allocation (256 KiB = 64 pages), so a
+/// bogus page count can't exhaust RAM in one call.
+const MAX_SHARED_PAGES: u64 = 64;
 
 // sysinfo keys.
 const INFO_RAM_TOTAL: u64 = 0;
@@ -162,6 +187,8 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_SPAWN => crate::process::spawn(args[0]).unwrap_or(u64::MAX),
         SYS_SIGNAL => sys_signal(args[0], args[1]),
         SYS_WAIT => sys_wait(args[0]),
+        SYS_FRAME_ALLOC => sys_frame_alloc(args[0], args[1], args[2]),
+        SYS_MAP_FRAME => sys_map_frame(args[0], args[1]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -459,6 +486,96 @@ fn sys_wait(notif_slot: u64) -> u64 {
         }
         crate::process::yield_now();
     }
+}
+
+/// Reserve `pages` of the shared-frame VA window and map the physical run
+/// `[phys, phys + pages*PAGE)` there in the CURRENT address space (cached, RW,
+/// NX). Returns the base user virtual address, or `None` if the window is full
+/// or a mapping fails. Shared by `SYS_FRAME_ALLOC` (its own fresh frames) and
+/// `SYS_MAP_FRAME` (a delegated frame) — the same physical run mapped into a
+/// second address space is exactly shared memory.
+fn map_shared(phys: u64, pages: u64) -> Option<u64> {
+    let mut next = NEXT_SHARED_VA.lock();
+    let va_base = *next;
+    match va_base.checked_add(pages * PAGE) {
+        Some(end) if end <= SHARED_REGION_END => {}
+        _ => return None,
+    }
+    for i in 0..pages {
+        if !arch::map_user(va_base + i * PAGE, phys + i * PAGE, true, false) {
+            return None;
+        }
+    }
+    *next = va_base + pages * PAGE;
+    Some(va_base)
+}
+
+/// Allocate `pages` contiguous frames, map them into the caller as shared
+/// memory, install a `Frame` cap naming them into `cap_slot`, and write the
+/// mapped virtual address to `out_ptr`. Bounded by the caller's `Untyped`
+/// budget. On any failure after allocation the frames are freed and the budget
+/// refunded.
+fn sys_frame_alloc(pages: u64, cap_slot: u64, out_ptr: u64) -> u64 {
+    if pages == 0 || pages > MAX_SHARED_PAGES {
+        return u64::MAX;
+    }
+    let need = pages * PAGE;
+    if !crate::process::current_charge_untyped(need) {
+        println!("[cap] DENY frame_alloc {need:#x} bytes (Untyped budget exhausted)");
+        return u64::MAX;
+    }
+
+    let unwind = |phys: Option<u64>| {
+        if let Some(p) = phys {
+            for i in 0..pages {
+                frame::free(p + i * PAGE);
+            }
+        }
+        crate::process::current_refund_untyped(need);
+        u64::MAX
+    };
+
+    let Some(phys) = frame::alloc_contiguous(pages) else {
+        return unwind(None);
+    };
+    // Zero the shared frames through the HHDM before any process sees them.
+    // SAFETY: freshly allocated contiguous frames, reachable via the HHDM.
+    unsafe {
+        core::ptr::write_bytes((phys + arch::hhdm_offset()) as *mut u8, 0, need as usize);
+    }
+    let Some(va) = map_shared(phys, pages) else {
+        return unwind(Some(phys));
+    };
+    let Some(buf) = user_slice_mut(out_ptr, 8) else {
+        return unwind(Some(phys));
+    };
+    buf.copy_from_slice(&va.to_le_bytes());
+    // Install the Frame cap last: only now does the caller gain a name it can
+    // delegate. A bad/occupied slot is a caller error — unwind it.
+    if !crate::process::current_cap_install(cap_slot as usize, crate::cap::CapEntry::frame(phys, pages))
+    {
+        return unwind(Some(phys));
+    }
+    0
+}
+
+/// Map a delegated `Frame` capability (in `cap_slot`) into the caller and write
+/// the mapped virtual address to `out_ptr`. No budget charge — the frame is
+/// already accounted to whoever allocated it; mapping it here is precisely how
+/// the memory becomes shared.
+fn sys_map_frame(cap_slot: u64, out_ptr: u64) -> u64 {
+    let Some((phys, pages)) = crate::process::current_frame_cap(cap_slot as usize) else {
+        println!("[cap] DENY map_frame (no Frame capability in slot {cap_slot})");
+        return u64::MAX;
+    };
+    let Some(va) = map_shared(phys, pages) else {
+        return u64::MAX;
+    };
+    let Some(buf) = user_slice_mut(out_ptr, 8) else {
+        return u64::MAX;
+    };
+    buf.copy_from_slice(&va.to_le_bytes());
+    0
 }
 
 fn sysinfo(which: u64) -> u64 {
