@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-06-09. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -22,7 +22,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
   `CAP_IDENTIFY` aufzählen (keine globale Sicht).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 22 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 24 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Prozesse zur Laufzeit (`SPAWN`):** der Kernel bootet nur noch **einen**
@@ -48,6 +48,15 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Root grantet dem Kind seine `IoPort`-Cap, woraufhin das Kind denselben Port
   lesen darf, der ihm vorher verweigert wurde — Autorität wandert explizit
   zwischen Prozessen.
+- **Geteilter Speicher (Frame-Delegation):** ein Prozess allokiert eine
+  physisch-zusammenhängende Seite gegen sein `Untyped`-Budget (`FRAME_ALLOC`),
+  bekommt eine `Frame`-Capability und kann sie über einen Endpoint **granten**;
+  der Empfänger mappt dieselbe physische Seite (`MAP_FRAME`) → **gemeinsamer
+  Speicher über die Adressraumgrenze**. Beweis: der Datei-Service legt eine ganze
+  Datei in eine geteilte Seite und reicht dem Client nur die Frame-Cap — der
+  liest die Datei in **einem** Zug aus dem Speicher statt byteweise über IPC. Der
+  Bulk-Datenpfad neben dem Nachrichten-Passing (Fundament für Socket-Puffer und
+  Readiness-Ringe).
 - **Datei-Service (erster Mikrokernel-Server):** das XernelFS läuft als
   **eigener Prozess**, der über ein Anfrage/Antwort-Endpoint-Paar bedient wird.
   Ein gespawnter Client **ohne jede Geräte-Capability** liest das komplette
@@ -91,6 +100,7 @@ Stand: 2026-06-08. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.20.2 UDP/DHCP | **DHCP** holt eine IP (10.0.2.15): UDP/BOOTP-DISCOVER raus, OFFER geparst — UDP funktioniert |
 | 0.20.3 TCP | **TCP-Handshake + Datenstrom**: SYN/SYN-ACK/ACK zu einem Echo-Server, Zeile gesendet + zurückbekommen, FIN — TCP funktioniert |
 | 0.21.0 Readiness | **Notification-Objekt** (`SIGNAL`/`WAIT`): seL4-Async-Signal, der epoll/kqueue-Baustein — ein Service signalisiert Bereitschaft, ein Client wartet darauf |
+| 0.22.0 GeteilterSpeicher | **Frame-Capabilities** (`FRAME_ALLOC`/`MAP_FRAME`): geteilter Speicher über die Adressraumgrenze — der Datei-Service legt eine Datei in eine geteilte Seite, der Client mappt sie und liest sie in einem Zug |
 
 ## XOS — das erste OS auf Xernel
 

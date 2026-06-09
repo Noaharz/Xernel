@@ -43,10 +43,12 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 20 | `SPAWN` | module | pid / `u64::MAX` | Erzeugt einen neuen Prozess aus Programm-Image `module` (heute nur 0 = init-Image): eigener Adressraum, frisch gesäte Caps, als bereit eingehängt. Der Kernel bootet nur den Root; jeder weitere Prozess entsteht so. |
 | 21 | `SIGNAL` | notif_slot, bits | 0 / `u64::MAX` | Signalisiert eine Notification: ODER-t `bits` in ihr Signal-Wort (nicht blockierend, akkumuliert). Braucht eine `Notification`-Capability in `notif_slot`. |
 | 22 | `WAIT` | notif_slot | bits (≠0) / 0 | Blockiert, bis die Notification in `notif_slot` Bits ≠ 0 hat, gibt sie zurück und löscht sie. Das Readiness-Primitiv (epoll/kqueue-Form): ein `WAIT` deckt viele Quellen ab. `0` = keine Cap. |
+| 23 | `FRAME_ALLOC` | pages, cap_slot, out_ptr | 0 / `u64::MAX` | Allokiert `pages` physisch-zusammenhängende, genullte Seiten, mappt sie in den Aufrufer, legt eine `Frame`-Capability in `cap_slot` und schreibt die User-Adresse nach `out_ptr`. **Gated:** verrechnet gegen das `Untyped`-Budget. Die Frame-Cap lässt sich per `SEND` granten → geteilter Speicher. |
+| 24 | `MAP_FRAME` | cap_slot, out_ptr | 0 / `u64::MAX` | Mappt den von der `Frame`-Cap in `cap_slot` benannten Speicher in den Aufrufer und schreibt die User-Adresse nach `out_ptr`. Keine Budget-Verrechnung — die empfangende Hälfte von Shared Memory: zwei Prozesse, die dieselbe delegierte Frame-Cap mappen, sehen denselben RAM. |
 
-Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16) prüfen eine
-Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung, wenn
-sie fehlt — es gibt keine ambiente Hardware-Autorität. Mit `CAP_IDENTIFY` kann
+Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16, 23) prüfen
+eine Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung,
+wenn sie fehlt — es gibt keine ambiente Hardware-Autorität. Mit `CAP_IDENTIFY` kann
 ein Prozess seine eigenen Capabilities aufzählen (nur die eigenen — keine
 globale Sicht).
 
@@ -129,4 +131,7 @@ lazy gemappt (nur Angefasstes kostet RAM).
 | Programm-Image (Code/Daten) | ab `0x0040_0000` (4 MiB) |
 | User-Stack (64 KiB) | bis `0x0081_0000` (8 MiB) |
 | Heap (per `SBRK`) | ab `0x1000_0000` (256 MiB) |
+| Geräte-MMIO (`IOMAP`) | `0x5000_0000`–`0x6000_0000` |
+| DMA-Puffer (`DMA_ALLOC`) | `0x6000_0000`–`0x7000_0000` |
+| Geteilter Speicher (`FRAME_ALLOC`/`MAP_FRAME`) | `0x7000_0000`–`0x8000_0000` |
 | Kernel (für Ring 3 gesperrt) | obere Hälfte (`0xffff_…`) |

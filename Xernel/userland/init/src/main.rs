@@ -30,6 +30,8 @@ const SYS_RECV: u64 = 19;
 const SYS_SPAWN: u64 = 20;
 const SYS_SIGNAL: u64 = 21;
 const SYS_WAIT: u64 = 22;
+const SYS_FRAME_ALLOC: u64 = 23;
+const SYS_MAP_FRAME: u64 = 24;
 
 /// Endpoint capability slots (seeded by the kernel): `EP_SLOT` carries requests
 /// from a client to the file-service, `REPLY_EP_SLOT` carries replies back.
@@ -49,6 +51,15 @@ const OP_NFILES: u64 = 1; // -> number of files
 const OP_FSIZE: u64 = 2; // arg = index            -> file size in bytes
 const OP_NAMECH: u64 = 3; // arg = index<<8 | pos   -> one byte of the name
 const OP_DATACH: u64 = 4; // arg = index<<16 | off  -> one byte of the contents
+const OP_READFILE: u64 = 5; // arg = index   -> size; reply GRANTS a Frame cap to
+                            //                  the shared page holding the file
+
+/// CNode slot used for the shared-memory frame on BOTH sides (different address
+/// spaces, so the same index is free in each): the service allocates its shared
+/// page here and grants a copy of the cap; the client receives that cap here and
+/// maps it. Slots 0–2 are device caps (pid 0 only), 3/4 the endpoints, 5 the
+/// notification — slot 6 is the first free one.
+const SHM_FRAME_SLOT: u64 = 6;
 
 const STDOUT: u64 = 1;
 
@@ -365,6 +376,8 @@ fn blk_rw(b: &mut Blk, sector: u64, write: bool, buf: *mut u8) -> bool {
 // Flat namespace, bump allocation, no delete-reclaim — deliberately tiny. It is
 // pure Ring-3 code over `blk_rw`; the kernel knows nothing about files.
 const SECTOR: usize = 512;
+/// One 4 KiB page — the width of a shared-memory frame.
+const PAGE_BYTES: usize = 4096;
 const FS_MAGIC: &[u8; 8] = b"XERNFS01";
 const SB_SECTOR: u64 = 1;
 const DIR_SECTOR: u64 = 2;
@@ -581,11 +594,40 @@ fn serve_one(b: &mut Blk, op: u64, arg: u64) -> u64 {
     }
 }
 
+/// Read file at directory index `i` into `out`, returning its size (bytes copied
+/// capped at `out.len()`), or `None` if the slot is empty / on I/O error. Keyed
+/// by the entry's name, reusing the normal read path.
+fn read_by_index(b: &mut Blk, i: usize, out: &mut [u8]) -> Option<usize> {
+    let mut dir = [0u8; SECTOR];
+    if !blk_rw(b, DIR_SECTOR, false, dir.as_mut_ptr()) || i >= DIR_ENTRIES || dir[i * ENT_SIZE] == 0 {
+        return None;
+    }
+    let mut name = [0u8; NAME_LEN];
+    name.copy_from_slice(&dir[i * ENT_SIZE..i * ENT_SIZE + NAME_LEN]);
+    fs_read(b, &name, out)
+}
+
 /// The file-service loop: receive a request on the request endpoint, do the disk
 /// I/O, reply on the reply endpoint. Returns when a client says goodbye. This is
 /// Xernel's first real microkernel server — a filesystem living in its OWN
 /// process, reachable only by message-passing.
+///
+/// Beside the byte-at-a-time protocol it offers a SHARED-MEMORY fast path
+/// (`OP_READFILE`): it allocates one shared page, reads a whole file into it, and
+/// replies by GRANTING the client a copy of the page's `Frame` capability. The
+/// client maps that same physical page and reads the file in one shot — bulk
+/// data crosses the address-space boundary without per-byte message round-trips.
 fn file_service(b: &mut Blk) {
+    // Allocate one shared page up front; keep the Frame cap in SHM_FRAME_SLOT and
+    // reuse the mapping for every OP_READFILE (SEND copies the cap, so granting it
+    // to a client does not take it away from us).
+    let mut shm_va = 0u64;
+    let have_shm = frame_alloc(1, SHM_FRAME_SLOT, &mut shm_va) == 0;
+    if have_shm {
+        print(" Datei-Service: geteilte Seite bei 0x");
+        print_hex(shm_va, 8);
+        print(" allokiert (Frame-Cap in Slot 6)\n");
+    }
     print(" Datei-Service: bereit, warte auf Anfragen\n");
     loop {
         let mut req = 0u64;
@@ -598,6 +640,27 @@ fn file_service(b: &mut Blk) {
         if op == OP_BYE {
             print(" Datei-Service: Abschied — beende\n");
             return;
+        }
+        if op == OP_READFILE {
+            // Read the whole file into the shared page; reply with its size and
+            // grant the client a copy of the Frame cap (or NO_CAP / u64::MAX if
+            // we have no shared page or the read failed).
+            let (size, grant) = if have_shm {
+                // SAFETY: shm_va is our own RW shared mapping, one page wide.
+                let page =
+                    unsafe { core::slice::from_raw_parts_mut(shm_va as *mut u8, PAGE_BYTES) };
+                match read_by_index(b, arg as usize, page) {
+                    Some(n) => (n as u64, SHM_FRAME_SLOT),
+                    None => (u64::MAX, NO_CAP),
+                }
+            } else {
+                (u64::MAX, NO_CAP)
+            };
+            if ipc_send(REPLY_EP_SLOT, size, grant) != 0 {
+                print(" Datei-Service: send (readfile) FEHLER\n");
+                return;
+            }
+            continue;
         }
         let reply = serve_one(b, op, arg);
         if ipc_send(REPLY_EP_SLOT, reply, NO_CAP) != 0 {
@@ -1386,6 +1449,18 @@ fn wait_notif(notif_slot: u64) -> u64 {
 }
 
 /// Send `word` (and optionally a capability) over the endpoint in `ep_slot`.
+/// Allocate `pages` shared frames, install a `Frame` cap in `cap_slot`, and
+/// write the mapped virtual address to `*out_va`. Returns 0 on success.
+fn frame_alloc(pages: u64, cap_slot: u64, out_va: *mut u64) -> u64 {
+    syscall3(SYS_FRAME_ALLOC, pages, cap_slot, out_va as u64)
+}
+
+/// Map a delegated `Frame` cap (in `cap_slot`) and write its virtual address to
+/// `*out_va`. Returns 0 on success.
+fn map_frame(cap_slot: u64, out_va: *mut u64) -> u64 {
+    syscall3(SYS_MAP_FRAME, cap_slot, out_va as u64, 0)
+}
+
 fn ipc_send(ep_slot: u64, word: u64, cap_slot: u64) -> u64 {
     syscall3(SYS_SEND, ep_slot, word, cap_slot)
 }
@@ -1469,6 +1544,34 @@ fn file_client() -> ! {
             write(&[c]);
         }
         print("\"\n");
+    }
+
+    // Now the SHARED-MEMORY fast path: ask the service to drop file 0 into a
+    // shared page. The reply carries the file's size AND grants us a Frame cap to
+    // that very page (received into SHM_FRAME_SLOT). We map it and read the whole
+    // file in one shot — no per-byte round-trip.
+    print("[Client] Shared-Memory: fordere Datei 0 als geteilte Seite an\n");
+    if ipc_send(EP_SLOT, (OP_READFILE << 56) | 0, NO_CAP) == 0 {
+        let mut size = 0u64;
+        if ipc_recv(REPLY_EP_SLOT, &mut size, SHM_FRAME_SLOT) == 0 && size != u64::MAX {
+            let mut va = 0u64;
+            if map_frame(SHM_FRAME_SLOT, &mut va) == 0 {
+                print("[Client] geteilte Seite gemappt bei 0x");
+                print_hex(va, 8);
+                print(", Datei (");
+                print_u64(size);
+                print(" B) direkt aus dem Speicher: \"");
+                let n = core::cmp::min(size as usize, PAGE_BYTES);
+                // SAFETY: va is our fresh read mapping of the shared page.
+                let data = unsafe { core::slice::from_raw_parts(va as *const u8, n) };
+                write(data);
+                print("\"\n");
+            } else {
+                print("[Client] map_frame FEHLER\n");
+            }
+        } else {
+            print("[Client] readfile-Antwort FEHLER\n");
+        }
     }
 
     // Tell the service to stop — goodbye expects no reply.
