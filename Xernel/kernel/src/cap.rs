@@ -104,6 +104,19 @@ impl CapEntry {
         Self::new(CapType::Notification, id)
     }
 
+    /// A `Frame` capability naming a physically-contiguous run of RAM:
+    /// `object` = physical base address, `badge` = number of 4 KiB pages. The
+    /// holder may map it into its own address space (`SYS_MAP_FRAME`). Granting
+    /// the *same* Frame cap to another process and having both map it is how two
+    /// address spaces share memory — the bulk-data path beside message-passing.
+    pub const fn frame(phys: u64, pages: u64) -> Self {
+        Self {
+            cap_type: CapType::Frame,
+            object: phys,
+            badge: pages,
+        }
+    }
+
     /// A normalized, userspace-facing view of this capability: `(type, a, b)`,
     /// where the meaning of `a`/`b` depends on the type — IoPort: (base, count);
     /// IoMem: (base, len); Untyped: (remaining bytes, 0); otherwise raw

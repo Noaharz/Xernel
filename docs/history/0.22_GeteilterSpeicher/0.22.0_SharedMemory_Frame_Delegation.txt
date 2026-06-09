@@ -1,0 +1,149 @@
+================================================================================
+0.22.0 — SHARED MEMORY: FRAME-CAPABILITIES ÜBER ADRESSRAUMGRENZEN
+================================================================================
+
+Zeitraum:      2026-06-09
+Ergebnis:      Xernel hat einen zweiten IPC-Datenpfad neben dem Nachrichten-
+               passing: GETEILTEN SPEICHER. Ein Prozess allokiert eine physisch-
+               zusammenhängende Seite (gegen sein Untyped-Budget), bekommt dafür
+               eine FRAME-Capability, mappt sie in seinen Adressraum — und kann
+               diese Cap über einen Endpoint an einen anderen Prozess GRANTEN.
+               Der Empfänger mappt dieselbe physische Seite und sieht denselben
+               Speicher. Beweis: der Datei-Service legt eine ganze Datei in eine
+               geteilte Seite und reicht dem Client nur die Frame-Cap; der Client
+               liest die Datei in EINEM Zug aus dem Speicher statt Byte-für-Byte
+               über IPC. Das Bulk-Daten-Fundament für Sockets und Readiness-Ringe.
+
+
+--------------------------------------------------------------------------------
+WARUM DIESES PRIMITIV
+--------------------------------------------------------------------------------
+
+Nachrichten-IPC (SEND/RECV) transportiert ein u64-Wort plus optional eine
+Capability — gut für Steuerung, schlecht für Masse. Eine 4-KiB-Datei byteweise
+zu holen kostet tausende Syscall-Roundtrips. Jedes ernsthafte OS hat deshalb
+einen zweiten Pfad: geteilten Speicher. Beide Prozesse mappen dieselbe physische
+Seite, danach ist Datenübergabe ein simpler memcpy — keine Kernel-Beteiligung
+mehr pro Byte.
+
+Das ist KEIN Netz-Sonderwunsch, sondern ein universelles Fundament:
+  - Socket-Bulk-Daten (send/recv-Puffer zwischen App und Netz-Service)
+  - der Readiness-Ring (epoll-Skalierung: viele Sockets, ein geteilter Ring)
+  - jede Service/Client-Beziehung, die mehr als ein Wort austauscht.
+
+Die mikrokernel-korrekte Form steht schon in der ABI: CapType::Frame (=3) war
+reserviert. In seL4 ist ein Frame genau das — eine Capability auf eine Kachel
+RAM, die man mappen und delegieren kann. Wir haben es jetzt implementiert.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  cap.rs: CapEntry::frame(phys, pages) — object = physische Basis, badge =
+          Seitenzahl. describe() liefert ohne Sonderfall (phys, pages).
+
+  process.rs: current_frame_cap(slot) -> Option<(phys, pages)>, prüft, dass die
+              Cap im Slot wirklich vom Typ Frame ist (sonst None).
+
+  syscall.rs: neue VA-Region für geteilten Speicher:
+                NEXT_SHARED_VA  0x7000_0000 .. SHARED_REGION_END 0x8000_0000.
+              Ein einziger monotoner Allocator über alle Prozesse reicht, weil
+              jeder in seinen EIGENEN Adressraum mappt (dieselbe VA in zwei
+              Räumen kollidiert nicht). Hilfsfunktion map_shared(phys, pages)
+              wird von beiden Syscalls geteilt.
+
+  SYS_FRAME_ALLOC (23)  (pages, cap_slot, out_ptr):
+       1. validiere pages (1..=64),
+       2. verrechne pages*4KiB gegen das Untyped-Budget,
+       3. frame::alloc_contiguous(pages) -> phys,
+       4. nulle die Seiten über die HHDM,
+       5. map_shared(phys, pages) in den Aufrufer,
+       6. schreibe die VA nach out_ptr,
+       7. installiere die Frame-Cap als LETZTES in cap_slot.
+       Schlägt irgendein Schritt nach (3) fehl, werden die Frames freigegeben
+       UND das Budget zurückerstattet (sauberes Unwinding).
+
+  SYS_MAP_FRAME (24)  (cap_slot, out_ptr):
+       hole die Frame-Cap aus cap_slot, map_shared in den Aufrufer, schreibe die
+       VA nach out_ptr. KEINE Budget-Verrechnung — der Frame ist schon dem
+       Allokator angerechnet; ein zweites Mapping zu zahlen wäre falsch, das
+       Teilen IST der Sinn.
+
+  Delegation läuft über die bestehende IPC-Maschinerie unverändert: SYS_SEND
+  trägt die Frame-Cap (current_cap_get liefert eine KOPIE, der Sender behält
+  seine), SYS_RECV installiert sie beim Empfänger (current_cap_install). So
+  bekommen BEIDE Prozesse eine Frame-Cap auf dieselbe physische Seite.
+
+Cap-gated wie alles: ohne Untyped-Budget kein FRAME_ALLOC ("[cap] DENY"), ohne
+Frame-Cap im Slot kein MAP_FRAME. Kein ambienter Weg an fremden RAM.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+Der Datei-Service (pid 0) allokiert beim Start eine geteilte Seite und behält die
+Frame-Cap in Slot 6. Auf OP_READFILE liest er die ganze Datei hinein und grantet
+dem Client eine Kopie der Cap mit der Antwort. Der Client (pid 1, OHNE jede
+Geräte-Autorität) mappt sie und liest die Datei in einem Zug:
+
+    Datei-Service: geteilte Seite bei 0x70000000 allokiert (Frame-Cap in Slot 6)
+    ...
+    [Client] Shared-Memory: fordere Datei 0 als geteilte Seite an
+    [Client] geteilte Seite gemappt bei 0x70001000, Datei (19 B) direkt aus dem
+             Speicher: "Hallo von XernelFS!"
+
+Zwei verschiedene virtuelle Adressen (0x70000000 beim Service, 0x70001000 beim
+Client — der globale Allocator zählt hoch), DIESELBE physische Seite: der Inhalt,
+den der Service hineinschrieb, erscheint beim Client. Geteilter Speicher über
+eine Adressraumgrenze, ausschließlich aus FRAME_ALLOC + Cap-Grant + MAP_FRAME.
+Kein zusätzlicher Mechanismus, kein Vertrauen — nur die Capability wandert.
+
+Zum Vergleich steht die alte byteweise Variante (OP_DATACH) direkt darüber: erst
+19 Roundtrips, dann ein Mapping. Beide liefern denselben Text — der Unterschied
+ist die Zahl der Kernel-Übergänge.
+
+
+--------------------------------------------------------------------------------
+WIE DAS ZUR SOCKET-API WIRD (nächste Phasen)
+--------------------------------------------------------------------------------
+
+  - Socket-Datenpuffer: App und Netz-Service teilen je einen RX- und TX-Ring per
+    Frame-Cap; send/recv werden zu memcpy in den geteilten Ring plus ein
+    Notification-Signal — kein Wort-pro-Byte mehr.
+  - Readiness-Ring (epoll-Skalierung): eine geteilte Seite trägt die Ready-Liste,
+    die Notification weckt nur. Damit deckt EIN wait beliebig viele Sockets ab,
+    ohne 64-Bit-Bitmasken-Grenze.
+
+Genau diese beiden Bausteine — Notification (0.21.0) + geteilter Speicher
+(0.22.0) — sind zusammen das, was NexusClouds Go-Netpoller braucht.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+  - Kein Unmap/Reclaim: gemappte geteilte VAs werden nicht zurückgegeben (der VA-
+    Allocator zählt nur hoch). Für die kurzen Test-Läufe egal; ein echtes
+    munmap + Frame-Free kommt mit der Cap-Revocation.
+  - Keine Rechte-Abstufung: ein gemappter Frame ist immer RW. Read-only-Grants
+    (badge-Rechte-Bits) sind ein späterer Schliff.
+  - Feste obere Grenze von 64 Seiten pro Allokation; das Untyped-Budget bleibt
+    die eigentliche Schranke.
+  - Beim FRAME_ALLOC-Spätfehler (belegter cap_slot / schlechter out_ptr) wird die
+    schon belegte geteilte VA nicht zurückgegeben — best-effort, wie bei
+    DMA_ALLOC. Die Frames selbst werden korrekt freigegeben.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/cap.rs            CapEntry::frame(phys, pages).
+  kernel/src/process.rs        current_frame_cap(slot).
+  kernel/src/syscall.rs        SYS_FRAME_ALLOC=23, SYS_MAP_FRAME=24, map_shared,
+                               NEXT_SHARED_VA-Region.
+  userland/init/src/main.rs    frame_alloc/map_frame-Wrapper; OP_READFILE im
+                               Datei-Service (geteilte Seite + Cap-Grant);
+                               read_by_index; Client mappt und liest direkt.
