@@ -423,6 +423,9 @@ fn sys_send(ep_slot: u64, word: u64, cap_slot: u64) -> u64 {
         }
     };
     if crate::endpoint::send(id as usize, word, cap) {
+        // Wake any process parked in RECV on this endpoint — the message is now
+        // waiting for it.
+        crate::process::wake(crate::process::BlockReason::Endpoint(id as usize));
         0
     } else {
         u64::MAX
@@ -452,8 +455,9 @@ fn sys_recv(ep_slot: u64, out_ptr: u64, dst_slot: u64) -> u64 {
             buf.copy_from_slice(&word.to_le_bytes());
             return 0;
         }
-        // Nothing yet — let other processes (including the sender) run.
-        crate::process::yield_now();
+        // Nothing yet — really block (no busy-yield). We wake and re-check when a
+        // SEND arrives on this endpoint.
+        crate::process::block_on(crate::process::BlockReason::Endpoint(id as usize));
     }
 }
 
@@ -466,6 +470,8 @@ fn sys_signal(notif_slot: u64, bits: u64) -> u64 {
         return u64::MAX;
     };
     if crate::notification::signal(id as usize, bits) {
+        // Wake any process parked in WAIT on this notification.
+        crate::process::wake(crate::process::BlockReason::Notification(id as usize));
         0
     } else {
         u64::MAX
@@ -484,7 +490,8 @@ fn sys_wait(notif_slot: u64) -> u64 {
         if let Some(bits) = crate::notification::poll_take(id as usize) {
             return bits;
         }
-        crate::process::yield_now();
+        // Really block until a SIGNAL on this notification wakes us.
+        crate::process::block_on(crate::process::BlockReason::Notification(id as usize));
     }
 }
 
