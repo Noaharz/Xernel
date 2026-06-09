@@ -25,6 +25,11 @@ Stand: 2026-06-09. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Programm als Limine-Modul), 24 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
+- **Echtes Blockieren (Wait-Queues):** ein Prozess, der auf eine Nachricht
+  (`RECV`) oder ein Signal (`WAIT`) wartet, geht in einen echten `Blocked`-
+  Zustand über; der Scheduler überspringt ihn, bis ihn genau das passende
+  Ereignis weckt (`SEND` an den Endpoint, `SIGNAL` an die Notification). Kein
+  Busy-Yield mehr — ein Warter verbrennt keine CPU.
 - **Prozesse zur Laufzeit (`SPAWN`):** der Kernel bootet nur noch **einen**
   Prozess (den Root, pid 0); jeden weiteren erzeugt der Root selbst über
   `SYS_SPAWN` — wie ein echtes init. Der Neuling bekommt einen eigenen
@@ -101,6 +106,7 @@ Stand: 2026-06-09. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.20.3 TCP | **TCP-Handshake + Datenstrom**: SYN/SYN-ACK/ACK zu einem Echo-Server, Zeile gesendet + zurückbekommen, FIN — TCP funktioniert |
 | 0.21.0 Readiness | **Notification-Objekt** (`SIGNAL`/`WAIT`): seL4-Async-Signal, der epoll/kqueue-Baustein — ein Service signalisiert Bereitschaft, ein Client wartet darauf |
 | 0.22.0 GeteilterSpeicher | **Frame-Capabilities** (`FRAME_ALLOC`/`MAP_FRAME`): geteilter Speicher über die Adressraumgrenze — der Datei-Service legt eine Datei in eine geteilte Seite, der Client mappt sie und liest sie in einem Zug |
+| 0.23.0 WaitQueues | **Echtes Blockieren**: `RECV`/`WAIT` schlafen wirklich (Prozess-Zustand `Blocked`), der Scheduler überspringt sie; ein `SEND`/`SIGNAL` weckt punktgenau — kein Busy-Yield mehr |
 
 ## XOS — das erste OS auf Xernel
 

@@ -1,0 +1,120 @@
+================================================================================
+0.23.0 — WAIT-QUEUES: ECHTES BLOCKIEREN STATT BUSY-YIELD
+================================================================================
+
+Zeitraum:      2026-06-09
+Ergebnis:      Blockierende Syscalls (RECV, WAIT) SCHLAFEN jetzt wirklich, statt
+               die CPU in einer Schleife abzugeben. Ein Prozess, der auf eine
+               Nachricht oder ein Signal wartet, geht in einen echten Zustand
+               Blocked(Grund) über; der Scheduler überspringt ihn vollständig,
+               bis ihn genau das passende Ereignis weckt — ein SEND an seinen
+               Endpoint oder ein SIGNAL an seine Notification. Damit verschwindet
+               die letzte große Schwäche des Schedulers (Leerlauf-Spin), und der
+               Block/Wake-Handshake ist sauber genug, dass eine falsche Weck-
+               Logik das System hängen ließe — der grüne Boot-Test beweist also
+               die Korrektheit.
+
+
+--------------------------------------------------------------------------------
+WAS VORHER WAR (und warum es schlecht war)
+--------------------------------------------------------------------------------
+
+Bisher war "blockieren" eine Lüge: RECV und WAIT prüften in einer Schleife, ob
+Daten da sind, und riefen sonst yield_now() — sie gaben die CPU ab, blieben aber
+RUNNABLE. Der Scheduler wählte sie wieder und wieder aus, sie prüften wieder und
+wieder vergeblich. Das ist Busy-Polling: korrekt, aber Verschwendung — ein
+wartender Prozess frisst Scheduler-Slots und CPU, obwohl er nichts tun kann.
+
+Ein echtes OS parkt einen Warter und weckt ihn punktgenau. Das ist die
+Voraussetzung für Effizienz unter Last (man denke an NexusClouds Server mit
+hunderten wartenden Verbindungen — jede einzelne darf nicht spinnen).
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  process.rs:
+    enum BlockReason { Endpoint(usize), Notification(usize) }
+        — WORAUF ein Prozess wartet. Vergleichbar (PartialEq), damit ein wake
+          gezielt die passenden Warter trifft.
+    enum State { Ready, Blocked(BlockReason), Done }   (vorher nur Ready/Done)
+
+    pick_next() wählt jetzt NUR Ready-Prozesse (vorher: alles außer Done). Das
+        ist der Kern: ein Blocked-Prozess ist schlicht kein Kandidat mehr.
+
+    block_on(reason):
+        setzt den aktuellen Prozess auf Blocked(reason) und schaltet auf einen
+        anderen Ready-Prozess um (gleicher switch_context-Pfad wie yield_now).
+        Der Prozess kehrt aus block_on erst zurück, wenn ihn ein wake wieder
+        Ready gemacht hat UND der Scheduler ihn erneut wählt. Sonderfall: ist
+        NIEMAND sonst runnable, kann man nicht wegschalten — dann markiert man
+        sich selbst wieder Ready und kehrt zurück, der Aufrufer prüft erneut.
+        (Degradiert zum alten Spin nur im echten Deadlock-Fall, parkt die CPU nie
+        ohne Wecker.)
+
+    wake(reason):
+        setzt JEDEN auf exakt diesen Grund blockierten Prozess wieder auf Ready.
+        Mehrere Warter zu wecken ist erlaubt — jeder prüft selbst nach, der
+        Verlierer blockiert einfach wieder (Thundering-Herd-tolerant).
+
+  syscall.rs:
+    sys_recv:   bei leerem Endpoint -> block_on(Endpoint(id)) statt yield_now;
+                nach Rückkehr Schleife + erneuter try_recv.
+    sys_wait:   bei 0 Bits -> block_on(Notification(id)) statt yield_now.
+    sys_send:   nach erfolgreichem endpoint::send -> wake(Endpoint(id)).
+    sys_signal: nach erfolgreichem notification::signal -> wake(Notification(id)).
+
+WICHTIG: Der Warter prüft seine Bedingung nach dem Aufwachen IMMER neu (Schleife
+um block_on). Aufgeweckt-werden heißt nur "schau noch mal nach", nicht "die Daten
+gehören dir" — so können sich mehrere Warter ein Ereignis teilen, ohne Race.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+Derselbe Datei-Service/Client-Tanz wie bisher, jetzt rein über echtes Blockieren
+getrieben:
+
+    Datei-Service: bereit, warte auf Anfragen        <- pid 0 blockiert auf recv
+    [Client] warte auf Service-Bereitschaft (wait)...
+    [Client] Service bereit (Signal-Bits 0x1)
+    [Client] Datei-Service meldet 2 Dateien ...
+    [Client] geteilte Seite gemappt bei 0x70001000, ... "Hallo von XernelFS!"
+    [Client] fertig
+    Datei-Service: Abschied — beende
+    [xernel] boot-test: ok
+
+Warum das die Korrektheit beweist: block_on rechecked NICHT mehr von selbst — ein
+blockierter Prozess kommt nur durch ein passendes wake zurück. Fehlte ein wake
+(oder träfe es den falschen Grund), bliebe der Partner für immer Blocked und der
+Ablauf käme zum Stillstand. Dass Service und Client sauber hin- und herwechseln
+und der Test grün endet, heißt: jeder SEND weckt genau seinen RECV, jeder SIGNAL
+genau seinen WAIT. Die Reihenfolge im Log (Service meldet "warte auf Anfragen" und
+gibt dann an den Client ab) zeigt das Parken direkt.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+  - wake ist O(Prozesse): es scannt die Prozessliste statt einer pro-Ressource
+    geführten Warteliste. Bei wenigen Prozessen egal; eine echte Queue pro
+    Endpoint/Notification ist der spätere Schliff.
+  - Kein Timeout/Deadline am Block (kein "warte höchstens N ms").
+  - Kein Prioritäts-/Fairness-Modell: geweckte Prozesse reihen sich nur in die
+    Round-Robin-Ordnung ein.
+  - exit() betrachtet ein Fehlen runnable-Prozesse als "alle fertig" — stünde am
+    Ende noch ein legitim Blockierter, wäre die Meldung ungenau (im Testfall
+    tritt das nicht auf, da der letzte Prozess beim Exit nicht blockiert ist).
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs   BlockReason; State::Blocked; pick_next nur Ready;
+                          block_on; wake.
+  kernel/src/syscall.rs   sys_recv/sys_wait -> block_on; sys_send/sys_signal ->
+                          wake nach Erfolg.
