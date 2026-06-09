@@ -128,8 +128,9 @@ Hinweise:
   hat einen eigenen Adressraum (eigene PML4), eigenen Kernel-Stack, eigene
   Capability-Tabelle.
 - **Scheduling:** preemptiv (Timer) + kooperativ (`YIELD`). Blockierende Syscalls
-  (`RECV`, `WAIT`) sind heute **busy-yield**: sie geben in einer Schleife die CPU
-  ab, bis Daten da sind (noch keine echten Wait-Queues — siehe Roadmap).
+  (`RECV`, `WAIT`) **blockieren echt** (seit 0.23.0): der Prozess geht in
+  `State::Blocked(BlockReason)`, der Scheduler überspringt ihn, ein `wake` aus
+  `SEND`/`SIGNAL` macht ihn wieder `Ready`. Kein Busy-Yield mehr.
 - **Capabilities:** Jeder Prozess hat ein CNode mit 64 Slots. Eine `CapEntry` ist
   `{ cap_type, object, badge }`. Slot-Belegung beim Seeding (`process.rs::seed_caps`):
   | Slot | Inhalt | wer |
@@ -244,7 +245,7 @@ Die schweren *Konzepte* sind erledigt; das hier ist überwiegend Muster-Arbeit.
 | 1 | **Netz-Service-Prozess**: NIC+TCP/IP in pid 0 halten, Socket-Handles über IPC vergeben (Muster: Datei-Service 0.19) | mittel | init/main.rs | ein Client ohne Geräte-Caps öffnet eine TCP-Verbindung rein per IPC |
 | 2 | **Socket-Protokoll**: OPs `connect/send/recv/close` über das Endpoint-Paar; Bulk-Daten über eine geteilte Frame-Seite (0.22), Aufwachen über Notification (0.21) | mittel-hoch | init/main.rs | ein Client schickt/empfängt Bytes über den Service, ohne zu pollen |
 | 3 | **Readiness-Set**: bei vielen Sockets eine Bitmaske im Notification-Wort ODER ein Shared-Memory-Ready-Ring; ein `WAIT` deckt N Sockets ab | hoch | syscall.rs, init/main.rs | `WAIT` liefert, welche von mehreren Verbindungen lesbar sind |
-| 4 | **Echte Wait-Queues** statt busy-yield: ein blockierter `RECV`/`WAIT` schläft wirklich (Prozess-State `Blocked`, beim Signal wieder `Ready`) | hoch (Kernel) | process.rs, endpoint.rs, notification.rs, syscall.rs | CPU-Last fällt; kein Yield-Spin mehr im Leerlauf |
+| ~~4~~ | ~~Echte Wait-Queues statt busy-yield~~ **ERLEDIGT (0.23.0)**: `Blocked`-State + `block_on`/`wake`, `RECV`/`WAIT` schlafen wirklich | — | — | — |
 | 5 | **Server-Crates füllen**: Datei-Service nach `servers/vfs`, Netz nach `servers/netstack` ziehen; mehrere Programm-Images für `SPAWN` (heute nur Index 0) | mittel | servers/*, elf.rs, process.rs | `SPAWN(1)` lädt ein anderes ELF |
 | 6 | **Cap-Revocation + Unmap**: `Frame`-Caps zurücknehmen, geteilte VAs freigeben (heute nur monoton hoch) | hoch (Kernel) | syscall.rs, cap.rs, paging | ein freigegebener Frame ist nicht mehr mappbar |
 | 7 | **`SPAWN` ausbauen**: Eltern/Kind, `wait`/Exit-Status, Caps gezielt mitgeben | mittel | process.rs, syscall.rs | Root erfährt den Exit-Code eines Kindes |
@@ -300,10 +301,14 @@ nicht pushen, melden.
   Wer zu viel allokiert, bekommt `[cap] DENY … budget exhausted`. Beim Erweitern
   prüfen, ob das Budget reicht (es war zuletzt bei ~241 KiB Rest nach den
   Treibern).
-- **Blockieren = busy-yield.** `RECV`/`WAIT` schlafen nicht wirklich. Reihenfolge
-  der Prozesse beachten: ein Service muss seine geteilten Ressourcen anlegen,
-  *bevor* der Client sie anfragt (im Code passiert das, weil pid 0 erst nach dem
-  Setup in die `recv`-Schleife geht).
+- **Blockieren ist echt (seit 0.23.0).** `RECV`/`WAIT` parken den Prozess
+  (`State::Blocked`) und kehren erst zurück, wenn ein `wake` ihn weckt — `SEND`
+  ruft `wake(Endpoint(id))`, `SIGNAL` ruft `wake(Notification(id))`. **Folge:**
+  Wer einen neuen blockierenden Pfad baut, MUSS auf der Gegenseite ein `wake` mit
+  exakt demselben `BlockReason` auslösen, sonst hängt der Warter für immer. Der
+  Warter prüft seine Bedingung nach dem Aufwachen immer neu (Schleife um
+  `block_on`). Reihenfolge weiter beachten: ein Service muss seine Ressourcen
+  anlegen, *bevor* der Client sie anfragt.
 - **Arbeitsverzeichnis driftet** nach `git`-Befehlen zur Repo-Wurzel → Cargo
   findet `Cargo.toml` nicht. Immer mit `cd <repo>/Xernel &&` absichern.
 - **Versionsnummern divergieren:** GitHub-Release-Versionen ≠ interne Phasen-

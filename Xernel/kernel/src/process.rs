@@ -65,9 +65,26 @@ const KSTACK_WORDS: usize = 4096; // 32 KiB kernel stack per process
 /// demo and never touches the framebuffer, so they do not collide.
 const NUM_PROCESSES: u64 = 1;
 
+/// Why a process is blocked — i.e. which resource it is waiting on. A blocked
+/// process is skipped by the scheduler until something `wake`s exactly this
+/// reason (a `SEND` to that endpoint, a `SIGNAL` to that notification).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    /// Waiting for a message on endpoint `id` (a blocked `RECV`).
+    Endpoint(usize),
+    /// Waiting for bits on notification `id` (a blocked `WAIT`).
+    Notification(usize),
+}
+
 #[derive(PartialEq, Eq)]
 enum State {
+    /// Runnable: the scheduler may switch to it.
     Ready,
+    /// Parked inside a syscall, waiting on `BlockReason`. Not runnable until
+    /// woken — the scheduler never picks it, so it burns no CPU (unlike the old
+    /// busy-yield).
+    Blocked(BlockReason),
+    /// Exited; kept in the table (PIDs are never reused) but never run again.
     Done,
 }
 
@@ -278,12 +295,14 @@ fn activate(s: &mut Scheduler, i: usize) -> u64 {
     p.ksp
 }
 
-/// Index of the next non-done process after `current` (round-robin), or `None`.
+/// Index of the next **ready** process after `current` (round-robin), or `None`
+/// if nobody is runnable. Blocked and Done processes are skipped — this is what
+/// makes blocking real: a parked waiter is simply not a candidate.
 fn pick_next(s: &Scheduler) -> Option<usize> {
     let n = s.procs.len();
     (1..=n)
         .map(|off| (s.current + off) % n)
-        .find(|&i| s.procs[i].state != State::Done)
+        .find(|&i| s.procs[i].state == State::Ready)
 }
 
 /// Create the processes and start running them. Never returns.
@@ -358,6 +377,52 @@ pub fn yield_now() {
     // in the shared higher half; processes are boxed, so growing the table via
     // `spawn` never relocates them and `save_ptr` stays valid.
     unsafe { arch::switch_context(save_ptr, next_ksp) };
+}
+
+/// Block the current process on `reason` and switch to another ready process —
+/// the heart of real (non-spinning) blocking. The caller (`sys_recv`/`sys_wait`)
+/// must re-check its condition after this returns, because being woken only means
+/// the resource *might* now be available (several waiters can race for one
+/// message). The process resumes here once a matching [`wake`] makes it `Ready`
+/// again and the scheduler picks it.
+///
+/// If nobody else is runnable, we cannot switch away; we re-mark ourselves
+/// `Ready` and return so the caller re-checks. That degrades to the old spin in
+/// the degenerate "only process, waiting forever" case (a program deadlock either
+/// way) but never parks the CPU with no one to wake it.
+pub fn block_on(reason: BlockReason) {
+    let (save_ptr, next_ksp) = {
+        let mut guard = SCHED.lock();
+        let s = guard.as_mut().expect("no scheduler");
+        let cur = s.current;
+        s.procs[cur].state = State::Blocked(reason);
+        let Some(next) = pick_next(s) else {
+            s.procs[cur].state = State::Ready;
+            return;
+        };
+        let save_ptr = core::ptr::addr_of_mut!(s.procs[cur].ksp);
+        let next_ksp = activate(s, next);
+        (save_ptr, next_ksp)
+    };
+    // SAFETY: see `yield_now` — both kernel stacks live in the shared higher
+    // half; boxed processes never relocate, so `save_ptr` stays valid.
+    unsafe { arch::switch_context(save_ptr, next_ksp) };
+}
+
+/// Wake every process blocked on exactly `reason`, marking it `Ready` so the
+/// scheduler may pick it again. Called right after a `SEND` (wakes a blocked
+/// `RECV` on that endpoint) or a `SIGNAL` (wakes a blocked `WAIT` on that
+/// notification). Waking more than one waiter is fine — each re-checks and the
+/// loser simply blocks again.
+pub fn wake(reason: BlockReason) {
+    let mut guard = SCHED.lock();
+    if let Some(s) = guard.as_mut() {
+        for p in s.procs.iter_mut() {
+            if p.state == State::Blocked(reason) {
+                p.state = State::Ready;
+            }
+        }
+    }
 }
 
 /// Terminate the current process and run the next. Never returns.
