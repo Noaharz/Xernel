@@ -29,6 +29,7 @@ mod cap;
 mod demo;
 mod elf;
 mod endpoint;
+mod frame_ref;
 mod ipc;
 mod mm;
 mod notification;

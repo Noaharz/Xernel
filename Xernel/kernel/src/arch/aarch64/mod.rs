@@ -98,6 +98,14 @@ pub fn map_user(_virt: u64, _phys: u64, _writable: bool, _executable: bool) -> b
     false
 }
 
+pub fn user_phys(_virt: u64) -> Option<u64> {
+    None
+}
+
+pub fn unmap_user(_virt: u64) -> bool {
+    false
+}
+
 pub unsafe fn enter_user(_entry: u64, _user_stack_top: u64) -> ! {
     unimplemented!("aarch64 user mode")
 }

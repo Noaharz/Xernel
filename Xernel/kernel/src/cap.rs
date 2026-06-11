@@ -117,6 +117,13 @@ impl CapEntry {
         }
     }
 
+    /// If this is a `Frame` capability, its physical base address; otherwise
+    /// `None`. Used by the syscall layer to refcount shared frames as their caps
+    /// move through IPC.
+    pub fn frame_object(&self) -> Option<u64> {
+        (self.cap_type == CapType::Frame).then_some(self.object)
+    }
+
     /// A normalized, userspace-facing view of this capability: `(type, a, b)`,
     /// where the meaning of `a`/`b` depends on the type — IoPort: (base, count);
     /// IoMem: (base, len); Untyped: (remaining bytes, 0); otherwise raw

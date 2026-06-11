@@ -9,7 +9,7 @@
 
 use spin::Once;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::MapToError;
+use x86_64::structures::paging::mapper::{MapToError, Translate};
 use x86_64::structures::paging::{
     FrameAllocator as X86FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
     PhysFrame, Size4KiB,
@@ -137,6 +137,27 @@ pub fn map_user(
         flags |= PageTableFlags::NO_EXECUTE;
     }
     map_with_flags(virt, phys, flags)
+}
+
+/// Physical address that `virt` currently maps to in the ACTIVE address space,
+/// or `None` if it is unmapped. Used to verify a user-supplied virtual address
+/// really points at the frame it claims before unmapping it.
+pub fn user_phys(virt: u64) -> Option<u64> {
+    mapper().translate_addr(VirtAddr::new(virt)).map(|p| p.as_u64())
+}
+
+/// Unmap a single 4 KiB page from the ACTIVE address space and flush the TLB.
+/// Returns `false` if the page was not mapped. Does NOT free the underlying
+/// physical frame — frame lifetime is handled separately (refcount).
+pub fn unmap_user(virt: u64) -> bool {
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    match mapper().unmap(page) {
+        Ok((_frame, flush)) => {
+            flush.flush();
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Allocate a fresh frame, map it at a scratch virtual address, write and read
