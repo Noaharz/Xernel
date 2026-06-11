@@ -218,6 +218,17 @@ pub fn map_user(virt: u64, phys: u64, writable: bool, executable: bool) -> bool 
     paging::map_user(virt, phys, writable, executable).is_ok()
 }
 
+/// Physical address `virt` maps to in the active address space, or `None`.
+pub fn user_phys(virt: u64) -> Option<u64> {
+    paging::user_phys(virt)
+}
+
+/// Unmap one user page from the active address space (TLB flushed). Returns
+/// `false` if it was not mapped. The physical frame is NOT freed here.
+pub fn unmap_user(virt: u64) -> bool {
+    paging::unmap_user(virt)
+}
+
 /// Enter ring 3 at `entry` with `user_stack_top`. Never returns.
 ///
 /// # Safety

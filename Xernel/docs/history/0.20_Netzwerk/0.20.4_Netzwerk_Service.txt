@@ -1,0 +1,35 @@
+==========...==========
+0.20.4 — NETZWERK-SERVICE-EXTRAKTION (M4)
+==========...==========
+
+Zeitraum:   11. Juni 2026
+Ergebnis:   Der Netzwerk-Stack ist aus dem monolithischen `init` in PID 0 extrahiert.
+            Ein isolierter Client (PID 1) ohne Hardware-Autorität führt einen TCP-Echo-Test 
+            rein über IPC durch. Zero-copy Datentransfer via Shared Memory (Frame-Cap) implementiert.
+
+--- WARUM DIESES PRIMITIV ---
+Die Extraktion bereitet die Mikrokernel-Decomposition vor. Der Netzwerk-Stack 
+muss als eigenständiger Service laufen, um Hardware-Autorität zu kapseln. 
+Die Shared-Memory-Lösung ist notwendig für hohe Durchsatzraten (Zero-copy).
+
+--- DER MECHANISMUS ---
+1. `init/main.rs`: `file_service` -> `combined_service`.
+2. Neue IPC-Opcodes für Netzwerk (`CONNECT`, `SEND`, `RECV`, `CLOSE`, `GET_FRAME`).
+3. `combined_service` (PID 0) hält den `Net`-State.
+4. Client (PID 1) fragt Shared Frame per `OP_NET_GET_FRAME` an, map ihn, 
+   und kommuniziert via IPC.
+
+--- DER BEWEIS (cargo xtask run --test) ---
+Service-Host: bereit, warte auf Anfragen
+[Client] TCP verbunden!
+[Client] Nachricht gesendet, warte auf Echo...
+[Client] Echo empfangen: "HELLO FROM IPC CLIENT"
+xtask: boot-test PASSED
+
+--- GRENZEN ---
+Kein Retransmit-Management, kein Fenster-Scaling im Stack (diese Logik bleibt
+vorerst minimal). Der Service-Host ist noch kombiniert (FS+Net), PID 1 ist
+nur eine Demo.
+
+--- BETEILIGTE DATEIEN ---
+- `Xernel/userland/init/src/main.rs`: Extraktion, Service-Loop, Client-Logik.

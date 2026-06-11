@@ -41,8 +41,9 @@ const REPLY_EP_SLOT: u64 = 4;
 const NOTIF_SLOT: u64 = 5;
 const NO_CAP: u64 = u64::MAX;
 
-/// Readiness bit the file-service raises on the notification once it is up.
+/// Readiness bits the services raise on the notification once up.
 const READY_BIT: u64 = 0x1;
+const NET_READY_BIT: u64 = 0x2;
 
 /// File-service protocol. A request is one `u64`: the opcode in the top byte,
 /// its argument in the low 56 bits. Each request gets exactly one `u64` reply.
@@ -53,6 +54,13 @@ const OP_NAMECH: u64 = 3; // arg = index<<8 | pos   -> one byte of the name
 const OP_DATACH: u64 = 4; // arg = index<<16 | off  -> one byte of the contents
 const OP_READFILE: u64 = 5; // arg = index   -> size; reply GRANTS a Frame cap to
                             //                  the shared page holding the file
+
+/// Network-service protocol.
+const OP_NET_CONNECT: u64 = 10; // arg = ip[31..0] | port[47..32] -> 0/MAX
+const OP_NET_SEND: u64 = 11; // arg = len -> #bytes sent
+const OP_NET_RECV: u64 = 12; // arg = max -> #bytes received
+const OP_NET_CLOSE: u64 = 13; // -> 0
+const OP_NET_GET_FRAME: u64 = 14; // -> size; reply GRANTS a Frame cap
 
 /// CNode slot used for the shared-memory frame on BOTH sides (different address
 /// spaces, so the same index is free in each): the service allocates its shared
@@ -607,65 +615,248 @@ fn read_by_index(b: &mut Blk, i: usize, out: &mut [u8]) -> Option<usize> {
     fs_read(b, &name, out)
 }
 
-/// The file-service loop: receive a request on the request endpoint, do the disk
-/// I/O, reply on the reply endpoint. Returns when a client says goodbye. This is
-/// Xernel's first real microkernel server — a filesystem living in its OWN
-/// process, reachable only by message-passing.
-///
-/// Beside the byte-at-a-time protocol it offers a SHARED-MEMORY fast path
-/// (`OP_READFILE`): it allocates one shared page, reads a whole file into it, and
-/// replies by GRANTING the client a copy of the page's `Frame` capability. The
-/// client maps that same physical page and reads the file in one shot — bulk
-/// data crosses the address-space boundary without per-byte message round-trips.
-fn file_service(b: &mut Blk) {
-    // Allocate one shared page up front; keep the Frame cap in SHM_FRAME_SLOT and
-    // reuse the mapping for every OP_READFILE (SEND copies the cap, so granting it
-    // to a client does not take it away from us).
+struct TcpState {
+    dmac: [u8; 6],
+    dip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    our_seq: u32,
+    their_ack: u32,
+    active: bool,
+}
+
+/// The combined service loop: receives requests on the request endpoint,
+/// dispatches to the filesystem or network stack, and replies. This is
+/// the consolidated driver/service host for Xernel.
+fn combined_service(blk: &mut Blk, net: &mut Net) {
+    let mut tcp = TcpState {
+        dmac: [0; 6],
+        dip: [0; 4],
+        sport: 49152,
+        dport: 0,
+        our_seq: 0x1000,
+        their_ack: 0,
+        active: false,
+    };
+
+    // Initialize network: DHCP + ARP gateway.
+    print(" Service-Host: Initialisiere Netzwerk (DHCP)...\n");
+    if let Some(ip) = net_dhcp(net) {
+        print(" Service-Host: IP erhalten: ");
+        print_ip(&ip);
+        print("\n");
+    } else {
+        print(" Service-Host: DHCP fehlgeschlagen (nutze Default 10.0.2.15)\n");
+    }
+
+    print(" Service-Host: Aufloesen Gateway-MAC...\n");
+    let mut gmac = [0u8; 6];
+    if let Some(mac) = net_resolve(net, GW_IP) {
+        gmac = mac;
+        print(" Service-Host: Gateway bei ");
+        print_mac(&gmac);
+        print("\n");
+    } else {
+        print(" Service-Host: ARP-Gateway FEHLER\n");
+    }
+
+    // Allocate one shared page up front; keep the Frame cap in SHM_FRAME_SLOT.
     let mut shm_va = 0u64;
     let have_shm = frame_alloc(1, SHM_FRAME_SLOT, &mut shm_va) == 0;
     if have_shm {
-        print(" Datei-Service: geteilte Seite bei 0x");
+        print(" Service-Host: geteilte Seite bei 0x");
         print_hex(shm_va, 8);
         print(" allokiert (Frame-Cap in Slot 6)\n");
     }
-    print(" Datei-Service: bereit, warte auf Anfragen\n");
+    print(" Service-Host: bereit, warte auf Anfragen\n");
     loop {
         let mut req = 0u64;
         if ipc_recv(EP_SLOT, &mut req, NO_CAP) != 0 {
-            print(" Datei-Service: recv FEHLER\n");
+            print(" Service-Host: recv FEHLER\n");
             return;
         }
         let op = req >> 56;
         let arg = req & ((1u64 << 56) - 1);
         if op == OP_BYE {
-            print(" Datei-Service: Abschied — beende\n");
+            print(" Service-Host: Abschied — beende\n");
             return;
         }
-        if op == OP_READFILE {
-            // Read the whole file into the shared page; reply with its size and
-            // grant the client a copy of the Frame cap (or NO_CAP / u64::MAX if
-            // we have no shared page or the read failed).
-            let (size, grant) = if have_shm {
-                // SAFETY: shm_va is our own RW shared mapping, one page wide.
-                let page =
-                    unsafe { core::slice::from_raw_parts_mut(shm_va as *mut u8, PAGE_BYTES) };
-                match read_by_index(b, arg as usize, page) {
-                    Some(n) => (n as u64, SHM_FRAME_SLOT),
-                    None => (u64::MAX, NO_CAP),
-                }
-            } else {
-                (u64::MAX, NO_CAP)
-            };
-            if ipc_send(REPLY_EP_SLOT, size, grant) != 0 {
-                print(" Datei-Service: send (readfile) FEHLER\n");
-                return;
+
+        match op {
+            OP_READFILE => {
+                let (size, grant) = if have_shm {
+                    let page =
+                        unsafe { core::slice::from_raw_parts_mut(shm_va as *mut u8, PAGE_BYTES) };
+                    match read_by_index(blk, arg as usize, page) {
+                        Some(n) => (n as u64, SHM_FRAME_SLOT),
+                        None => (u64::MAX, NO_CAP),
+                    }
+                } else {
+                    (u64::MAX, NO_CAP)
+                };
+                ipc_send(REPLY_EP_SLOT, size, grant);
             }
-            continue;
-        }
-        let reply = serve_one(b, op, arg);
-        if ipc_send(REPLY_EP_SLOT, reply, NO_CAP) != 0 {
-            print(" Datei-Service: send FEHLER\n");
-            return;
+            OP_NET_CONNECT => {
+                // arg = ip[31..0] | port[47..32]
+                let dip = (arg as u32).to_be_bytes();
+                let dport = (arg >> 32) as u16;
+                print(" Service-Host: Connect an ");
+                print_ip(&dip);
+                print(":");
+                print_u64(u64::from(dport));
+                print("\n");
+                
+                tcp.dip = dip;
+                tcp.dport = dport;
+                tcp.dmac = gmac;
+                tcp.active = false;
+
+                // 1. SYN
+                net_rx_arm(net);
+                if net_tcp_send(
+                    net,
+                    tcp.dmac,
+                    tcp.dip,
+                    tcp.sport,
+                    tcp.dport,
+                    tcp.our_seq,
+                    0,
+                    TCP_SYN,
+                    &[],
+                ) {
+                    print(" Service-Host: SYN gesendet, warte auf SYN/ACK...\n");
+                    let mut r = [0u8; 128];
+                    if net_rx_wait(net, &mut r) {
+                        print(" Service-Host: Paket empfangen, pruefe SYN/ACK...\n");
+                        if r[12] == 0x08
+                            && r[13] == 0x00
+                            && r[23] == 6
+                            && (r[47] & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)
+                        {
+                            let their_isn = u32::from_be_bytes([r[38], r[39], r[40], r[41]]);
+                            tcp.our_seq += 1;
+                            tcp.their_ack = their_isn + 1;
+                            // 2. ACK
+                            if net_tcp_send(
+                                net,
+                                tcp.dmac,
+                                tcp.dip,
+                                tcp.sport,
+                                tcp.dport,
+                                tcp.our_seq,
+                                tcp.their_ack,
+                                TCP_ACK,
+                                &[],
+                            ) {
+                                print(" Service-Host: ACK gesendet, Verbindung AKTIV\n");
+                                tcp.active = true;
+                            }
+                        } else {
+                            print(" Service-Host: Kein SYN/ACK (Flags 0x");
+                            print_hex(u64::from(r[47]), 2);
+                            print(")\n");
+                        }
+                    } else {
+                        print(" Service-Host: SYN/ACK RX-Timeout\n");
+                    }
+                } else {
+                    print(" Service-Host: SYN TX-Fehler\n");
+                }
+                ipc_send(REPLY_EP_SLOT, if tcp.active { 0 } else { u64::MAX }, NO_CAP);
+            }
+            OP_NET_SEND => {
+                let len = arg as usize;
+                let mut res = u64::MAX;
+                if tcp.active && have_shm && len <= PAGE_BYTES {
+                    let data = unsafe { core::slice::from_raw_parts(shm_va as *const u8, len) };
+                    if net_tcp_send(
+                        net,
+                        tcp.dmac,
+                        tcp.dip,
+                        tcp.sport,
+                        tcp.dport,
+                        tcp.our_seq,
+                        tcp.their_ack,
+                        TCP_PSH | TCP_ACK,
+                        data,
+                    ) {
+                        tcp.our_seq += len as u32;
+                        res = len as u64;
+                    }
+                }
+                ipc_send(REPLY_EP_SLOT, res, NO_CAP);
+            }
+            OP_NET_RECV => {
+                let mut res = u64::MAX;
+                if tcp.active && have_shm {
+                    for _attempt in 0..4 {
+                        net_rx_arm(net);
+                        let mut e = [0u8; 256];
+                        if net_rx_wait(net, &mut e) {
+                            let ip_total = (usize::from(e[16]) << 8) | usize::from(e[17]);
+                            let plen = ip_total.saturating_sub(40); // 20 IP + 20 TCP
+                            if plen > 0 {
+                                let seg_seq = u32::from_be_bytes([e[38], e[39], e[40], e[41]]);
+                                tcp.their_ack = seg_seq + plen as u32;
+                                let n = plen.min(PAGE_BYTES);
+                                let dest = unsafe {
+                                    core::slice::from_raw_parts_mut(shm_va as *mut u8, PAGE_BYTES)
+                                };
+                                dest[..n].copy_from_slice(&e[54..54 + n]);
+                                res = n as u64;
+                                // Send ACK for received data.
+                                net_tcp_send(
+                                    net,
+                                    tcp.dmac,
+                                    tcp.dip,
+                                    tcp.sport,
+                                    tcp.dport,
+                                    tcp.our_seq,
+                                    tcp.their_ack,
+                                    TCP_ACK,
+                                    &[],
+                                );
+                                break;
+                            } else {
+                                // Just an ACK or empty, try again.
+                                res = 0;
+                            }
+                        } else {
+                            break; // timeout
+                        }
+                    }
+                }
+                ipc_send(REPLY_EP_SLOT, res, NO_CAP);
+            }
+            OP_NET_CLOSE => {
+                if tcp.active {
+                    net_tcp_send(
+                        net,
+                        tcp.dmac,
+                        tcp.dip,
+                        tcp.sport,
+                        tcp.dport,
+                        tcp.our_seq,
+                        tcp.their_ack,
+                        TCP_FIN | TCP_ACK,
+                        &[],
+                    );
+                    tcp.active = false;
+                }
+                ipc_send(REPLY_EP_SLOT, 0, NO_CAP);
+            }
+            OP_NET_GET_FRAME => {
+                let (size, grant) = if have_shm {
+                    (PAGE_BYTES as u64, SHM_FRAME_SLOT)
+                } else {
+                    (u64::MAX, NO_CAP)
+                };
+                ipc_send(REPLY_EP_SLOT, size, grant);
+            }
+            _ => {
+                let reply = serve_one(blk, op, arg);
+                ipc_send(REPLY_EP_SLOT, reply, NO_CAP);
+            }
         }
     }
 }
@@ -1498,8 +1689,8 @@ fn request(op: u64, arg: u64) -> u64 {
 /// name and size, then pulls one file's contents back byte by byte. The visible
 /// proof that a client gets filesystem service without any hardware capability.
 /// Never returns.
-fn file_client() -> ! {
-    // Prove we have no device authority: a port the service may touch, we cannot.
+fn combined_client() -> ! {
+    // Prove we have no device authority.
     print("[Client] eigene Geraete-Autoritaet? Port 0xc000: ");
     if syscall3(SYS_PORT_IN, 0xc000, 4, 0) == u64::MAX {
         print("VERWEIGERT (korrekt — nur Endpoint-Caps)\n");
@@ -1507,17 +1698,21 @@ fn file_client() -> ! {
         print("erlaubt (?!)\n");
     }
 
-    // Wait until the service signals it is ready (async readiness primitive).
-    print("[Client] warte auf Service-Bereitschaft (wait)...\n");
-    let bits = wait_notif(NOTIF_SLOT);
-    print("[Client] Service bereit (Signal-Bits 0x");
+    // Wait until both services are ready.
+    print("[Client] warte auf Service-Bereitschaft...\n");
+    let mut bits = 0u64;
+    while (bits & (READY_BIT | NET_READY_BIT)) != (READY_BIT | NET_READY_BIT) {
+        bits |= wait_notif(NOTIF_SLOT);
+    }
+    print("[Client] Services bereit (Signal-Bits 0x");
     print_hex(bits, 1);
     print(")\n");
 
+    // 1. File Service Test
     let n = request(OP_NFILES, 0);
     print("[Client] Datei-Service meldet ");
     print_u64(n);
-    print(" Dateien — alles via IPC, ohne Disk-Autoritaet:\n");
+    print(" Dateien via IPC:\n");
     for i in 0..n {
         print("   ");
         for pos in 0..(NAME_LEN as u64) {
@@ -1532,49 +1727,49 @@ fn file_client() -> ! {
         print(" B)\n");
     }
 
-    // Pull file 0's contents back byte by byte, purely through the service.
-    let size0 = request(OP_FSIZE, 0);
-    if size0 != u64::MAX {
-        print("[Client] lese Datei 0 ueber den Service: \"");
-        for off in 0..size0 {
-            let c = request(OP_DATACH, off) as u8; // index 0: arg = off
-            if c == 0 {
-                break;
+    // 2. Network Service Test
+    print("[Client] Netzwerk-Service: starte TCP-Echo-Test via IPC\n");
+    // Fordere Shared Frame vom Service an.
+    if ipc_send(EP_SLOT, OP_NET_GET_FRAME << 56, NO_CAP) == 0 {
+        let mut fsize = 0u64;
+        if ipc_recv(REPLY_EP_SLOT, &mut fsize, SHM_FRAME_SLOT) == 0 && fsize != u64::MAX {
+            let mut shm_va = 0u64;
+            if syscall3(SYS_MAP_FRAME, SHM_FRAME_SLOT, core::ptr::addr_of_mut!(shm_va) as u64, 0) == 0 {
+                // IP 10.0.2.100 (ECHO_IP), Port 9
+                let ip_val = u64::from(ECHO_IP[0]) << 24
+                    | (u64::from(ECHO_IP[1]) << 16)
+                    | (u64::from(ECHO_IP[2]) << 8)
+                    | u64::from(ECHO_IP[3]);
+                let arg = ip_val | (9u64 << 32);
+
+                if request(OP_NET_CONNECT, arg) == 0 {
+                    print("[Client] TCP verbunden!\n");
+                    // Nachricht in den Shared Frame schreiben.
+                    let msg = b"HELLO FROM IPC CLIENT\n";
+                    let dest = unsafe { core::slice::from_raw_parts_mut(shm_va as *mut u8, msg.len()) };
+                    dest.copy_from_slice(msg);
+
+                    if request(OP_NET_SEND, msg.len() as u64) != u64::MAX {
+                        print("[Client] Nachricht gesendet, warte auf Echo...\n");
+                        let recv_len = request(OP_NET_RECV, PAGE_BYTES as u64);
+                        if recv_len != u64::MAX && recv_len > 0 {
+                            print("[Client] Echo empfangen: \"");
+                            let reply = unsafe {
+                                core::slice::from_raw_parts(shm_va as *const u8, recv_len as usize)
+                            };
+                            write(reply);
+                            print("\"\n");
+                        }
+                    }
+                    request(OP_NET_CLOSE, 0);
+                } else {
+                    print("[Client] TCP-Connect fehlgeschlagen\n");
+                }
             }
-            write(&[c]);
         }
-        print("\"\n");
     }
 
-    // Now the SHARED-MEMORY fast path: ask the service to drop file 0 into a
-    // shared page. The reply carries the file's size AND grants us a Frame cap to
-    // that very page (received into SHM_FRAME_SLOT). We map it and read the whole
-    // file in one shot — no per-byte round-trip.
-    print("[Client] Shared-Memory: fordere Datei 0 als geteilte Seite an\n");
-    if ipc_send(EP_SLOT, (OP_READFILE << 56) | 0, NO_CAP) == 0 {
-        let mut size = 0u64;
-        if ipc_recv(REPLY_EP_SLOT, &mut size, SHM_FRAME_SLOT) == 0 && size != u64::MAX {
-            let mut va = 0u64;
-            if map_frame(SHM_FRAME_SLOT, &mut va) == 0 {
-                print("[Client] geteilte Seite gemappt bei 0x");
-                print_hex(va, 8);
-                print(", Datei (");
-                print_u64(size);
-                print(" B) direkt aus dem Speicher: \"");
-                let n = core::cmp::min(size as usize, PAGE_BYTES);
-                // SAFETY: va is our fresh read mapping of the shared page.
-                let data = unsafe { core::slice::from_raw_parts(va as *const u8, n) };
-                write(data);
-                print("\"\n");
-            } else {
-                print("[Client] map_frame FEHLER\n");
-            }
-        } else {
-            print("[Client] readfile-Antwort FEHLER\n");
-        }
-    }
-
-    // Tell the service to stop — goodbye expects no reply.
+    // Tell the service to stop.
     ipc_send(EP_SLOT, OP_BYE << 56, NO_CAP);
     print("[Client] fertig\n");
     exit(0);
@@ -1684,11 +1879,7 @@ fn fb_demo() {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // The kernel boots only ONE copy of this binary: the root (pid 0). The root
-    // brings up the disk, becomes a FILE-SERVICE, and SPAWNS a client itself
-    // (like a real init). Each copy takes a role by its PID: pid 0 is the
-    // service/driver host below; any other pid is a client that holds no device
-    // authority and reaches the filesystem only by asking the service over IPC.
+    // The kernel boots only ONE copy of this binary: the root (pid 0).
     let pid = getpid();
 
     print("\n[init pid ");
@@ -1696,7 +1887,7 @@ pub extern "C" fn _start() -> ! {
     print("] hello — eigener Adressraum, eigener Heap\n");
 
     if pid != 0 {
-        file_client(); // never returns
+        combined_client(); // never returns
     }
 
     heap_check(8192);
@@ -1706,56 +1897,45 @@ pub extern "C" fn _start() -> ! {
     print(" | |\\/| |/ _ \\ '__| '_ \\/ -_) |   Xernel OS\n");
     print(" |_|  |_|\\___/_|  |_| |_\\___|_|\n");
 
-    // Framebuffer: now mapped into THIS process's address space (per-process),
-    // so writing pixels works in any process — not just the first caller.
     fb_demo();
-    pci_scan(); // print the bus; pick specific devices by id below
+    pci_scan();
     let bdev = pci_find_virtio(0x1001); // virtio-blk
     let mut service_blk = None;
     if bdev != 0xFF {
         iomap_demo(bdev);
         service_blk = blk_init(bdev);
     }
+
+    let ndev = pci_find_virtio(0x1000); // virtio-net
+    let mut service_net = None;
+    if ndev != 0xFF {
+        service_net = net_init(ndev);
+    }
+
     dma_demo();
     cap_list();
     cap_demo();
 
-    // Networking: bring up the virtio-net NIC and do a real ARP exchange with
-    // the gateway — proof that a user-space driver can talk to the network.
-    let ndev = pci_find_virtio(0x1000); // virtio-net
-    if ndev != 0xFF {
-        if let Some(mut net) = net_init(ndev) {
-            net_demo(&mut net);
-        }
-    } else {
-        print(" kein virtio-net gefunden\n");
-    }
-
-    // Become the file-service: format the disk, spawn a client that has NO
-    // device authority, then answer its file requests over IPC — the first
-    // Xernel service living in its own process.
-    if let Some(mut blk) = service_blk {
+    // Become the combined service host.
+    if let (Some(mut blk), Some(mut net)) = (service_blk, service_net) {
         if fs_setup(&mut blk) {
             let client = spawn(0);
             if client == u64::MAX {
                 print(" spawn: FEHLER\n");
             } else {
-                print(" spawn: Datei-Client erzeugt, pid ");
+                print(" spawn: Combined-Client erzeugt, pid ");
                 print_u64(client);
                 print("\n");
             }
-            // Signal readiness so the client may proceed (async readiness
-            // primitive — the seL4-style notification, epoll's building block).
-            notify(NOTIF_SLOT, READY_BIT);
-            print(" Datei-Service: Bereitschaft signalisiert (notify)\n");
-            file_service(&mut blk);
+            // Signal readiness for both services.
+            notify(NOTIF_SLOT, READY_BIT | NET_READY_BIT);
+            print(" Service-Host: Bereitschaft signalisiert (notify)\n");
+            combined_service(&mut blk, &mut net);
         }
     } else {
-        print(" kein virtio-blk — kein Datei-Service\n");
+        print(" Hardware fehlt — Service-Host kann nicht starten\n");
     }
 
-    let _ = yield_now; // cooperative yield available for programs that want it
-    print("[init] fertig\n");
     exit(0);
 }
 
