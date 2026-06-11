@@ -269,6 +269,16 @@ pub fn current_cap_get(slot: usize) -> Option<CapEntry> {
     s.procs[s.current].caps.get(slot).ok()
 }
 
+/// Remove and return the capability in slot `slot` of the current process, or
+/// `None` if the slot is empty/out of range. The destroying half of a cap's
+/// lifetime — backs `SYS_FRAME_DROP`.
+pub fn current_cap_delete(slot: usize) -> Option<CapEntry> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut()?;
+    let cur = s.current;
+    s.procs[cur].caps.delete(slot).ok()
+}
+
 /// Install a delegated capability into slot `slot` of the current process.
 /// Returns false if the slot is occupied or out of range (capabilities are
 /// never silently overwritten). This is the receiving half of delegation.
