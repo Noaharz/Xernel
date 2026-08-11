@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-06-09. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -76,8 +76,17 @@ Stand: 2026-06-09. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Handshake, Datenstrom, Echo, FIN) zu einem Echo-Server steht. Wie der Block-
   Treiber komplett auf den Primitiven (PCI, Port-I/O, DMA) gebaut, **ohne neuen
   Syscall**. (Noch nicht produktionsreif: ein Connection, kein Retransmit/
-  Fenster, kein passives Öffnen, keine prozess-übergreifende Socket-API — das ist
-  die nächste Arbeit.)
+  Fenster, kein passives Öffnen.)
+- **Netzwerk-Service (Socket-API über IPC):** der Netz-Stack ist in PID 0
+  extrahiert und wird über ein Anfrage/Antwort-Endpoint-Paar bedient
+  (`OP_NET_CONNECT`/`SEND`/`RECV`/`CLOSE`, Bulk-Daten über die geteilte
+  Frame-Seite aus 0.22, Bereitschaft über die Notification aus 0.21). Ein
+  gespawnter Client **ohne jede Geräte-Capability** öffnet eine echte
+  TCP-Verbindung (Handshake gegen den Echo-Server), sendet eine Nachricht und
+  empfängt das Echo — rein per IPC, während der Service die NIC-Arbeit macht.
+  Die Socket-API ist damit prozess-übergreifend nutzbar; der nächste Schritt
+  ist die Aufspaltung des kombinierten Service-Hosts (FS+Net) in eigene
+  Server-Crates.
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -104,6 +113,7 @@ Stand: 2026-06-09. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.20.1 IPv4/ICMP | **ping** ans Gateway: ARP-Resolve + IPv4-Header mit Prüfsumme + ICMP-Echo — Request raus, Reply rein |
 | 0.20.2 UDP/DHCP | **DHCP** holt eine IP (10.0.2.15): UDP/BOOTP-DISCOVER raus, OFFER geparst — UDP funktioniert |
 | 0.20.3 TCP | **TCP-Handshake + Datenstrom**: SYN/SYN-ACK/ACK zu einem Echo-Server, Zeile gesendet + zurückbekommen, FIN — TCP funktioniert |
+| 0.20.4 Netzwerk-Service | **Socket-API über IPC** (M4): der Netz-Stack wird in PID 0 zum Service extrahiert; ein Client ohne Geräte-Caps öffnet per IPC eine TCP-Verbindung, sendet/empfängt über die geteilte Frame-Seite |
 | 0.21.0 Readiness | **Notification-Objekt** (`SIGNAL`/`WAIT`): seL4-Async-Signal, der epoll/kqueue-Baustein — ein Service signalisiert Bereitschaft, ein Client wartet darauf |
 | 0.22.0 GeteilterSpeicher | **Frame-Capabilities** (`FRAME_ALLOC`/`MAP_FRAME`): geteilter Speicher über die Adressraumgrenze — der Datei-Service legt eine Datei in eine geteilte Seite, der Client mappt sie und liest sie in einem Zug |
 | 0.23.0 WaitQueues | **Echtes Blockieren**: `RECV`/`WAIT` schlafen wirklich (Prozess-Zustand `Blocked`), der Scheduler überspringt sie; ein `SEND`/`SIGNAL` weckt punktgenau — kein Busy-Yield mehr |
