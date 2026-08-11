@@ -87,12 +87,19 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Seit 0.24.0 verwaltet der Service **mehrere gleichzeitige Verbindungen**
   (`SOCK_MAX`=4): jeder Socket hat einen eigenen lokalen Port, eigenen TCP-
   Zustand und eigenen Shared Frame, das Protokoll trägt einen Socket-Index,
-  und Empfangsframes werden per TCP-Zielport dem richtigen Socket zugeordnet
-  (Fremd-Frames werden übersprungen). Beweis: ein Client öffnet zwei
-  Verbindungen parallel und bekommt je das richtige Echo auf dem richtigen
-  Socket zurück. Die nächsten Schritte sind ein echtes Ready-Set (Ticket #3)
-  und die Aufspaltung des kombinierten Service-Hosts (FS+Net) in eigene
-  Server-Crates (Ticket #5).
+  und Empfangsframes werden per TCP-Zielport dem richtigen Socket zugeordnet.
+  Beweis: ein Client öffnet zwei Verbindungen parallel und bekommt je das
+  richtige Echo auf dem richtigen Socket zurück. Seit 0.25.0 gibt es das
+  **Ready-Set** (Ticket #3, das select/epoll-Äquivalent): ein
+  `OP_NET_GET_READY`-Aufruf liefert die Bitmaske aller Sockets mit
+  gepufferten Daten, und der Service hebt pro Socket ein Bereitschafts-Bit
+  auf der geteilten Notification — **ein `WAIT` meldet, welche von mehreren
+  Verbindungen lesbar sind**. Eingehende Frames werden dabei per Socket
+  gepuffert statt verworfen (Datenverlust über Socket-Grenzen hinweg ist
+  ausgeschlossen), `RECV` bedient zuerst den gepufferten Bestand. Die
+  nächsten Schritte sind ein Byte-Stream-Puffer/Ring pro Socket und die
+  Aufspaltung des kombinierten Service-Hosts (FS+Net) in eigene Server-Crates
+  (Ticket #5).
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -124,6 +131,7 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.22.0 GeteilterSpeicher | **Frame-Capabilities** (`FRAME_ALLOC`/`MAP_FRAME`): geteilter Speicher über die Adressraumgrenze — der Datei-Service legt eine Datei in eine geteilte Seite, der Client mappt sie und liest sie in einem Zug |
 | 0.23.0 WaitQueues | **Echtes Blockieren**: `RECV`/`WAIT` schlafen wirklich (Prozess-Zustand `Blocked`), der Scheduler überspringt sie; ein `SEND`/`SIGNAL` weckt punktgenau — kein Busy-Yield mehr |
 | 0.24.0 MultiConnection | **Socket-API mit mehreren Verbindungen** (Ticket #2): der Service verwaltet 4 TCP-Sockets gleichzeitig (eigener Port, TCP-Zustand, Shared Frame je Socket); das Protokoll trägt einen Socket-Index, Empfang wird per Zielport demuxed; ein Client ohne Geräte-Caps öffnet zwei Verbindungen parallel und verifiziert je Echo |
+| 0.25.0 ReadySet | **Ready-Set / WAIT** (Ticket #3, select/epoll-Äquivalent): ein `OP_NET_GET_READY` liefert die Bitmaske der lesbaren Sockets, pro Socket wird ein Bereitschafts-Bit auf der geteilten Notification erheit — **ein `WAIT` meldet, welche von mehreren Verbindungen lesbar sind**; eingehende Frames werden gepuffert statt verworfen, `RECV` bedient zuerst den Puffer |
 
 ## XOS — das erste OS auf Xernel
 

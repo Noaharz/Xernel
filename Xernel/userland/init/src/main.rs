@@ -63,6 +63,7 @@ const OP_NET_SEND: u64 = 11; // arg = sock | len -> #bytes sent
 const OP_NET_RECV: u64 = 12; // arg = sock | max -> #bytes received
 const OP_NET_CLOSE: u64 = 13; // arg = sock -> 0
 const OP_NET_GET_FRAME: u64 = 14; // arg = sock -> size; reply GRANTS a Frame cap
+const OP_NET_GET_READY: u64 = 15; // arg = (unused) -> bitmask of sockets with data
 
 /// Concurrent TCP connections the network service tracks. Each socket gets its
 /// own local port (`49152 + index`) and its own shared data frame.
@@ -72,6 +73,12 @@ const SOCK_MAX: usize = 4;
 const SOCK_SHIFT: u64 = 52;
 const SOCK_MASK: u64 = 0xF;
 const ARG_MASK: u64 = (1 << 52) - 1;
+
+/// Ready-set bits on the shared notification (slot 5): bits 0/1 report service
+/// readiness (`READY_BIT`, `NET_READY_BIT`), socket `i`'s data-readiness is
+/// `1 << (NET_SOCK_BIT + i)` — one WAIT yields which of several sockets are
+/// readable, the select/epoll shape.
+const NET_SOCK_BIT: u64 = 2;
 
 /// CNode slots for the shared-memory frames on BOTH sides (different address
 /// spaces, so the same indexes are free in each): the service allocates one
@@ -662,6 +669,11 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
     for (i, s) in socks.iter_mut().enumerate() {
         s.sport = (49152 + i) as u16;
     }
+    // Ready-set bookkeeping: `pending[i]` is set once a data frame for socket
+    // `i` arrived and was buffered into its shared frame but not yet handed
+    // out; `pending_len[i]` is how many bytes are waiting there.
+    let mut pending = [false; SOCK_MAX];
+    let mut pending_len = [0u32; SOCK_MAX];
 
     // Initialize network: DHCP + ARP gateway.
     print(" Service-Host: Initialisiere Netzwerk (DHCP)...\n");
@@ -781,55 +793,54 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
                 ipc_send(REPLY_EP_SLOT, res, NO_CAP);
             }
             OP_NET_RECV => {
-                // arg = sock | max. Frames for OTHER sockets are skipped (an
-                // ACK is harmless to drop; data is not interleaved in this demo,
-                // so a foreign data frame is treated as not-ours and retried).
+                // arg = sock | max. Drains any frame the ready-set already
+                // buffered for this socket; otherwise polls the NIC, buffering
+                // (not dropping) frames that belong to other sockets.
                 let sock = ((arg >> SOCK_SHIFT) & SOCK_MASK) as usize;
                 let max = (arg & ARG_MASK) as usize;
                 let mut res = u64::MAX;
                 if sock < SOCK_MAX && socks[sock].active && have_shm[sock] {
-                    let my_port = socks[sock].sport;
                     let mut got = 0u64;
-                    for _attempt in 0..6 {
-                        net_rx_arm(net);
-                        let mut e = [0u8; 256];
-                        if !net_rx_wait(net, &mut e) {
-                            break;
-                        }
-                        // TCP dest port (offset 34+2) demuxes which socket this
-                        // segment belongs to.
-                        let f_dport = (usize::from(e[36]) << 8) | usize::from(e[37]);
-                        if f_dport != usize::from(my_port) {
-                            continue;
-                        }
-                        let tcp = &mut socks[sock];
-                        let ip_total = (usize::from(e[16]) << 8) | usize::from(e[17]);
-                        let plen = ip_total.saturating_sub(40); // 20 IP + 20 TCP
-                        if plen > 0 {
-                            let seg_seq = u32::from_be_bytes([e[38], e[39], e[40], e[41]]);
-                            tcp.their_ack = seg_seq + plen as u32;
-                            let n = plen.min(max).min(PAGE_BYTES);
-                            let dest = unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    shm_va[sock] as *mut u8,
-                                    PAGE_BYTES,
-                                )
-                            };
-                            dest[..n].copy_from_slice(&e[54..54 + n]);
-                            // Send ACK for received data.
-                            net_tcp_send(
+                    if pending[sock] {
+                        got = pending_len[sock].min(max as u32) as u64;
+                        pending[sock] = false;
+                        pending_len[sock] = 0;
+                    } else {
+                        let my_port = socks[sock].sport;
+                        for _attempt in 0..6 {
+                            net_rx_arm(net);
+                            let mut e = [0u8; 256];
+                            if !net_rx_wait(net, &mut e) {
+                                break;
+                            }
+                            // TCP dest port (offset 34+2) demuxes which socket
+                            // this segment belongs to.
+                            let f_dport = (usize::from(e[36]) << 8) | usize::from(e[37]);
+                            if f_dport != usize::from(my_port) {
+                                net_buffer_frame(
+                                    net,
+                                    &e,
+                                    &mut socks,
+                                    &shm_va,
+                                    &mut pending,
+                                    &mut pending_len,
+                                );
+                                continue;
+                            }
+                            if net_buffer_frame(
                                 net,
-                                tcp.dmac,
-                                tcp.dip,
-                                tcp.sport,
-                                tcp.dport,
-                                tcp.our_seq,
-                                tcp.their_ack,
-                                TCP_ACK,
-                                &[],
-                            );
-                            got = n as u64;
-                            break;
+                                &e,
+                                &mut socks,
+                                &shm_va,
+                                &mut pending,
+                                &mut pending_len,
+                            ) == Some(sock)
+                            {
+                                got = pending_len[sock].min(max as u32) as u64;
+                                pending[sock] = false;
+                                pending_len[sock] = 0;
+                                break;
+                            }
                         }
                     }
                     res = got;
@@ -866,12 +877,91 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
                 };
                 ipc_send(REPLY_EP_SLOT, size, grant);
             }
+            OP_NET_GET_READY => {
+                // arg = (unused) -> bitmask of sockets whose shared frame holds
+                // buffered data. Blocks in the NIC until at least one tracked
+                // socket has data, buffering each frame per socket. Each buffer
+                // already raised the socket's ready bit on the shared
+                // notification, so a WAIT returns the same ready-set.
+                let mut mask = 0u64;
+                for (i, p) in pending.iter().enumerate() {
+                    if *p {
+                        mask |= 1u64 << i;
+                    }
+                }
+                for _attempt in 0..6 {
+                    if mask != 0 {
+                        break;
+                    }
+                    net_rx_arm(net);
+                    let mut e = [0u8; 256];
+                    if !net_rx_wait(net, &mut e) {
+                        break;
+                    }
+                    if let Some(sock) =
+                        net_buffer_frame(net, &e, &mut socks, &shm_va, &mut pending, &mut pending_len)
+                    {
+                        mask |= 1u64 << sock;
+                    }
+                }
+                ipc_send(REPLY_EP_SLOT, mask, NO_CAP);
+            }
             _ => {
                 let reply = serve_one(blk, op, arg);
                 ipc_send(REPLY_EP_SLOT, reply, NO_CAP);
             }
         }
     }
+}
+
+/// Ready-set helper: classify one received Ethernet frame. If it carries data
+/// for a tracked active socket, ACK it, buffer the payload into that socket's
+/// shared frame, and raise the socket's ready bit on the shared notification —
+/// so a `WAIT` on the notification wakes with exactly the set of readable
+/// sockets. Returns the socket that got data, or `None` if the frame was not
+/// socket data. Frames are buffered, never dropped.
+fn net_buffer_frame(
+    net: &mut Net,
+    e: &[u8],
+    socks: &mut [TcpState],
+    shm_va: &[u64],
+    pending: &mut [bool],
+    pending_len: &mut [u32],
+) -> Option<usize> {
+    let f_dport = (usize::from(e[36]) << 8) | usize::from(e[37]);
+    if !(49152..49152 + SOCK_MAX).contains(&f_dport) {
+        return None;
+    }
+    let sock = f_dport - 49152;
+    if shm_va[sock] == 0 || !socks[sock].active {
+        return None;
+    }
+    let ip_total = (usize::from(e[16]) << 8) | usize::from(e[17]);
+    let plen = ip_total.saturating_sub(40); // 20 IP + 20 TCP
+    if plen == 0 {
+        return None;
+    }
+    let seg_seq = u32::from_be_bytes([e[38], e[39], e[40], e[41]]);
+    let tcp = &mut socks[sock];
+    tcp.their_ack = seg_seq + plen as u32;
+    let n = plen.min(PAGE_BYTES).min(e.len() - 54);
+    let dest = unsafe { core::slice::from_raw_parts_mut(shm_va[sock] as *mut u8, PAGE_BYTES) };
+    dest[..n].copy_from_slice(&e[54..54 + n]);
+    net_tcp_send(
+        net,
+        tcp.dmac,
+        tcp.dip,
+        tcp.sport,
+        tcp.dport,
+        tcp.our_seq,
+        tcp.their_ack,
+        TCP_ACK,
+        &[],
+    );
+    pending[sock] = true;
+    pending_len[sock] = n as u32;
+    notify(NOTIF_SLOT, 1u64 << (NET_SOCK_BIT + sock as u64));
+    Some(sock)
 }
 
 // --- virtio-net: a user-space NIC driver, with ARP + IPv4/ICMP (ping) ---
@@ -1843,46 +1933,80 @@ fn combined_client() -> ! {
             | (u64::from(ECHO_IP[1]) << 16)
             | (u64::from(ECHO_IP[2]) << 8)
             | u64::from(ECHO_IP[3]);
+        // Open BOTH connections first — the ready-set test needs them live at
+        // the same time.
         for sock in 0..2 {
             let arg = ((sock as u64) << SOCK_SHIFT) | ip_val | (9u64 << 32);
             if request(OP_NET_CONNECT, arg) == 0 {
                 print("[Client] Socket ");
                 print_u64(sock as u64);
                 print(" TCP verbunden!\n");
-                let msg: &[u8] = if sock == 0 {
-                    b"HELLO FROM SOCKET 0\n"
-                } else {
-                    b"HELLO FROM SOCKET 1\n"
-                };
-                let dest = unsafe {
-                    core::slice::from_raw_parts_mut(shm_va[sock as usize] as *mut u8, msg.len())
-                };
-                dest.copy_from_slice(msg);
-
-                if request(OP_NET_SEND, ((sock as u64) << SOCK_SHIFT) | msg.len() as u64)
-                    == msg.len() as u64
-                {
-                    print("[Client] Socket ");
-                    print_u64(sock as u64);
-                    print(" Nachricht gesendet, warte auf Echo...\n");
-                    let recv_len = request(OP_NET_RECV, ((sock as u64) << SOCK_SHIFT) | (PAGE_BYTES as u64));
-                    if recv_len != u64::MAX && recv_len > 0 {
-                        print("[Client] Socket ");
-                        print_u64(sock as u64);
-                        print(" Echo: \"");
-                        let reply = unsafe {
-                            core::slice::from_raw_parts(shm_va[sock as usize] as *const u8, recv_len as usize)
-                        };
-                        write(reply);
-                        print("\"\n");
-                    }
-                }
-                request(OP_NET_CLOSE, (sock as u64) << SOCK_SHIFT);
             } else {
                 print("[Client] Socket ");
                 print_u64(sock as u64);
                 print(" Connect fehlgeschlagen\n");
             }
+        }
+
+        // 3. Ready-Set test: send on BOTH sockets, then wait ONCE and learn
+        // which of them are readable — the select/epoll equivalent.
+        print("[Client] Ready-Set-Test: sende auf Socket 0 und 1, dann EIN WAIT\n");
+        let msgs: [&[u8]; 2] = [b"HELLO FROM SOCKET 0\n", b"HELLO FROM SOCKET 1\n"];
+        for sock in 0..2 {
+            let dest = unsafe {
+                core::slice::from_raw_parts_mut(shm_va[sock as usize] as *mut u8, PAGE_BYTES)
+            };
+            dest[..msgs[sock].len()].copy_from_slice(msgs[sock]);
+            let n = request(OP_NET_SEND, ((sock as u64) << SOCK_SHIFT) | msgs[sock].len() as u64);
+            if n == msgs[sock].len() as u64 {
+                print("[Client] Socket ");
+                print_u64(sock as u64);
+                print(" Nachricht gesendet\n");
+            }
+        }
+        let mut remaining = 0x3u64; // sockets 0 and 1
+        for _round in 0..4 {
+            if remaining == 0 {
+                break;
+            }
+            let mask = request(OP_NET_GET_READY, 0);
+            if mask == 0 {
+                break;
+            }
+            // The service raised the same mask on the shared notification — a
+            // WAIT returns exactly which sockets are readable.
+            let bits = wait_notif(NOTIF_SLOT);
+            print("[Client] Ready-Set per WAIT: 0x");
+            print_hex(bits >> NET_SOCK_BIT, 1);
+            print(" (Maske 0x");
+            print_hex(mask, 1);
+            print(")\n");
+            for sock in 0..2 {
+                if (mask & (1 << sock)) == 0 {
+                    continue;
+                }
+                let recv_len = request(
+                    OP_NET_RECV,
+                    ((sock as u64) << SOCK_SHIFT) | (PAGE_BYTES as u64),
+                );
+                if recv_len != u64::MAX && recv_len > 0 {
+                    print("[Client] Socket ");
+                    print_u64(sock as u64);
+                    print(" Echo: \"");
+                    let reply = unsafe {
+                        core::slice::from_raw_parts(
+                            shm_va[sock as usize] as *const u8,
+                            recv_len as usize,
+                        )
+                    };
+                    write(reply);
+                    print("\"\n");
+                    remaining &= !(1 << sock);
+                }
+            }
+        }
+        for sock in 0..2 {
+            request(OP_NET_CLOSE, (sock as u64) << SOCK_SHIFT);
         }
     }
 

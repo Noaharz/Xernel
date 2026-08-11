@@ -1,0 +1,148 @@
+================================================================================
+0.25.0 — READY-SET / WAIT-MECHANISMUS (TICKET #3)
+================================================================================
+
+Zeitraum:      2026-08-11
+Ergebnis:      Ein Client kann jetzt EINE Operation ausführen (OP_NET_GET_READY)
+               und erhält die Bitmaske aller Sockets, deren Shared Frame frische
+               Daten enthält — das select/epoll-Äquivalent. Der Service puffert
+               dafür jeden eingehenden Daten-Frame pro Socket zwischen (statt
+               fremde Frames zu verwerfen) und erhebt pro Socket ein
+               Bereitschafts-Bit auf dem geteilten Notification-Objekt (Bit
+               2+i); ein WAIT auf die Notification liefert also genau die Menge
+               der lesbaren Sockets. RECV bedient zuerst den gepufferten
+               Bestand eines Sockets, bevor es die NIC fragt. Beweis im Test:
+               ein Client sendet auf zwei parallel offenen Verbindungen und
+               liest beide Echos über einen einzigen WAIT pro Lesevorgang —
+               die Maske (0x1, dann 0x2) nennt jeweils, welche Socket lesbar
+               ist. Kein neuer Syscall, alles in Ring 3 auf den bestehenden
+               Primitiven (IPC, Notification, Shared Frames).
+
+
+--------------------------------------------------------------------------------
+WARUM DIESES PRIMITIV
+--------------------------------------------------------------------------------
+
+Seit 0.24.0 kann der Service mehrere Verbindungen gleichzeitig halten — aber der
+Client musste sie der Reihe nach RECVen und dabei wissen, WO Daten liegen. Für
+eine echte Anwendung reicht das nicht: Wer N Sockets hat, will NICHT N-mal
+blockierend raten, sondern einmal warten und danach wissen, welche davon lesbar
+sind. Das ist exakt die Funktion, die in Linux epoll/select übernimmt. Das
+Xernel-Primitiv dafür ist das Notification-Objekt aus 0.21/0.23: eine Quelle
+pro Ereignis, ein WAIT über alle. Dieses Ticket macht die Notification zur
+Socket-Readiness-Quelle — jeder Socket setzt sein eigenes Bit, WAIT liefert die
+Menge. Universell: dieselbe Notification deckt auch den Datei-Service und jede
+künftige Ereignisquelle ab.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs:
+
+  Protokoll:  NEU  OP_NET_GET_READY  arg = (unused)
+                    -> reply = Bitmaske der Sockets mit gepufferten Daten.
+              Bereitschafts-Bits auf dem geteilten Notification-Objekt (Slot 5):
+              Bit 0/1 bleiben READY_BIT/NET_READY_BIT (Service oben), Socket i
+              erhebt Bit (2+i)  [NET_SOCK_BIT = 2].
+
+  Service (combined_service):
+    - pending[i] / pending_len[i]:  Buchhaltung des Ready-Sets. pending[i]=true
+      heißt: für Socket i liegt bereits ein Daten-Frame in dessen Shared Frame,
+      der noch nicht an den Client ausgehändigt wurde.
+    - NEU net_buffer_frame(net, e, ...):  klassifiziert einen RX-Frame. Gehört
+      er einem aktiven, getrackten Socket (Demux über TCP-Zielport, Offset
+      34+2), wird der Payload in den Shared Frame des Sockets kopiert
+      (abgesichert gegen Pufferüberlauf), dem Peer geACKt, pending gesetzt und
+      das Bereitschafts-Bit des Sockets auf der Notification erheit (notify).
+      Frames werden damit NIEMALS verworfen — der Punkt, den 0.24 als Grenze
+      nannte, ist geschlossen.
+    - OP_NET_GET_READY:  Zuerst die pending-Flags lesen (bereits gepufferte
+      Daten sind sofort "ready"), sonst NIC-Frames einholen (net_rx_arm/
+      net_rx_wait, bis 6 Versuche), jeden Frame durch net_buffer_frame
+      puffern, die Maske aus den erzielten Sockets bilden und antworten.
+    - OP_NET_RECV:  Wenn pending[sock] gesetzt ist, wird nur der gepufferte
+      Bestand geliefert (Daten liegen ja schon im Shared Frame des Clients).
+      Sonst wie gehabt die NIC pollen; Frames für fremde Sockets laufen jetzt
+      durch net_buffer_frame (werden also gepuffert, nicht übersprungen).
+      Die alte Fehlannahme "Daten sind im Demo nicht verzahnt" ist damit
+      obsolet — Datenverlust ist nicht mehr möglich, weil nichts verworfen
+      wird.
+
+  Client (combined_client):
+    - Öffnet beide Sockets, schreibt in jeden seinen Shared Frame und sendet.
+    - Schleife: request(OP_NET_GET_READY) -> Maske. Anschließend wait_notif
+      auf der Notification — die vom Service erheiteten Bits (Maske << 2) sind
+      der Nachweis, dass EIN WAIT die lesbaren Sockets liefert. Für jede
+      gesetzte Maske RECV(sock), Echo ausgeben, Socket aus der Rest-Menge
+      nehmen; weiter bis beide Echos da sind. Danach CLOSE auf beiden.
+
+  Kernpunkte des Verhaltens:
+    - EIN GET_READY/WAIT deckt N Sockets ab (Maske 0x1 -> Socket 0, Maske 0x2
+      -> Socket 1 im Beweis).
+    - Senden/Empfangen braucht nicht mehr serialisiert zu sein: ein Frame für
+      Socket A, der während eines RECV auf Socket B eintrifft, geht nicht
+      verloren, sondern wartet in dessen pending-Slot.
+    - Alles rein im Userland; der Kernel-Syscall-Satz ist unverändert.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+  [Client] Ready-Set-Test: sende auf Socket 0 und 1, dann EIN WAIT
+  [Client] Socket 0 Nachricht gesendet
+  [Client] Socket 1 Nachricht gesendet
+  [Client] Ready-Set per WAIT: 0x1 (Maske 0x1)
+  [Client] Socket 0 Echo: "HELLO FROM SOCKET 0
+  "
+  [Client] Ready-Set per WAIT: 0x2 (Maske 0x2)
+  [Client] Socket 1 Echo: "HELLO FROM SOCKET 1
+  "
+  [Client] fertig
+  [user pid 1] exit(0)
+   Service-Host: Abschied — beende
+  [user pid 0] exit(0)
+  [xernel] all processes exited.
+  [xernel] boot-test: ok
+  xtask: boot-test PASSED
+
+Jede "Ready-Set per WAIT"-Zeile nennt die Menge der lesbaren Sockets, ohne dass
+der Client raten oder pollen müsste; beide Echos treffen auf dem richtigen
+Socket ein.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+  - Pro Socket nur EIN gepufferter Daten-Frame (eine Seite). Kommen mehrere
+    Segmente für denselben Socket, bevor der Client liest, wird das zweite
+    nicht zusätzlich gepuffert, sondern dessen RECV müsste wieder pollen —
+    ein richtiger Byte-Stream-Puffer (Ring pro Socket) wäre der nächste
+    Schritt.
+  - Der Service bleibt single-threaded: Während GET_READY blockierend auf
+    NIC-Daten wartet, werden keine anderen Anfragen bedient (im Demo-Ablauf
+    unkritisch). Ein echter Ready-Ring/Server-Split wäre Ticket #5.
+  - Weitergedacht wie in 0.24: kein TCP-Retransmit, kein Fenster, keine
+    Reassembly über Segmentgrenzen, Segment-Offsets >0 werden nicht geparst.
+  - Die WAIT-Maske zeigt Daten-Bereitschaft an; es gibt (noch) kein
+    getrenntes "Socket geschlossen"-Signal.
+  - Ein ankommendes Daten-Segment und die eigene SEND-Antwort sind nicht
+    atomar — die Lese-/Schreib-Reihenfolge im Client ist weiter die einfache
+    Echo-Form.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs   OP_NET_GET_READY (Op 15), NET_SOCK_BIT-Konstante;
+                              combined_service mit pending/pending_len;
+                              net_buffer_frame als gemeinsame
+                              Klassifikations-/Puffer-Hilfe für GET_READY und
+                              RECV (Frames werden gepuffert statt verworfen);
+                              OP_NET_RECV bedient zuerst gepufferten Bestand;
+                              combined_client mit Ready-Set-Test (2 Sockets,
+                              ein WAIT liefert die lesbare Menge).
