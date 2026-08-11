@@ -75,8 +75,8 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Gateway auf, **ICMP** pingt es, und eine echte **TCP**-Verbindung (Drei-Wege-
   Handshake, Datenstrom, Echo, FIN) zu einem Echo-Server steht. Wie der Block-
   Treiber komplett auf den Primitiven (PCI, Port-I/O, DMA) gebaut, **ohne neuen
-  Syscall**. (Noch nicht produktionsreif: ein Connection, kein Retransmit/
-  Fenster, kein passives Öffnen.)
+  Syscall**. (Noch nicht produktionsreif: kein Retransmit/Fenster, kein
+  passives Öffnen.)
 - **Netzwerk-Service (Socket-API über IPC):** der Netz-Stack ist in PID 0
   extrahiert und wird über ein Anfrage/Antwort-Endpoint-Paar bedient
   (`OP_NET_CONNECT`/`SEND`/`RECV`/`CLOSE`, Bulk-Daten über die geteilte
@@ -84,9 +84,15 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   gespawnter Client **ohne jede Geräte-Capability** öffnet eine echte
   TCP-Verbindung (Handshake gegen den Echo-Server), sendet eine Nachricht und
   empfängt das Echo — rein per IPC, während der Service die NIC-Arbeit macht.
-  Die Socket-API ist damit prozess-übergreifend nutzbar; der nächste Schritt
-  ist die Aufspaltung des kombinierten Service-Hosts (FS+Net) in eigene
-  Server-Crates.
+  Seit 0.24.0 verwaltet der Service **mehrere gleichzeitige Verbindungen**
+  (`SOCK_MAX`=4): jeder Socket hat einen eigenen lokalen Port, eigenen TCP-
+  Zustand und eigenen Shared Frame, das Protokoll trägt einen Socket-Index,
+  und Empfangsframes werden per TCP-Zielport dem richtigen Socket zugeordnet
+  (Fremd-Frames werden übersprungen). Beweis: ein Client öffnet zwei
+  Verbindungen parallel und bekommt je das richtige Echo auf dem richtigen
+  Socket zurück. Die nächsten Schritte sind ein echtes Ready-Set (Ticket #3)
+  und die Aufspaltung des kombinierten Service-Hosts (FS+Net) in eigene
+  Server-Crates (Ticket #5).
 
 ## Phasen-Überblick (Details im `history/`-Protokoll)
 
@@ -117,6 +123,7 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.21.0 Readiness | **Notification-Objekt** (`SIGNAL`/`WAIT`): seL4-Async-Signal, der epoll/kqueue-Baustein — ein Service signalisiert Bereitschaft, ein Client wartet darauf |
 | 0.22.0 GeteilterSpeicher | **Frame-Capabilities** (`FRAME_ALLOC`/`MAP_FRAME`): geteilter Speicher über die Adressraumgrenze — der Datei-Service legt eine Datei in eine geteilte Seite, der Client mappt sie und liest sie in einem Zug |
 | 0.23.0 WaitQueues | **Echtes Blockieren**: `RECV`/`WAIT` schlafen wirklich (Prozess-Zustand `Blocked`), der Scheduler überspringt sie; ein `SEND`/`SIGNAL` weckt punktgenau — kein Busy-Yield mehr |
+| 0.24.0 MultiConnection | **Socket-API mit mehreren Verbindungen** (Ticket #2): der Service verwaltet 4 TCP-Sockets gleichzeitig (eigener Port, TCP-Zustand, Shared Frame je Socket); das Protokoll trägt einen Socket-Index, Empfang wird per Zielport demuxed; ein Client ohne Geräte-Caps öffnet zwei Verbindungen parallel und verifiziert je Echo |
 
 ## XOS — das erste OS auf Xernel
 

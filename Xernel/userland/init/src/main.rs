@@ -55,18 +55,30 @@ const OP_DATACH: u64 = 4; // arg = index<<16 | off  -> one byte of the contents
 const OP_READFILE: u64 = 5; // arg = index   -> size; reply GRANTS a Frame cap to
                             //                  the shared page holding the file
 
-/// Network-service protocol.
-const OP_NET_CONNECT: u64 = 10; // arg = ip[31..0] | port[47..32] -> 0/MAX
-const OP_NET_SEND: u64 = 11; // arg = len -> #bytes sent
-const OP_NET_RECV: u64 = 12; // arg = max -> #bytes received
-const OP_NET_CLOSE: u64 = 13; // -> 0
-const OP_NET_GET_FRAME: u64 = 14; // -> size; reply GRANTS a Frame cap
+/// Network-service protocol. Every net op carries the socket index in the top
+/// 4 bits of the 56-bit argument (see `SOCK_SHIFT`), so the service can track
+/// several concurrent TCP connections at once.
+const OP_NET_CONNECT: u64 = 10; // arg = sock | ip[31..0] | port[47..32] -> 0/MAX
+const OP_NET_SEND: u64 = 11; // arg = sock | len -> #bytes sent
+const OP_NET_RECV: u64 = 12; // arg = sock | max -> #bytes received
+const OP_NET_CLOSE: u64 = 13; // arg = sock -> 0
+const OP_NET_GET_FRAME: u64 = 14; // arg = sock -> size; reply GRANTS a Frame cap
 
-/// CNode slot used for the shared-memory frame on BOTH sides (different address
-/// spaces, so the same index is free in each): the service allocates its shared
-/// page here and grants a copy of the cap; the client receives that cap here and
-/// maps it. Slots 0–2 are device caps (pid 0 only), 3/4 the endpoints, 5 the
-/// notification — slot 6 is the first free one.
+/// Concurrent TCP connections the network service tracks. Each socket gets its
+/// own local port (`49152 + index`) and its own shared data frame.
+const SOCK_MAX: usize = 4;
+/// Socket index lives in the top 4 bits of the op argument; the lower 52 bits
+/// hold the op-specific payload.
+const SOCK_SHIFT: u64 = 52;
+const SOCK_MASK: u64 = 0xF;
+const ARG_MASK: u64 = (1 << 52) - 1;
+
+/// CNode slots for the shared-memory frames on BOTH sides (different address
+/// spaces, so the same indexes are free in each): the service allocates one
+/// shared page per socket here and grants a copy of the cap; the client receives
+/// that cap here and maps it. Slots 0–2 are device caps (pid 0 only), 3/4 the
+/// endpoints, 5 the notification — slot 6 is the first free one. Socket `i`
+/// uses slot `SHM_FRAME_SLOT + i`.
 const SHM_FRAME_SLOT: u64 = 6;
 
 const STDOUT: u64 = 1;
@@ -615,6 +627,7 @@ fn read_by_index(b: &mut Blk, i: usize, out: &mut [u8]) -> Option<usize> {
     fs_read(b, &name, out)
 }
 
+#[derive(Copy, Clone)]
 struct TcpState {
     dmac: [u8; 6],
     dip: [u8; 4],
@@ -625,19 +638,30 @@ struct TcpState {
     active: bool,
 }
 
+impl TcpState {
+    fn new() -> Self {
+        Self {
+            dmac: [0; 6],
+            dip: [0; 4],
+            sport: 0,
+            dport: 0,
+            our_seq: 0,
+            their_ack: 0,
+            active: false,
+        }
+    }
+}
+
 /// The combined service loop: receives requests on the request endpoint,
 /// dispatches to the filesystem or network stack, and replies. This is
 /// the consolidated driver/service host for Xernel.
 fn combined_service(blk: &mut Blk, net: &mut Net) {
-    let mut tcp = TcpState {
-        dmac: [0; 6],
-        dip: [0; 4],
-        sport: 49152,
-        dport: 0,
-        our_seq: 0x1000,
-        their_ack: 0,
-        active: false,
-    };
+    // One TCP state per socket; each uses its own local port so incoming
+    // segments can be demultiplexed by destination port.
+    let mut socks = [TcpState::new(); SOCK_MAX];
+    for (i, s) in socks.iter_mut().enumerate() {
+        s.sport = (49152 + i) as u16;
+    }
 
     // Initialize network: DHCP + ARP gateway.
     print(" Service-Host: Initialisiere Netzwerk (DHCP)...\n");
@@ -660,13 +684,20 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
         print(" Service-Host: ARP-Gateway FEHLER\n");
     }
 
-    // Allocate one shared page up front; keep the Frame cap in SHM_FRAME_SLOT.
-    let mut shm_va = 0u64;
-    let have_shm = frame_alloc(1, SHM_FRAME_SLOT, &mut shm_va) == 0;
-    if have_shm {
-        print(" Service-Host: geteilte Seite bei 0x");
-        print_hex(shm_va, 8);
-        print(" allokiert (Frame-Cap in Slot 6)\n");
+    // Allocate one shared page per socket; keep the Frame caps in slots 6..9.
+    let mut shm_va = [0u64; SOCK_MAX];
+    let mut have_shm = [false; SOCK_MAX];
+    for i in 0..SOCK_MAX {
+        have_shm[i] = frame_alloc(1, SHM_FRAME_SLOT + i as u64, &mut shm_va[i]) == 0;
+        if have_shm[i] {
+            print(" Service-Host: Socket-");
+            print_u64(i as u64);
+            print(" Frame bei 0x");
+            print_hex(shm_va[i], 8);
+            print(" (Cap in Slot ");
+            print_u64(SHM_FRAME_SLOT + i as u64);
+            print(")\n");
+        }
     }
     print(" Service-Host: bereit, warte auf Anfragen\n");
     loop {
@@ -684,9 +715,11 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
 
         match op {
             OP_READFILE => {
-                let (size, grant) = if have_shm {
+                // Bulk file data is handed out through socket 0's shared frame
+                // (slot 6) — the same bulk-data page mechanism.
+                let (size, grant) = if have_shm[0] {
                     let page =
-                        unsafe { core::slice::from_raw_parts_mut(shm_va as *mut u8, PAGE_BYTES) };
+                        unsafe { core::slice::from_raw_parts_mut(shm_va[0] as *mut u8, PAGE_BYTES) };
                     match read_by_index(blk, arg as usize, page) {
                         Some(n) => (n as u64, SHM_FRAME_SLOT),
                         None => (u64::MAX, NO_CAP),
@@ -697,78 +730,39 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
                 ipc_send(REPLY_EP_SLOT, size, grant);
             }
             OP_NET_CONNECT => {
-                // arg = ip[31..0] | port[47..32]
-                let dip = (arg as u32).to_be_bytes();
-                let dport = (arg >> 32) as u16;
-                print(" Service-Host: Connect an ");
+                // arg = sock | ip[31..0] | port[47..32]
+                let sock = ((arg >> SOCK_SHIFT) & SOCK_MASK) as usize;
+                if sock >= SOCK_MAX {
+                    ipc_send(REPLY_EP_SLOT, u64::MAX, NO_CAP);
+                    continue;
+                }
+                let a = arg & ARG_MASK;
+                let dip = (a as u32).to_be_bytes();
+                let dport = (a >> 32) as u16;
+                print(" Service-Host: Socket ");
+                print_u64(sock as u64);
+                print(" Connect an ");
                 print_ip(&dip);
                 print(":");
                 print_u64(u64::from(dport));
                 print("\n");
-                
+
+                let tcp = &mut socks[sock];
                 tcp.dip = dip;
                 tcp.dport = dport;
                 tcp.dmac = gmac;
-                tcp.active = false;
-
-                // 1. SYN
-                net_rx_arm(net);
-                if net_tcp_send(
-                    net,
-                    tcp.dmac,
-                    tcp.dip,
-                    tcp.sport,
-                    tcp.dport,
-                    tcp.our_seq,
-                    0,
-                    TCP_SYN,
-                    &[],
-                ) {
-                    print(" Service-Host: SYN gesendet, warte auf SYN/ACK...\n");
-                    let mut r = [0u8; 128];
-                    if net_rx_wait(net, &mut r) {
-                        print(" Service-Host: Paket empfangen, pruefe SYN/ACK...\n");
-                        if r[12] == 0x08
-                            && r[13] == 0x00
-                            && r[23] == 6
-                            && (r[47] & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)
-                        {
-                            let their_isn = u32::from_be_bytes([r[38], r[39], r[40], r[41]]);
-                            tcp.our_seq += 1;
-                            tcp.their_ack = their_isn + 1;
-                            // 2. ACK
-                            if net_tcp_send(
-                                net,
-                                tcp.dmac,
-                                tcp.dip,
-                                tcp.sport,
-                                tcp.dport,
-                                tcp.our_seq,
-                                tcp.their_ack,
-                                TCP_ACK,
-                                &[],
-                            ) {
-                                print(" Service-Host: ACK gesendet, Verbindung AKTIV\n");
-                                tcp.active = true;
-                            }
-                        } else {
-                            print(" Service-Host: Kein SYN/ACK (Flags 0x");
-                            print_hex(u64::from(r[47]), 2);
-                            print(")\n");
-                        }
-                    } else {
-                        print(" Service-Host: SYN/ACK RX-Timeout\n");
-                    }
-                } else {
-                    print(" Service-Host: SYN TX-Fehler\n");
-                }
+                tcp.active = net_connect(net, tcp);
                 ipc_send(REPLY_EP_SLOT, if tcp.active { 0 } else { u64::MAX }, NO_CAP);
             }
             OP_NET_SEND => {
-                let len = arg as usize;
+                // arg = sock | len
+                let sock = ((arg >> SOCK_SHIFT) & SOCK_MASK) as usize;
+                let len = (arg & ARG_MASK) as usize;
                 let mut res = u64::MAX;
-                if tcp.active && have_shm && len <= PAGE_BYTES {
-                    let data = unsafe { core::slice::from_raw_parts(shm_va as *const u8, len) };
+                if sock < SOCK_MAX && socks[sock].active && have_shm[sock] && len <= PAGE_BYTES {
+                    let tcp = &mut socks[sock];
+                    let data =
+                        unsafe { core::slice::from_raw_parts(shm_va[sock] as *const u8, len) };
                     if net_tcp_send(
                         net,
                         tcp.dmac,
@@ -787,49 +781,66 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
                 ipc_send(REPLY_EP_SLOT, res, NO_CAP);
             }
             OP_NET_RECV => {
+                // arg = sock | max. Frames for OTHER sockets are skipped (an
+                // ACK is harmless to drop; data is not interleaved in this demo,
+                // so a foreign data frame is treated as not-ours and retried).
+                let sock = ((arg >> SOCK_SHIFT) & SOCK_MASK) as usize;
+                let max = (arg & ARG_MASK) as usize;
                 let mut res = u64::MAX;
-                if tcp.active && have_shm {
-                    for _attempt in 0..4 {
+                if sock < SOCK_MAX && socks[sock].active && have_shm[sock] {
+                    let my_port = socks[sock].sport;
+                    let mut got = 0u64;
+                    for _attempt in 0..6 {
                         net_rx_arm(net);
                         let mut e = [0u8; 256];
-                        if net_rx_wait(net, &mut e) {
-                            let ip_total = (usize::from(e[16]) << 8) | usize::from(e[17]);
-                            let plen = ip_total.saturating_sub(40); // 20 IP + 20 TCP
-                            if plen > 0 {
-                                let seg_seq = u32::from_be_bytes([e[38], e[39], e[40], e[41]]);
-                                tcp.their_ack = seg_seq + plen as u32;
-                                let n = plen.min(PAGE_BYTES);
-                                let dest = unsafe {
-                                    core::slice::from_raw_parts_mut(shm_va as *mut u8, PAGE_BYTES)
-                                };
-                                dest[..n].copy_from_slice(&e[54..54 + n]);
-                                res = n as u64;
-                                // Send ACK for received data.
-                                net_tcp_send(
-                                    net,
-                                    tcp.dmac,
-                                    tcp.dip,
-                                    tcp.sport,
-                                    tcp.dport,
-                                    tcp.our_seq,
-                                    tcp.their_ack,
-                                    TCP_ACK,
-                                    &[],
-                                );
-                                break;
-                            } else {
-                                // Just an ACK or empty, try again.
-                                res = 0;
-                            }
-                        } else {
-                            break; // timeout
+                        if !net_rx_wait(net, &mut e) {
+                            break;
+                        }
+                        // TCP dest port (offset 34+2) demuxes which socket this
+                        // segment belongs to.
+                        let f_dport = (usize::from(e[36]) << 8) | usize::from(e[37]);
+                        if f_dport != usize::from(my_port) {
+                            continue;
+                        }
+                        let tcp = &mut socks[sock];
+                        let ip_total = (usize::from(e[16]) << 8) | usize::from(e[17]);
+                        let plen = ip_total.saturating_sub(40); // 20 IP + 20 TCP
+                        if plen > 0 {
+                            let seg_seq = u32::from_be_bytes([e[38], e[39], e[40], e[41]]);
+                            tcp.their_ack = seg_seq + plen as u32;
+                            let n = plen.min(max).min(PAGE_BYTES);
+                            let dest = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    shm_va[sock] as *mut u8,
+                                    PAGE_BYTES,
+                                )
+                            };
+                            dest[..n].copy_from_slice(&e[54..54 + n]);
+                            // Send ACK for received data.
+                            net_tcp_send(
+                                net,
+                                tcp.dmac,
+                                tcp.dip,
+                                tcp.sport,
+                                tcp.dport,
+                                tcp.our_seq,
+                                tcp.their_ack,
+                                TCP_ACK,
+                                &[],
+                            );
+                            got = n as u64;
+                            break;
                         }
                     }
+                    res = got;
                 }
                 ipc_send(REPLY_EP_SLOT, res, NO_CAP);
             }
             OP_NET_CLOSE => {
-                if tcp.active {
+                // arg = sock
+                let sock = ((arg >> SOCK_SHIFT) & SOCK_MASK) as usize;
+                if sock < SOCK_MAX && socks[sock].active {
+                    let tcp = &socks[sock];
                     net_tcp_send(
                         net,
                         tcp.dmac,
@@ -841,13 +852,15 @@ fn combined_service(blk: &mut Blk, net: &mut Net) {
                         TCP_FIN | TCP_ACK,
                         &[],
                     );
-                    tcp.active = false;
+                    socks[sock].active = false;
                 }
                 ipc_send(REPLY_EP_SLOT, 0, NO_CAP);
             }
             OP_NET_GET_FRAME => {
-                let (size, grant) = if have_shm {
-                    (PAGE_BYTES as u64, SHM_FRAME_SLOT)
+                // arg = sock -> grant that socket's shared frame.
+                let sock = ((arg >> SOCK_SHIFT) & SOCK_MASK) as usize;
+                let (size, grant) = if sock < SOCK_MAX && have_shm[sock] {
+                    (PAGE_BYTES as u64, SHM_FRAME_SLOT + sock as u64)
                 } else {
                     (u64::MAX, NO_CAP)
                 };
@@ -1264,6 +1277,77 @@ fn net_tcp_send(
     f[51] = cks as u8;
 
     net_tx(n, &f[..frame_len])
+}
+
+/// Perform a TCP three-way handshake for `tcp` (dmac/dip/dport/sport already
+/// set): SYN -> SYN/ACK -> ACK. On success `active` is set by the caller.
+/// Returns true if the connection is established.
+///
+/// Frames NOT destined for this socket (e.g. a leftover FIN/ACK from a previous
+/// connection) are skipped, so a fresh connect is not confused by stale traffic.
+fn net_connect(n: &mut Net, tcp: &mut TcpState) -> bool {
+    tcp.our_seq = 0x1000 + u32::from(tcp.sport);
+    tcp.their_ack = 0;
+
+    net_rx_arm(n);
+    if !net_tcp_send(
+        n,
+        tcp.dmac,
+        tcp.dip,
+        tcp.sport,
+        tcp.dport,
+        tcp.our_seq,
+        0,
+        TCP_SYN,
+        &[],
+    ) {
+        print(" Service-Host: SYN TX-Fehler\n");
+        return false;
+    }
+    print(" Service-Host: SYN gesendet, warte auf SYN/ACK...\n");
+    for _attempt in 0..4 {
+        let mut r = [0u8; 128];
+        if !net_rx_wait(n, &mut r) {
+            print(" Service-Host: SYN/ACK RX-Timeout\n");
+            return false;
+        }
+        // TCP dest port (offset 34+2): skip segments for other sockets.
+        let f_dport = (usize::from(r[36]) << 8) | usize::from(r[37]);
+        if f_dport != usize::from(tcp.sport) {
+            net_rx_arm(n);
+            continue;
+        }
+        print(" Service-Host: Paket empfangen, pruefe SYN/ACK...\n");
+        if r[12] == 0x08
+            && r[13] == 0x00
+            && r[23] == 6
+            && (r[47] & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)
+        {
+            let their_isn = u32::from_be_bytes([r[38], r[39], r[40], r[41]]);
+            tcp.our_seq += 1;
+            tcp.their_ack = their_isn + 1;
+            if net_tcp_send(
+                n,
+                tcp.dmac,
+                tcp.dip,
+                tcp.sport,
+                tcp.dport,
+                tcp.our_seq,
+                tcp.their_ack,
+                TCP_ACK,
+                &[],
+            ) {
+                print(" Service-Host: ACK gesendet, Verbindung AKTIV\n");
+                return true;
+            }
+        } else {
+            print(" Service-Host: Kein SYN/ACK (Flags 0x");
+            print_hex(u64::from(r[47]), 2);
+            print(")\n");
+            return false;
+        }
+    }
+    false
 }
 
 /// Open a TCP connection to `dip` (reachable at `dmac`), send a line, and verify
@@ -1727,44 +1811,77 @@ fn combined_client() -> ! {
         print(" B)\n");
     }
 
-    // 2. Network Service Test
-    print("[Client] Netzwerk-Service: starte TCP-Echo-Test via IPC\n");
-    // Fordere Shared Frame vom Service an.
-    if ipc_send(EP_SLOT, OP_NET_GET_FRAME << 56, NO_CAP) == 0 {
-        let mut fsize = 0u64;
-        if ipc_recv(REPLY_EP_SLOT, &mut fsize, SHM_FRAME_SLOT) == 0 && fsize != u64::MAX {
-            let mut shm_va = 0u64;
-            if syscall3(SYS_MAP_FRAME, SHM_FRAME_SLOT, core::ptr::addr_of_mut!(shm_va) as u64, 0) == 0 {
-                // IP 10.0.2.100 (ECHO_IP), Port 9
-                let ip_val = u64::from(ECHO_IP[0]) << 24
-                    | (u64::from(ECHO_IP[1]) << 16)
-                    | (u64::from(ECHO_IP[2]) << 8)
-                    | u64::from(ECHO_IP[3]);
-                let arg = ip_val | (9u64 << 32);
-
-                if request(OP_NET_CONNECT, arg) == 0 {
-                    print("[Client] TCP verbunden!\n");
-                    // Nachricht in den Shared Frame schreiben.
-                    let msg = b"HELLO FROM IPC CLIENT\n";
-                    let dest = unsafe { core::slice::from_raw_parts_mut(shm_va as *mut u8, msg.len()) };
-                    dest.copy_from_slice(msg);
-
-                    if request(OP_NET_SEND, msg.len() as u64) != u64::MAX {
-                        print("[Client] Nachricht gesendet, warte auf Echo...\n");
-                        let recv_len = request(OP_NET_RECV, PAGE_BYTES as u64);
-                        if recv_len != u64::MAX && recv_len > 0 {
-                            print("[Client] Echo empfangen: \"");
-                            let reply = unsafe {
-                                core::slice::from_raw_parts(shm_va as *const u8, recv_len as usize)
-                            };
-                            write(reply);
-                            print("\"\n");
-                        }
-                    }
-                    request(OP_NET_CLOSE, 0);
-                } else {
-                    print("[Client] TCP-Connect fehlgeschlagen\n");
+    // 2. Network Service Test — two concurrent sockets.
+    print("[Client] Netzwerk-Service: Multi-Connection-Test via IPC\n");
+    // Ask the service for one shared frame per socket and map it.
+    let mut shm_va = [0u64; SOCK_MAX];
+    let mut frames_ok = true;
+    for sock in 0..2 {
+        if ipc_send(EP_SLOT, (OP_NET_GET_FRAME << 56) | (sock << SOCK_SHIFT), NO_CAP) == 0 {
+            let mut fsize = 0u64;
+            let slot = SHM_FRAME_SLOT + sock as u64;
+            if ipc_recv(REPLY_EP_SLOT, &mut fsize, slot) == 0 && fsize != u64::MAX {
+                if syscall3(
+                    SYS_MAP_FRAME,
+                    slot,
+                    core::ptr::addr_of_mut!(shm_va[sock as usize]) as u64,
+                    0,
+                ) != 0
+                {
+                    frames_ok = false;
                 }
+            } else {
+                frames_ok = false;
+            }
+        } else {
+            frames_ok = false;
+        }
+    }
+    if frames_ok {
+        // IP 10.0.2.100 (ECHO_IP), Port 9
+        let ip_val = u64::from(ECHO_IP[0]) << 24
+            | (u64::from(ECHO_IP[1]) << 16)
+            | (u64::from(ECHO_IP[2]) << 8)
+            | u64::from(ECHO_IP[3]);
+        for sock in 0..2 {
+            let arg = ((sock as u64) << SOCK_SHIFT) | ip_val | (9u64 << 32);
+            if request(OP_NET_CONNECT, arg) == 0 {
+                print("[Client] Socket ");
+                print_u64(sock as u64);
+                print(" TCP verbunden!\n");
+                let msg: &[u8] = if sock == 0 {
+                    b"HELLO FROM SOCKET 0\n"
+                } else {
+                    b"HELLO FROM SOCKET 1\n"
+                };
+                let dest = unsafe {
+                    core::slice::from_raw_parts_mut(shm_va[sock as usize] as *mut u8, msg.len())
+                };
+                dest.copy_from_slice(msg);
+
+                if request(OP_NET_SEND, ((sock as u64) << SOCK_SHIFT) | msg.len() as u64)
+                    == msg.len() as u64
+                {
+                    print("[Client] Socket ");
+                    print_u64(sock as u64);
+                    print(" Nachricht gesendet, warte auf Echo...\n");
+                    let recv_len = request(OP_NET_RECV, ((sock as u64) << SOCK_SHIFT) | (PAGE_BYTES as u64));
+                    if recv_len != u64::MAX && recv_len > 0 {
+                        print("[Client] Socket ");
+                        print_u64(sock as u64);
+                        print(" Echo: \"");
+                        let reply = unsafe {
+                            core::slice::from_raw_parts(shm_va[sock as usize] as *const u8, recv_len as usize)
+                        };
+                        write(reply);
+                        print("\"\n");
+                    }
+                }
+                request(OP_NET_CLOSE, (sock as u64) << SOCK_SHIFT);
+            } else {
+                print("[Client] Socket ");
+                print_u64(sock as u64);
+                print(" Connect fehlgeschlagen\n");
             }
         }
     }

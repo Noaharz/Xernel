@@ -1,0 +1,125 @@
+================================================================================
+0.24.0 — MULTI-CONNECTION SOCKET-SERVICE (TICKET #2)
+================================================================================
+
+Zeitraum:      2026-08-11
+Ergebnis:      Der Netzwerk-Service (pid 0) verwaltet jetzt mehrere TCP-
+               Verbindungen gleichzeitig statt einer einzigen. Das Socket-IPC-
+               Protokoll (CONNECT/SEND/RECV/CLOSE/GET_FRAME) trägt pro Op einen
+               Socket-Index; jeder Socket hat seinen eigenen lokalen Port, seinen
+               eigenen TCP-Zustand (Sequenz-/ACK-Nummern) und seinen eigenen
+               Shared Frame für Bulk-Daten. Der Client (pid 1, ohne Geräte-Caps)
+               öffnet zwei Verbindungen parallel, sendet auf jeder eine andere
+               Nachricht und bekommt das jeweils richtige Echo auf dem richtigen
+               Socket zurück. Ein liegengebliebener FIN/ACK einer alten Verbindung
+               verwirrt einen neuen Connect nicht mehr: Empfangsframes werden per
+               TCP-Zielport dem passenden Socket zugeordnet, Fremd-Frames werden
+               übersprungen statt als Fehler gewertet.
+
+
+--------------------------------------------------------------------------------
+WARUM DIESES PRIMITIV
+--------------------------------------------------------------------------------
+
+Ein Netzwerk-Service mit genau EINER Verbindung kann keine echte Aufgabe erfüllen
+— jede Anwendung braucht mehrere gleichzeitige Verbindungen (Steuerkanal +
+Datenkanal, mehrere Clients, parallele Requests). Das Socket-Handle im IPC-Op ist
+der universelle Baustein dafür: Es macht die Verbindung benennbar, ohne dass der
+Client irgendeine Netz-Autorität braucht. Genau das ist die Voraussetzung für
+Ticket #3 (Readiness-Set: ein WAIT meldet, welche von N Sockets lesbar sind).
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs:
+
+  Protokoll:  Jeder Netz-Op trägt den Socket-Index in den oberen 4 Bits des
+              56-Bit-Arguments (SOCK_SHIFT=52, SOCK_MASK=0xF). Darunter liegt
+              der op-spezifische Payload (IP+Port beim CONNECT, Länge bei
+              SEND/RECV).
+              OP_NET_CONNECT   arg = sock | ip[31..0] | port[47..32]
+              OP_NET_SEND      arg = sock | len
+              OP_NET_RECV      arg = sock | max
+              OP_NET_CLOSE     arg = sock
+              OP_NET_GET_FRAME arg = sock   -> reply GRANTET den Frame-Cap
+                                               dieses Sockets (Slot 6+sock)
+
+  Service (combined_service):
+    - socks: [TcpState; 4]  — ein Zustand pro Socket; lokaler Port 49152+i.
+    - Pro Socket ein Shared Frame (frame_alloc, Cap in Slot 6..9) als
+      Bulk-Daten-Puffer. Der Client holt ihn per GET_FRAME(sock) und mappt ihn.
+    - net_connect(net, tcp): SYN/SYN/ACK-ACK-Handshake aus dem alten
+      Inline-Code extrahiert. Wichtige Robustheit: Es werden NUR Frames
+      akzeptiert, deren TCP-Zielport (Ethernet-Offset 34+2) zum Socket passt
+      und die SYN|ACK tragen. Ein liegengebliebener FIN/ACK von Socket 0 wird
+      beim Connect von Socket 1 übersprungen statt als Fehler gewertet.
+    - OP_NET_RECV(sock, max): arbeitet wie vorher, aber mit Demux — Frames mit
+      fremdem Zielport werden übersprungen (ein ACK ist wegwerfbar), nur Daten
+      für `sock` landen im Shared Frame des Sockets; danach ACK senden.
+    - OP_NET_CLOSE(sock) schließt nur diesen Socket.
+
+  Client (combined_client):
+    - Holt sich für die Sockets 0 und 1 je den Frame (GET_FRAME + MAP_FRAME),
+      verbindet beide zu 10.0.2.100:9, schreibt je eine UNTERSCHIEDLICHE
+      Nachricht in den eigenen Frame, sendet, empfängt und prüft, dass jedes
+      Echo auf dem richtigen Socket ankommt. Dann CLOSE auf beiden.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS  (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+  Service-Host: Socket-0 Frame bei 0x70000000 (Cap in Slot 6)
+  Service-Host: Socket-1 Frame bei 0x70001000 (Cap in Slot 7)
+  ...
+  [Client] Netzwerk-Service: Multi-Connection-Test via IPC
+   Service-Host: Socket 0 Connect an 10.0.2.100:9
+   Service-Host: SYN gesendet, warte auf SYN/ACK...
+   Service-Host: ACK gesendet, Verbindung AKTIV
+  [Client] Socket 0 TCP verbunden!
+  [Client] Socket 0 Echo: "HELLO FROM SOCKET 0
+  "
+   Service-Host: Socket 1 Connect an 10.0.2.100:9
+   Service-Host: SYN gesendet, warte auf SYN/ACK...
+   Service-Host: ACK gesendet, Verbindung AKTIV
+  [Client] Socket 1 TCP verbunden!
+  [Client] Socket 1 Echo: "HELLO FROM SOCKET 1
+  "
+  [Client] fertig
+  xtask: boot-test PASSED
+
+Beide Verbindungen stehen gleichzeitig (jeder Handshake hat seinen eigenen
+Zustand), beide Echos sind unterschiedlich und kommen auf dem richtigen Socket
+an — die Demux-Funktion ist damit bewiesen.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+  - Noch immer ein einziger TCP-Stack: kein Retransmit, kein Fenster, keine
+    Reassembly über Segmentgrenzen; der Empfangspuffer ist eine Seite pro Socket.
+  - RECV verwirft Frames für fremde Sockets. Ein ACK ist harmlos; Daten eines
+    anderen Sockets würden im Demo-Ablauf nicht auftreten (Senden/Empfangen ist
+    serialisiert), fehlen aber für echte Parallelität (-> Ticket #3 mit einem
+    echten Ready-Ring/Shared-State).
+  - SOCK_MAX ist hart auf 4 (Festwert); Socket-Frames und -Caps verbrauchen
+    Untyped-Budget (4 Seiten).
+  - Ein eingehender Segment-Offset (z. B. Retransmit ab Offset >0) wird nicht
+    geparst — `their_ack` wird naiv aus seg_seq+plen gebildet.
+  - Der Service-Host bleibt kombiniert (FS+Net) in einem Prozess (Ticket #5).
+  - Der Client ist weiterhin eine Demo, kein allgemeiner Socket-Client.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  userland/init/src/main.rs   OP_NET_*-Protokoll um Socket-Index erweitert;
+                              TcpState::new + SOCK_MAX/SOCK_SHIFT/SOCK_MASK/
+                              ARG_MASK; combined_service mit socks-Array,
+                              per-Socket-Frames und Demux in CONNECT/RECV;
+                              net_connect extrahiert; combined_client mit
+                              2-Socket-Test.
