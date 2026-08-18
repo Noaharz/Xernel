@@ -91,7 +91,7 @@ Treiber laufen im User-Space, isoliert, mit eigenem Adressraum. Ein Bug im
 Disk-Treiber kann den Kernel nicht crashen. Der Kernel stellt nur die fünf
 Primitive bereit (PCI-Config, MMIO-Map, DMA-Alloc, Port-I/O) und kennt das
 Wort "virtio" nicht. Das ist die Mikrokernel-Idee in einem laufenden Beispiel
-und das Fundament für ein echtes Storage-/Dateisystem (was XOS und NexusCloud
+und das Fundament für ein echtes Storage-/Dateisystem (was XOS und Externer Kunde
 brauchen) sowie weitere virtio-Geräte (net, gpu) nach demselben Muster.
 
 

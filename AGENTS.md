@@ -38,7 +38,7 @@ käme später in den User-Space).
 5. **Commit-Nachrichten enden mit:**
    `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
 6. **Universelle Fundamente bauen**, nicht auf einen einzelnen Nutzer (z. B.
-   "NexusCloud") hin optimieren. Wenn ein externer Wunsch kommt: bau die *allgemeine*
+   "Externer Kunde") hin optimieren. Wenn ein externer Wunsch kommt: bau die *allgemeine*
    Form davon (Beispiel: aus "wir brauchen epoll" wurde das generische
    Notification-Primitiv, das jedem Service nützt).
 7. **Sei ehrlich, nicht gefällig.** Sag, was *läuft* vs. was *produktionsreif* ist.
@@ -318,7 +318,7 @@ nicht pushen, melden.
 
 ## 9. Haltung gegenüber externem Druck
 
-Externe „Kunden" (z. B. NexusCloud) schicken manchmal Ultimaten („liefert X in
+Externe „Kunden" (z. B. Externer Kunde) schicken manchmal Ultimaten („liefert X in
 1 Stunde oder wir wechseln zu Linux"). Lass dich davon **nicht** zu Abkürzungen
 treiben. Richtig ist:
 1. Die *allgemeine* Form des Wunsches bauen (universelles Primitiv, nicht den
