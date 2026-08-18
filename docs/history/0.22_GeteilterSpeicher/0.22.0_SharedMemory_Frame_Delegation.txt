@@ -117,7 +117,7 @@ WIE DAS ZUR SOCKET-API WIRD (nächste Phasen)
     ohne 64-Bit-Bitmasken-Grenze.
 
 Genau diese beiden Bausteine — Notification (0.21.0) + geteilter Speicher
-(0.22.0) — sind zusammen das, was NexusClouds Go-Netpoller braucht.
+(0.22.0) — sind zusammen das, was Externer Kundes Go-Netpoller braucht.
 
 
 --------------------------------------------------------------------------------

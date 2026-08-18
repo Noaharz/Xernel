@@ -13,10 +13,10 @@ Ergebnis:      Xernel hat ein asynchrones Readiness-Primitiv: das Notification-
 
 
 --------------------------------------------------------------------------------
-WARUM DIESES PRIMITIV (NexusCloud-Anforderung, universell gelöst)
+WARUM DIESES PRIMITIV (Externer Kunde-Anforderung, universell gelöst)
 --------------------------------------------------------------------------------
 
-NexusClouds Socket-Wünsche, nach Priorität: (1) non-blocking Primitive, (2)
+Externer Kundes Socket-Wünsche, nach Priorität: (1) non-blocking Primitive, (2)
 Multiplex + ein effizientes „warte auf N" (epoll/kqueue-Äquivalent), (3) auf der
 Endpoint-IPC. Das ist KEIN Sonderwunsch, sondern eine universelle OS-Anforderung:
 ein Server (ihr gRPC-Beispiel) hält hunderte Verbindungen und braucht EIN
@@ -81,7 +81,7 @@ WIE DAS ZUR SOCKET-API WIRD (nächste Phasen, Release v0.18.0)
     Socket lesbar/schreibbar wird; ein wait deckt hunderte Sockets ab. Die
     Ready-Menge transportiert entweder eine Bitmaske im Signal-Wort (bis 64
     Sockets) oder ein Shared-Memory-Readiness-Ring (skaliert wie epoll) —
-    Designfrage an NexusCloud.
+    Designfrage an Externer Kunde.
 
 
 --------------------------------------------------------------------------------
