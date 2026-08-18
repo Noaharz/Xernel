@@ -124,6 +124,30 @@ pub const SYS_FRAME_ALLOC: u64 = 23;
 /// shared memory: two processes that both map the same delegated Frame cap see
 /// the same RAM.
 pub const SYS_MAP_FRAME: u64 = 24;
+/// Spawn a new process with environment variables. Like `SPAWN`, but arg 1 is a
+/// pointer to the environment buffer in the caller's address space and arg 2 is
+/// its length in bytes. The kernel copies the env data into the child's heap;
+/// the child retrieves the pointer via `SYS_GETENVP`. Returns the new PID, or
+/// `u64::MAX` on failure.
+pub const SYS_SPAWN_ENV: u64 = 25;
+/// Query the state of the process identified by `pid` (arg 0). Returns:
+///   0 = running (Ready or Blocked),
+///   1 = exited (Done),
+///   2 = unknown PID.
+pub const SYS_GET_STATUS: u64 = 26;
+/// Return the environment pointer and length for the current process. Writes
+/// `[envp_user, envp_len]` (2 × u64) to `out_ptr` (arg 0). Returns 0 on
+/// success, `u64::MAX` if no environment was set or the buffer is bad.
+pub const SYS_GETENVP: u64 = 27;
+/// Read and drain up to `args[2]` bytes from process `args[0]`'s log ring buffer
+/// into user pointer `args[1]`. Returns bytes copied, 0 if empty/unknown.
+pub const SYS_LOG_READ: u64 = 28;
+/// Send a signal to a process. `args[0]` = target_pid, `args[1]` = signal
+/// (15 = SIGTERM, 9 = SIGKILL). Returns 0 on success, `u64::MAX` on error.
+pub const SYS_KILL: u64 = 29;
+/// Block until `args[0]` has exited, then return its exit code. Returns
+/// `u64::MAX` if the PID is unknown or is the caller itself.
+pub const SYS_WAIT_PID: u64 = 30;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -189,6 +213,12 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_WAIT => sys_wait(args[0]),
         SYS_FRAME_ALLOC => sys_frame_alloc(args[0], args[1], args[2]),
         SYS_MAP_FRAME => sys_map_frame(args[0], args[1]),
+        SYS_SPAWN_ENV => crate::process::spawn_env(args[0], args[1], args[2]).unwrap_or(u64::MAX),
+        SYS_GET_STATUS => crate::process::get_status(args[0]),
+        SYS_GETENVP => sys_getenvp(args[0]),
+        SYS_LOG_READ => sys_log_read(args[0], args[1], args[2]),
+        SYS_KILL => crate::process::kill(args[0], args[1]),
+        SYS_WAIT_PID => crate::process::wait_pid(args[0]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -222,6 +252,11 @@ fn sys_write(_fd: u64, ptr: u64, len: u64) -> u64 {
     // send UTF-8/ASCII.
     let text = String::from_utf8_lossy(buf);
     arch::serial_write(&text);
+    // Mirror stdout (fd 1) and stderr (fd 2) into the process's log ring buffer
+    // so that `SYS_LOG_READ` can retrieve it from another process.
+    if _fd == 1 || _fd == 2 {
+        crate::process::log_write(buf);
+    }
     len
 }
 
@@ -593,5 +628,28 @@ fn sysinfo(which: u64) -> u64 {
         INFO_FRAME_SIZE => frame::FRAME_SIZE,
         _ => u64::MAX,
     }
+}
+
+/// Write `[envp_user, envp_len]` for the current process to `out_ptr`. Returns 0
+/// on success, `u64::MAX` if the process has no environment or the buffer is bad.
+fn sys_getenvp(out_ptr: u64) -> u64 {
+    let (envp, len) = crate::process::current_getenvp();
+    let Some(buf) = user_slice_mut(out_ptr, 16) else {
+        return u64::MAX;
+    };
+    buf[0..8].copy_from_slice(&envp.to_le_bytes());
+    buf[8..16].copy_from_slice(&len.to_le_bytes());
+    0
+}
+
+/// Read up to `max` bytes from `target_pid`'s log ring buffer into `out_ptr`.
+/// Returns the number of bytes copied. The bytes are consumed (removed from the
+/// buffer). Any process can read any other process's log.
+fn sys_log_read(target_pid: u64, out_ptr: u64, max: u64) -> u64 {
+    let max = max.min(65536) as usize; // hard cap 64 KiB per call
+    let Some(buf) = user_slice_mut(out_ptr, max as u64) else {
+        return u64::MAX;
+    };
+    crate::process::log_read(target_pid, buf, max)
 }
 

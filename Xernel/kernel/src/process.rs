@@ -14,6 +14,7 @@
 //! a process yields voluntarily; timer-driven preemption is the next step.
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -27,6 +28,8 @@ use crate::{arch, elf, println};
 const PAGE: u64 = 4096;
 /// Capability-table size for a process.
 const CAP_SLOTS: usize = 64;
+/// Highest user virtual address (exclusive). Used to validate user pointers.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
 /// PCI I/O-BAR window on the QEMU q35 machine. The root driver task is granted
 /// an `IoPort` capability over exactly this range — enough to reach virtio
 /// devices' legacy registers, but not the low system ports (PIC, PIT, CMOS, …).
@@ -99,6 +102,17 @@ struct Process {
     kstack_top: u64,   // top of the kernel stack (for syscall entry)
     state: State,
     caps: CNode, // this process's capability space (its only authority)
+    /// Pointer to the environment block in the child's address space (HEAP_START).
+    /// `0` means no environment was provided.
+    envp_user: u64,
+    /// Length of the environment block in bytes.
+    envp_len: u64,
+    /// Ring buffer capturing this process's stdout/stderr output. Readable by
+    /// any process that knows this PID (via `SYS_LOG_READ`). 64 KiB per process.
+    log_buf: VecDeque<u8>,
+    /// Exit code passed to `exit()` or set by `kill()`. Only meaningful when
+    /// `state == Done`. Convention: 0 = normal, 15 = SIGTERM, 9 = SIGKILL.
+    exit_code: u64,
 }
 
 struct Scheduler {
@@ -146,6 +160,8 @@ fn create(pid: u64, module: &[u8]) -> Option<Process> {
     let mut kstack = vec![0u64; KSTACK_WORDS];
     let ksp = arch::init_thread_stack(&mut kstack, trampoline);
     let kstack_top = kstack.as_ptr_range().end as u64 & !0xf;
+    let mut log_buf = VecDeque::new();
+    log_buf.reserve_exact(65536);
     Some(Process {
         pid,
         space,
@@ -157,6 +173,10 @@ fn create(pid: u64, module: &[u8]) -> Option<Process> {
         kstack_top,
         state: State::Ready,
         caps: seed_caps(pid),
+        envp_user: 0,
+        envp_len: 0,
+        log_buf,
+        exit_code: 0,
     })
 }
 
@@ -369,6 +389,97 @@ pub fn spawn(_module_index: u64) -> Option<u64> {
     Some(pid)
 }
 
+/// Like [`spawn`], but also copies an environment block from the parent's
+/// address space into the child. `envp_ptr`/`envp_len` point into the
+/// **caller's** (parent's) address space; the data is copied page-by-page into
+/// the child's heap at `HEAP_START`. The child can later retrieve the pointer
+/// via `SYS_GETENVP`. Returns the new PID, or `u64::MAX` on failure.
+pub fn spawn_env(_module_index: u64, envp_ptr: u64, envp_len: u64) -> Option<u64> {
+    if envp_len == 0 || envp_ptr == 0 {
+        return spawn(_module_index);
+    }
+    let module = arch::init_module()?;
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut()?;
+    let pid = s.next_pid;
+    let mut p = create(pid, module)?;
+
+    // Copy the environment from the parent's address space into the child's
+    // freshly created heap. We map pages on demand and do a byte-by-byte copy
+    // through the HHDM (both address spaces share kernel memory).
+    let env_pages = envp_len.div_ceil(PAGE);
+    for i in 0..env_pages {
+        let child_va = HEAP_START + i * PAGE;
+        if !arch::vspace_alloc_map(p.space, child_va, true, false) {
+            return None; // couldn't map child page
+        }
+    }
+    // Zero the region first.
+    // SAFETY: we just mapped these pages in the child's address space; they are
+    // accessible from ring 0 through the HHDM.
+    unsafe {
+        core::ptr::write_bytes(
+            (HEAP_START + arch::hhdm_offset()) as *mut u8,
+            0,
+            (env_pages * PAGE) as usize,
+        );
+    }
+    // Copy byte-by-byte from parent to child through the HHDM. The parent's
+    // pages are in the current address space (active CR3).
+    // SAFETY: `envp_ptr` came from userspace; we validate it fits.
+    let parent_end = envp_ptr.checked_add(envp_len)?;
+    if parent_end >= USER_ADDR_MAX {
+        return None;
+    }
+    for offset in 0..envp_len {
+        let byte = unsafe { core::ptr::read_volatile((envp_ptr + offset) as *const u8) };
+        unsafe {
+            core::ptr::write_volatile(
+                (HEAP_START + offset + arch::hhdm_offset()) as *mut u8,
+                byte,
+            );
+        }
+    }
+    p.envp_user = HEAP_START;
+    p.envp_len = envp_len;
+    // Adjust heap break past the environment block so SBRK starts after it.
+    p.heap_break = HEAP_START + env_pages * PAGE;
+
+    s.procs.push(Box::new(p));
+    s.next_pid += 1;
+    Some(pid)
+}
+
+/// Query the state of the process identified by `target_pid`. Returns:
+///   0 = running (Ready or Blocked)
+///   1 = exited (Done)
+///   2 = unknown PID
+pub fn get_status(target_pid: u64) -> u64 {
+    let guard = SCHED.lock();
+    let s = match guard.as_ref() {
+        Some(s) => s,
+        None => return 2,
+    };
+    for p in s.procs.iter() {
+        if p.pid == target_pid {
+            return match p.state {
+                State::Ready | State::Blocked(_) => 0,
+                State::Done => 1,
+            };
+        }
+    }
+    2 // PID not found
+}
+
+/// Return the (user virtual address, length) of the environment block for the
+/// current process, or `(0, 0)` if none was set.
+pub fn current_getenvp() -> (u64, u64) {
+    let guard = SCHED.lock();
+    guard
+        .as_ref()
+        .map_or((0, 0), |s| (s.procs[s.current].envp_user, s.procs[s.current].envp_len))
+}
+
 /// Yield the CPU to the next ready process.
 pub fn yield_now() {
     let (save_ptr, next_ksp) = {
@@ -441,6 +552,7 @@ pub fn exit(code: u64) -> ! {
         let mut guard = SCHED.lock();
         let s = guard.as_mut().expect("no scheduler");
         let pid = s.procs[s.current].pid;
+        s.procs[s.current].exit_code = code;
         s.procs[s.current].state = State::Done;
         println!("[user pid {pid}] exit({code})");
         pick_next(s).map(|i| activate(s, i))
@@ -465,6 +577,115 @@ pub fn exit(code: u64) -> ! {
 /// PID of the currently running process.
 pub fn getpid() -> u64 {
     SCHED.lock().as_ref().map_or(0, |s| s.procs[s.current].pid)
+}
+
+/// Maximum bytes kept in a process's log ring buffer (64 KiB).
+const LOG_BUF_CAP: usize = 65536;
+
+/// Append `data` to the current process's log ring buffer, dropping the oldest
+/// bytes when the buffer is full. Called from `sys_write` when `fd` is 1 or 2.
+pub fn log_write(data: &[u8]) {
+    let mut guard = SCHED.lock();
+    if let Some(s) = guard.as_mut() {
+        let p = &mut s.procs[s.current];
+        for &b in data {
+            if p.log_buf.len() >= LOG_BUF_CAP {
+                p.log_buf.pop_front();
+            }
+            p.log_buf.push_back(b);
+        }
+    }
+}
+
+/// Copy up to `max` bytes from the log ring buffer of the process identified by
+/// `target_pid` into `out`, returning how many bytes were copied and removing
+/// them from the buffer. Any process can read any other process's log (no
+/// capability needed — the data is non-sensitive debugging output).
+pub fn log_read(target_pid: u64, out: &mut [u8], max: usize) -> u64 {
+    let mut guard = SCHED.lock();
+    let s = match guard.as_mut() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let p = match s.procs.iter_mut().find(|p| p.pid == target_pid) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let n = core::cmp::min(max, p.log_buf.len());
+    for i in 0..n {
+        if let Some(b) = p.log_buf.pop_front() {
+            out[i] = b;
+        }
+    }
+    n as u64
+}
+
+/// Send a signal to a process identified by `target_pid`.
+/// - signal 15 (SIGTERM): mark the process as Done with exit_code 15.
+/// - signal 9  (SIGKILL): same, but exit_code 9.
+/// Returns 0 on success, `u64::MAX` if the PID is unknown or already exited.
+/// Any process can kill any other process (no capability needed — this is a
+/// single-tenant OS; in a multi-tenant model this would be gated).
+pub fn kill(target_pid: u64, signal: u64) -> u64 {
+    let mut guard = SCHED.lock();
+    let s = match guard.as_mut() {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
+    // Don't kill PID 0 (the root/init) — the system depends on it.
+    if target_pid == 0 {
+        return u64::MAX;
+    }
+    let p = match s.procs.iter_mut().find(|p| p.pid == target_pid) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    match p.state {
+        State::Done => return u64::MAX, // already exited
+        _ => {}
+    }
+    let code = match signal {
+        9 => 9,   // SIGKILL
+        15 => 15, // SIGTERM
+        other => other, // arbitrary exit code
+    };
+    p.exit_code = code;
+    p.state = State::Done;
+    println!("[kernel] kill(pid={}, sig={}) → exit_code={}", target_pid, signal, code);
+    0
+}
+
+/// Block until the process identified by `target_pid` has exited, then return
+/// its exit code. Returns `u64::MAX` if the PID is unknown or is the caller
+/// itself. If the target has already exited, returns immediately.
+pub fn wait_pid(target_pid: u64) -> u64 {
+    if target_pid == 0 {
+        return u64::MAX;
+    }
+    // Busy-wait with yield: check, yield, repeat. Not elegant, but correct for
+    // single-tenant where children exit quickly.
+    loop {
+        {
+            let guard = SCHED.lock();
+            let s = match guard.as_ref() {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            // Don't wait for yourself.
+            if s.procs[s.current].pid == target_pid {
+                return u64::MAX;
+            }
+            if let Some(p) = s.procs.iter().find(|p| p.pid == target_pid) {
+                if p.state == State::Done {
+                    return p.exit_code;
+                }
+            } else {
+                return u64::MAX; // PID unknown
+            }
+        }
+        // Release lock, yield, then re-check.
+        crate::process::yield_now();
+    }
 }
 
 /// Adjust the current process's heap break; new pages map into its own space.
