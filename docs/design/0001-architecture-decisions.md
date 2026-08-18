@@ -2,7 +2,7 @@
 
 - **Status:** Akzeptiert
 - **Datum:** 2026-05-18
-- **Beschluss durch:** Noah, mit Claude als Co-Designer
+- **Beschluss durch:** Noah
 - **Bezug:** `../history/0.1_KernelPlanen/0.1.2_Xernel_Konzept_v0.1.md`
 
 ## Kontext
@@ -39,7 +39,7 @@ beantwortet.
 - `relibc` aus Redox wird **nicht** als Basis verwendet — wir schreiben `xlibc`
   selbst, um POSIX-Subset auf unsere ABI zu mappen.
 
-### 4. Team: solo + Claude
+### 4. Team: solo
 
 - Keine Open-Source-Veröffentlichung vor Meilenstein 0.3 (Capabilities + IPC laufen).
 - CI von Tag 1 trotzdem, weil sie auch solo wertvoll ist.
