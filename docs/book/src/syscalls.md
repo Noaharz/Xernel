@@ -45,8 +45,14 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 22 | `WAIT` | notif_slot | bits (≠0) / 0 | Blockiert, bis die Notification in `notif_slot` Bits ≠ 0 hat, gibt sie zurück und löscht sie. Das Readiness-Primitiv (epoll/kqueue-Form): ein `WAIT` deckt viele Quellen ab. `0` = keine Cap. |
 | 23 | `FRAME_ALLOC` | pages, cap_slot, out_ptr | 0 / `u64::MAX` | Allokiert `pages` physisch-zusammenhängende, genullte Seiten, mappt sie in den Aufrufer, legt eine `Frame`-Capability in `cap_slot` und schreibt die User-Adresse nach `out_ptr`. **Gated:** verrechnet gegen das `Untyped`-Budget. Die Frame-Cap lässt sich per `SEND` granten → geteilter Speicher. |
 | 24 | `MAP_FRAME` | cap_slot, out_ptr | 0 / `u64::MAX` | Mappt den von der `Frame`-Cap in `cap_slot` benannten Speicher in den Aufrufer und schreibt die User-Adresse nach `out_ptr`. Keine Budget-Verrechnung — die empfangende Hälfte von Shared Memory: zwei Prozesse, die dieselbe delegierte Frame-Cap mappen, sehen denselben RAM. |
+| 25 | `SPAWN_ENV` | module, envp, len | pid / `u64::MAX` | Wie `SPAWN`, aber überträgt einen Environment-Block (`envp`, `len` Bytes) an den Kind-Prozess. Der Kind-Prozess ruft `GETENVP` ab, um den Pointer und die Länge abzurufen. Die Env-Daten werden in den Kind-Adressraum an HEAP_START kopiert. |
+| 26 | `GET_STATUS` | pid | status / `u64::MAX` | Fragt den Zustand eines Prozesses ab: `0` = running, `1` = exited, `2` = unknown. Funktioniert für jeden Prozess (kein Capability nötig — nur Status-Abfrage). |
+| 27 | `GETENVP` | out_ptr | 0 / `u64::MAX` | Schreibt `[envp, len]` (2×u64) des aktuellen Prozesses nach `out_ptr`. `envp` ist die User-Adresse des Environment-Blocks (bei `SPAWN_ENV` gesetzt, `0` wenn kein Env vorhanden), `len` ist die Größe in Bytes. |
+| 28 | `LOG_READ` | pid, out_ptr, max | bytes / 0 | Liest und konsumiert bis zu `max` Bytes (max. 64 KiB) aus dem Log-Ring-Buffer des Prozesses `pid` nach `out_ptr`. Jeder Prozess kann das Log jedes anderen lesen (kein Capability nötig — Debug-Ausgabe). `0` = nichts gepuffert. |
+| 29 | `KILL` | pid, signal | 0 / `u64::MAX` | Sendet ein Signal an den Prozess `pid`: `15` = SIGTERM (graceful), `9` = SIGKILL (hard). Markiert den Prozess als beendet mit dem entsprechenden Exit-Code. Kein Capability nötig. `u64::MAX` wenn PID unbekannt oder bereits beendet. PID 0 (Root) kann nicht getötet werden. |
+| 30 | `WAIT_PID` | pid | exit_code / `u64::MAX` | Blockiert (mit Yield-Schleife) bis der Prozess `pid` beendet ist, gibt seinen Exit-Code zurück. `u64::MAX` wenn PID unbekannt oder der Aufrufer sich selbst erwartet. |
 
-Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16, 23) prüfen
+Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16, 23, 25) prüfen
 eine Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung,
 wenn sie fehlt — es gibt keine ambiente Hardware-Autorität. Mit `CAP_IDENTIFY` kann
 ein Prozess seine eigenen Capabilities aufzählen (nur die eigenen — keine
@@ -82,6 +88,12 @@ fn read(buf: &mut [u8]) -> u64    { syscall3(6, 0, buf.as_mut_ptr() as u64, buf.
 fn read_nb(buf: &mut [u8]) -> u64 { syscall3(7, 0, buf.as_mut_ptr() as u64, buf.len() as u64) }
 fn sbrk(delta: i64) -> u64        { syscall3(8, delta as u64, 0, 0) }
 fn fb_info(out: &mut [u64; 5]) -> u64 { syscall3(9, out.as_mut_ptr() as u64, 0, 0) }
+fn spawn_env(module: u64, envp: *const u8, len: u64) -> u64 { syscall3(25, module, envp as u64, len) }
+fn get_status(pid: u64) -> u64     { syscall3(26, pid, 0, 0) }
+fn getenvp(out: &mut [u64; 2]) -> u64 { syscall3(27, out.as_mut_ptr() as u64, 0, 0) }
+fn log_read(pid: u64, out: &mut [u8], max: u64) -> u64 { syscall3(28, pid, out.as_mut_ptr() as u64, max) }
+fn kill(pid: u64, signal: u64) -> u64 { syscall3(29, pid, signal, 0) }
+fn wait_pid(pid: u64) -> u64 { syscall3(30, pid, 0, 0) }
 ```
 
 ## Grafik (Framebuffer)
@@ -119,8 +131,12 @@ lazy gemappt (nur Angefasstes kostet RAM).
 - **SSE/FPU verfügbar** (normaler x86_64-Build möglich, kein Soft-float-Zwang).
 - Stack: 64 KiB, ABI-korrekt ausgerichtet (`rsp % 16 == 8` bei Eintritt).
 - Kein `std`. `alloc` ist über `SBRK` möglich.
-- Prozesse: `SPAWN` erzeugt einen neuen Prozess (noch kein `fork`/`exec`, kein
-  `wait`).
+- Prozesse: `SPAWN` erzeugt einen neuen Prozess; `SPAWN_ENV` zusätzlich mit
+  Environment-Variablen; `GET_STATUS` fragt den Zustand eines Prozesses ab;
+  `GETENVP` ruft das Env im Kind ab; `LOG_READ` liest den stdout/stderr-Log
+  eines Prozesses (Ring-Buffer, 64 KiB); `KILL` beendet einen Prozess per
+  Signal (SIGTERM/SIGKILL); `WAIT_PID` blockiert bis ein Kind beendet ist und
+  liefert den Exit-Code.
 - Noch **nicht** verfügbar: Dateisystem-*Syscalls* (XernelFS ist eine Ring-3-
   Bibliothek über die Block-Primitive), Timer-Frequenz in Hz.
 

@@ -32,6 +32,12 @@ const SYS_SIGNAL: u64 = 21;
 const SYS_WAIT: u64 = 22;
 const SYS_FRAME_ALLOC: u64 = 23;
 const SYS_MAP_FRAME: u64 = 24;
+const SYS_SPAWN_ENV: u64 = 25;
+const SYS_GET_STATUS: u64 = 26;
+const SYS_GETENVP: u64 = 27;
+const SYS_LOG_READ: u64 = 28;
+const SYS_KILL: u64 = 29;
+const SYS_WAIT_PID: u64 = 30;
 
 /// Endpoint capability slots (seeded by the kernel): `EP_SLOT` carries requests
 /// from a client to the file-service, `REPLY_EP_SLOT` carries replies back.
@@ -1843,6 +1849,43 @@ fn spawn(module: u64) -> u64 {
     syscall3(SYS_SPAWN, module, 0, 0)
 }
 
+/// Spawn a new process with environment variables. `envp` is a pointer to a
+/// sequence of null-terminated strings terminated by a final null byte.
+/// Returns the new PID, or `u64::MAX` on failure.
+fn spawn_env(module: u64, envp: *const u8, envp_len: u64) -> u64 {
+    syscall3(SYS_SPAWN_ENV, module, envp as u64, envp_len)
+}
+
+/// Query the state of process `pid`. Returns:
+///   0 = running, 1 = exited, 2 = unknown.
+fn get_status(pid: u64) -> u64 {
+    syscall3(SYS_GET_STATUS, pid, 0, 0)
+}
+
+/// Retrieve the environment pointer and length for the current process.
+/// Writes `[envp, len]` to `out`. Returns 0 on success.
+fn getenvp(out: &mut [u64; 2]) -> u64 {
+    syscall3(SYS_GETENVP, out.as_mut_ptr() as u64, 0, 0)
+}
+
+/// Read and drain up to `max` bytes from `target_pid`'s log ring buffer into
+/// `out`. Returns the number of bytes copied (0 = nothing buffered).
+fn log_read(target_pid: u64, out: &mut [u8], max: u64) -> u64 {
+    syscall3(SYS_LOG_READ, target_pid, out.as_mut_ptr() as u64, max)
+}
+
+/// Send a signal to a process. signal=15 (SIGTERM), signal=9 (SIGKILL).
+/// Returns 0 on success, u64::MAX on error.
+fn kill(target_pid: u64, signal: u64) -> u64 {
+    syscall3(SYS_KILL, target_pid, signal, 0)
+}
+
+/// Block until `target_pid` has exited, then return its exit code.
+/// Returns u64::MAX on error.
+fn wait_pid(target_pid: u64) -> u64 {
+    syscall3(SYS_WAIT_PID, target_pid, 0, 0)
+}
+
 /// Client helper: send one request to the file-service and block for its
 /// one-word reply. The client holds no device authority — every answer comes
 /// from the service doing the disk work on its behalf.
@@ -1872,6 +1915,53 @@ fn combined_client() -> ! {
         print("erlaubt (?!)\n");
     }
 
+    // Retrieve environment (set by parent via SPAWN_ENV).
+    let mut env_info = [0u64; 2];
+    if getenvp(&mut env_info) == 0 && env_info[1] != 0 {
+        print("[Client] ENV: ");
+        print_u64(env_info[1]);
+        print(" Bytes ab 0x");
+        print_hex(env_info[0], 8);
+        print("\n");
+        // Walk and print the env strings.
+        let base = env_info[0] as *const u8;
+        let len = env_info[1] as usize;
+        let mut i = 0;
+        while i < len {
+            let mut end = i;
+            while end < len {
+                let ch = unsafe { core::ptr::read_volatile(base.add(end)) };
+                if ch == 0 {
+                    break;
+                }
+                end += 1;
+            }
+            if end > i {
+                print("   ");
+                // Print the string byte by byte
+                for j in i..end {
+                    let ch = unsafe { core::ptr::read_volatile(base.add(j)) };
+                    write(&[ch]);
+                }
+                print("\n");
+            }
+            i = end + 1; // skip null terminator
+            if i < len {
+                let ch = unsafe { core::ptr::read_volatile(base.add(i - 1)) };
+                // Double-null = end of env block
+                if i >= 2 {
+                    let prev = unsafe { core::ptr::read_volatile(base.add(i - 2)) };
+                    let _ = ch;
+                    if prev == 0 && i >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        print("[Client] Kein ENV gesetzt\n");
+    }
+
     // Wait until both services are ready.
     print("[Client] warte auf Service-Bereitschaft...\n");
     let mut bits = 0u64;
@@ -1899,6 +1989,135 @@ fn combined_client() -> ! {
         print("  (");
         print_u64(request(OP_FSIZE, i));
         print(" B)\n");
+    }
+
+    // 1b. Deployment-Demo — SPAWN_ENV + GET_STATUS + GETENVP
+    print("[Client] Deployment-Demo: SPAWN_ENV + GET_STATUS + GETENVP\n");
+    // Build an environment block: two null-terminated strings + trailing null.
+    let env1 = b"BROCK_DATA_DIR=/data\0";
+    let env2 = b"RUST_LOG=info\0";
+    let env_total_len = (env1.len() + env2.len() + 1) as u64;
+    // We need the env data in OUR address space to pass it to spawn_env.
+    // Use a stack buffer and copy.
+    let mut env_buf = [0u8; 128];
+    let mut off = 0usize;
+    for b in env1.iter() {
+        env_buf[off] = *b;
+        off += 1;
+    }
+    for b in env2.iter() {
+        env_buf[off] = *b;
+        off += 1;
+    }
+    env_buf[off] = 0; // trailing null
+    off += 1;
+    let child_pid = spawn_env(0, env_buf.as_ptr(), off as u64);
+    if child_pid == u64::MAX {
+        print("   spawn_env: FEHLER\n");
+    } else {
+        print("   spawn_env: pid ");
+        print_u64(child_pid);
+        print(" erzeugt\n");
+        // Check status of the child — it should be running (0).
+        let st = get_status(child_pid);
+        print("   get_status(pid ");
+        print_u64(child_pid);
+        print(") = ");
+        print_u64(st);
+        if st == 0 {
+            print(" (running)\n");
+        } else {
+            print(" (unexpected)\n");
+        }
+        // Check status of a non-existent PID.
+        let st_bad = get_status(99999);
+        print("   get_status(99999) = ");
+        print_u64(st_bad);
+        if st_bad == 2 {
+            print(" (unknown — korrekt)\n");
+        } else {
+            print(" (unexpected)\n");
+        }
+        // Log-Streaming: the child writes via SYS_WRITE (captured in ring buffer),
+        // we read it here via SYS_LOG_READ. Give the child a moment to produce
+        // output, then drain its log.
+        // (The child is already running and will print env + authority check.)
+        // Poll a few times with a short busy-wait to let the child run.
+        for _ in 0..4 {
+            syscall3(SYS_YIELD, 0, 0, 0);
+        }
+        let mut log_buf = [0u8; 512];
+        let n = log_read(child_pid, &mut log_buf, 512);
+        if n > 0 {
+            print("   log_read(pid ");
+            print_u64(child_pid);
+            print("): ");
+            print_u64(n);
+            print(" Bytes\n");
+            print("   ┌──────────────────────────────────\n");
+            // Print the log line by line, prefixed with │
+            print("   │ ");
+            for i in 0..n as usize {
+                let c = log_buf[i];
+                if c == b'\n' {
+                    print("\n   │ ");
+                } else if c >= 0x20 && c < 0x7f {
+                    write(&[c]);
+                } else {
+                    write(&[b'.']);
+                }
+            }
+            print("\n   └──────────────────────────────────\n");
+        } else {
+            print("   log_read(pid ");
+            print_u64(child_pid);
+            print("): kein Output (noch leer)\n");
+        }
+
+        // Kill + Wait_PID Demo — spawn a short-lived child, kill it, verify exit code.
+        print("[Client] Kill + Wait_PID Demo\n");
+        let kill_child = spawn(0);
+        if kill_child == u64::MAX {
+            print("   spawn für Kill-Test: FEHLER\n");
+        } else {
+            print("   kill_child pid=");
+            print_u64(kill_child);
+            print(" erzeugt\n");
+            // Let the child start (it enters combined_client and checks authority).
+            syscall3(SYS_YIELD, 0, 0, 0);
+            syscall3(SYS_YIELD, 0, 0, 0);
+            // Kill it with SIGTERM (15).
+            let kr = kill(kill_child, 15);
+            print("   kill(pid=");
+            print_u64(kill_child);
+            print(", SIGTERM) = ");
+            print_u64(kr);
+            if kr == 0 {
+                print(" (ok)\n");
+            } else {
+                print(" (fehlgeschlagen)\n");
+            }
+            // Reap: wait_pid returns the exit code.
+            let ec = wait_pid(kill_child);
+            print("   wait_pid(pid=");
+            print_u64(kill_child);
+            print(") = ");
+            print_u64(ec);
+            if ec == 15 {
+                print(" (SIGTERM — korrekt)\n");
+            } else {
+                print(" (unerwartet)\n");
+            }
+            // Verify: status should now be "exited" (1).
+            let st = get_status(kill_child);
+            print("   get_status(nach Kill) = ");
+            print_u64(st);
+            if st == 1 {
+                print(" (exited — korrekt)\n");
+            } else {
+                print(" (unerwartet)\n");
+            }
+        }
     }
 
     // 2. Network Service Test — two concurrent sockets.

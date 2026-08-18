@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-08-18. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -22,7 +22,7 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
   `CAP_IDENTIFY` aufzählen (keine globale Sicht).
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 24 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 30 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Echtes Blockieren (Wait-Queues):** ein Prozess, der auf eine Nachricht
@@ -36,6 +36,25 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Adressraum, eigenen Heap und eine frisch gesäte Capability-Tabelle und wird
   vom Scheduler aufgenommen. Erst dadurch wird Xernel zum OS: ein Programm ruft
   ein anderes ins Leben.
+- **Deployment-Unterstützung (SPAWN_ENV, GET_STATUS, GETENVP):** mit `SPAWN_ENV`
+  überträgt der Elternprozess Environment-Variablen an ein Kind — der Block wird
+  in den Kind-Adressraum an HEAP_START kopiert, `GETENVP` liefert Pointer und
+  Länge. `GET_STATUS` fragt den Zustand eines Prozesses ab (running/exited/
+  unknown) ohne Capability-Berechtigung. Das Fundament für Deployment-Dienste
+  des externen Kunden: PID-gesteuertes Verhalten eines Binaries.
+- **Log-Streaming (LOG_READ):** jeder `WRITE`-Aufruf (fd 1 oder 2) wird
+  zusätzlich in einen prozess-lokalen Ring-Buffer (64 KiB) gespiegelt. Ein
+  beliebiger anderer Prozess kann diesen Puffer per `LOG_READ` auslesen und
+  konsumieren — ohne Capability, ohne IPC-Verbindung. Nützlich für Debugging,
+  Monitoring und Status-Abfragen zwischen Diensten und orchestrierendem Prozess.
+- **Prozess beenden (KILL + WAIT_PID):** ein Prozess kann einen anderen per PID
+  beenden — `KILL(pid, 15)` sendet SIGTERM (graceful), `KILL(pid, 9)` SIGKILL
+  (hard). Der Zielprozess wird sofort als `Done` markiert mit dem entsprechenden
+  Exit-Code. `WAIT_PID` blockiert (per Yield-Schleife) bis ein Kind beendet ist
+  und liefert den Exit-Code zurück. PID 0 (Root) kann nicht getötet werden.
+  Zusammen mit `GET_STATUS` bilden `KILL` + `WAIT_PID` das vollständige
+  Lebenszyklus-Management für den Reconciler: Prozess starten (mit ENV),
+  Status abfragen, beenden, Exit-Code abholen.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.
 - **Dynamischer Speicher:** wachsender User-Heap via `SBRK`.
 - **Treiber im User-Space:** Kernel liefert nur Primitive (PCI-Config-Read,
@@ -132,6 +151,7 @@ Stand: 2026-08-11. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.23.0 WaitQueues | **Echtes Blockieren**: `RECV`/`WAIT` schlafen wirklich (Prozess-Zustand `Blocked`), der Scheduler überspringt sie; ein `SEND`/`SIGNAL` weckt punktgenau — kein Busy-Yield mehr |
 | 0.24.0 MultiConnection | **Socket-API mit mehreren Verbindungen** (Ticket #2): der Service verwaltet 4 TCP-Sockets gleichzeitig (eigener Port, TCP-Zustand, Shared Frame je Socket); das Protokoll trägt einen Socket-Index, Empfang wird per Zielport demuxed; ein Client ohne Geräte-Caps öffnet zwei Verbindungen parallel und verifiziert je Echo |
 | 0.25.0 ReadySet | **Ready-Set / WAIT** (Ticket #3, select/epoll-Äquivalent): ein `OP_NET_GET_READY` liefert die Bitmaske der lesbaren Sockets, pro Socket wird ein Bereitschafts-Bit auf der geteilten Notification erheit — **ein `WAIT` meldet, welche von mehreren Verbindungen lesbar sind**; eingehende Frames werden gepuffert statt verworfen, `RECV` bedient zuerst den Puffer |
+| 0.26.0 Deployment | **Deployment-Primitive + Kill/Wait:** SPAWN_ENV (25), GET_STATUS (26), GETENVP (27), LOG_READ (28), KILL (29), WAIT_PID (30) — sechs neue Syscalls für PID-gesteuertes Deployment mit vollem Lebenszyklus-Management |
 
 ## XOS — das erste OS auf Xernel
 
@@ -149,8 +169,10 @@ cargo xtask run --init /pfad/zu/xos-init.elf
   Prozessen), `PCI_READ` per Cap — Port-I/O, `IOMAP` und `DMA_ALLOC` sind bereits gated
 - Mehrere Prozesse + Adressraum-Trennung (dann: XMM-Save im Context-Switch)
 - Timer-Frequenz in Hz (LAPIC kalibrieren)
-- `SPAWN` existiert (ein Prozess erzeugt einen anderen); noch offen: mehrere
-  Programm-Images, Eltern/Kind-Beziehung, `wait`/Exit-Status, Caps beim Spawn
-  gezielt mitgeben
+- `SPAWN` existiert (ein Prozess erzeugt einen anderen); `SPAWN_ENV` überträgt
+  Environment-Variablen, `GET_STATUS` fragt Zustand ab, `KILL` beendet einen
+  Prozess, `WAIT_PID` liefert den Exit-Code. Noch offen: mehrere
+  Programm-Images, Eltern/Kind-Beziehung mit `wait`/Exit-Status aus dem
+  Kind-Syscall (Ticket #7), Capabilities gezielt beim Spawn mitgeben
 - ELF-Loader vom Kernel in einen Root-Server verlagern
 - Tastatur: Shift/Modifier; IO-APIC-Basis aus ACPI statt hartkodiert

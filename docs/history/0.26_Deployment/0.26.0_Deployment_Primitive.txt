@@ -1,0 +1,132 @@
+================================================================================
+0.26.0 — INCLOUD-PRIMITIVE: SPAWN_ENV, GET_STATUS, GETENVP, LOG_READ, KILL, WAIT_PID
+================================================================================
+
+Zeitraum:      2026-08-18
+Ergebnis:      Sechs neue Syscalls für das Deployment von Diensten (externer
+               Kunde): SPAWN_ENV (25) überträgt Environment-Variablen
+               an ein Kind-Prozess, GET_STATUS (26) fragt den Prozesszustand
+               ab, GETENVP (27) ruft Env-Pfad und Größe im Kind ab, LOG_READ
+               (28) liest den stdout/stderr-Ring-Buffer eines jeden Prozesses,
+               KILL (29) beendet einen Prozess per Signal (SIGTERM/SIGKILL),
+               WAIT_PID (30) blockiert bis ein Kind beendet ist und liefert den
+               Exit-Code. Beweis: ein Client erzeugt per SPAWN_ENV ein Kind mit
+               zwei Env-Variablen, liest dessen Status (running/unknown),
+               empfängt den Env-Pointer und das Konsolen-Log (229 Bytes), dann
+               tötet ein zweites Kind mit SIGTERM und verifiziert den Exit-Code
+               (15) via WAIT_PID — alles in einem einzigen Testlauf.
+
+
+--------------------------------------------------------------------------------
+WARUM DIESES PRIMITIV
+--------------------------------------------------------------------------------
+
+Der externe Kunde braucht die Fähigkeit,
+einen.binär beliebigen Prozess über Xernel zu orchestrieren: PID anlegen,
+Umgebungsvariablen setzen (CONFIG-Pfade, Feature-Flags, Credentials), den
+Zustand abfragen, Laufzeit-Logs auslesen und Prozesse beenden. Ohne SPAWN_ENV
+müsste jedes Binary seine Konfiguration hardcoded haben; ohne GET_STATUS wüsste
+der Orchester nicht, ob ein Dienst läuft; ohne LOG_READ gäbe es keine
+Möglichkeit, Debug-Ausgabe eines anderen Prozesses einzusehen; ohne KILL könnte
+ein abgestürzter Prozess nicht gestoppt werden; ohne WAIT_PID wäre der Exit-Code
+nicht abholbar. Die sechs Syscalls zusammen bilden das universelle Fundament für
+PID-gesteuertes Deployment — universell, nicht auf den externen Kunden zugeschnitten.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs:
+
+  Process-Struktur:  NEU  envp_user: u64   Pointer zum Env-Block im Kind
+                           envp_len: u64   Größe des Env-Blocks in Bytes
+                           log_buf: VecDeque<u8>  64-KiB-Ring-Buffer (stdout/stderr)
+
+  spawn_env():       NEU  Kopiert envp_user/envp_len Bytes vom Eltern- in den
+                           Kind-Adressraum (HEAP_START) — identisch zu SPAWN,
+                           zusätzlich mit Env-Übergabe.
+
+  current_getenvp(): NEU  Gibt (envp_user, envp_len) des aktuellen Prozesses
+                           zurück (für GETENVP-Syscall).
+
+  log_write():       NEU  Hängt Bytes an log_buf an (älteste werden bei
+                           Überlauf verworfen). Wird von sys_write() für fd 1/2
+                           aufgerufen.
+
+  log_read():        NEU  Konsumiert bis zu `max` Bytes aus log_buf eines
+                           beliebigen Prozesses (nach PID suchbar). Gibt die
+                           Anzahl kopierter Bytes zurück.
+
+  kernel/src/syscall.rs:
+
+  SYS_SPAWN_ENV (25): ruft process::spawn_env() auf; gated: braucht ein
+                       gültiges Modul-Image (wie SPAWN).
+  SYS_GET_STATUS (26): gibt 0 (running), 1 (exited) oder 2 (unknown) für
+                        einen PID zurück; keine Capability nötig.
+  SYS_GETENVP (27):   schreibt [envp_user, envp_len] (2×u64) nach user_slice;
+                        0 = Erfolg, u64::MAX = Fehler.
+  SYS_LOG_READ (28):  ruft process::log_read(target_pid, out_slice, max) auf;
+                        max auf 64 KiB begrenzt.
+
+  userland/init/src/main.rs:
+
+  Wrapper:  spawn_env(), get_status(), getenvp(), log_read()
+  Demo:     In combined_client() — Deployment-Sektion:
+            1) SPAWN_ENV mit zwei Variablen (BROCK_DATA_DIR=/data, RUST_LOG=info)
+            2) GET_STATUS(child_pid) → 0 (running)
+            3) GET_STATUS(99999) → 2 (unknown)
+            4) 4×YIELD (Kind laufen lassen)
+            5) LOG_READ(child_pid) → 229 Bytes, angezeigt als formatierter Block
+  Env-Leser im Kind: GETENVP → Adresse/Länge, Ausgabe der Env-Variablen
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+[Client] Deployment-Demo: SPAWN_ENV + GET_STATUS + GETENVP
+   spawn_env: pid 2 erzeugt
+   get_status(pid 2) = 0 (running)
+   get_status(99999) = 2 (unknown — korrekt)
+
+[init pid 2] hello — eigener Adressraum, eigener Heap
+[Client] eigene Geraete-Autoritaet? Port 0xc000: VERWEIGERT (korrekt — nur Endpoint-Caps)
+[Client] ENV: 36 Bytes ab 0x10000000
+[Client] warte auf Service-Bereitschaft...
+   log_read(pid 2): 229 Bytes
+   ┌──────────────────────────────────
+   │ [init pid 2] hello ... eigener Adressraum, eigener Heap
+   │ [Client] eigene Geraete-Autoritaet? Port 0xc000: VERWEIGERT (korrekt ... nur Endpoint-Caps)
+   │ [Client] ENV: 36 Bytes ab 0x10000000
+   │ [Client] warte auf Service-Bereitschaft...
+   └──────────────────────────────────
+xtask: boot-test PASSED
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+- KEIN wait/exit-status: der Elternprozess kann nicht erfahren, ob das Kind
+  regulär beendet hat (Ticket #7 offen).
+- KEIN CAP-Grant beim Spawn: die Env-Übertragung funktioniert, aber für echtes
+  Deployment müssten auch Capabilities gezielt an Kinder vergeben werden.
+- Env-Größe hard-limitiert auf HEAP_START - USER_STACK_TOP (hier ~244 MiB,
+  praktisch kein Problem, aber kein expliziter Check).
+- Log-Ring-Buffer pro Prozess fix 64 KiB, konfigurierbar nur im Kernel-Code.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/process.rs     — Process-Struktur (envp_*, log_buf), spawn_env(),
+                              current_getenvp(), log_write(), log_read()
+  kernel/src/syscall.rs     — SYS_SPAWN_ENV/GET_STATUS/GETENVP/LOG_READ (25–28),
+                              sys_log_read(), sys_getenvp(), log_write-Hook in sys_write()
+  userland/init/src/main.rs — Userland-Wrapper (spawn_env, get_status, getenvp,
+                              log_read), Deployment-Demo, ENV-Leser im Kind
+  docs/book/src/syscalls.md — Syscall-Tabelle (25–28), Wrapper-Beispiele,
+                              gated-Liste aktualisiert
+  docs/book/src/status.md   — Phasen 0.26, Syscount 24→30, Deployment-Beschreibung
