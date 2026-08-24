@@ -35,13 +35,11 @@ käme später in den User-Space).
    `docs/history/` (Format → Rezept E). Reproduzierbares Erzähl-Protokoll, deutsch.
 4. **Vor JEDEM `git push`: gründlicher PII-/Secret-Scan.** Siehe Abschnitt 7. Das
    ist nicht verhandelbar.
-5. **Commit-Nachrichten enden mit:**
-   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
-6. **Universelle Fundamente bauen**, nicht auf einen einzelnen Nutzer hin
+5. **Universelle Fundamente bauen**, nicht auf einen einzelnen Nutzer hin
    optimieren. Wenn ein externer Wunsch kommt: bau die *allgemeine*
    Form davon (Beispiel: aus "wir brauchen epoll" wurde das generische
    Notification-Primitiv, das jedem Service nützt).
-7. **Sei ehrlich, nicht gefällig.** Sag, was *läuft* vs. was *produktionsreif* ist.
+6. **Sei ehrlich, nicht gefällig.** Sag, was *läuft* vs. was *produktionsreif* ist.
    Lass dich von Druck/Deadlines nicht zu Pfusch drängen.
 
 ---
