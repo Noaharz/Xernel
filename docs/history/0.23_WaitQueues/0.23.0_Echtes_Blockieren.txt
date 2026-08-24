@@ -26,7 +26,7 @@ wieder vergeblich. Das ist Busy-Polling: korrekt, aber Verschwendung — ein
 wartender Prozess frisst Scheduler-Slots und CPU, obwohl er nichts tun kann.
 
 Ein echtes OS parkt einen Warter und weckt ihn punktgenau. Das ist die
-Voraussetzung für Effizienz unter Last (man denke an Externer Kundes Server mit
+Voraussetzung für Effizienz unter Last (man denke an einen Server mit
 hunderten wartenden Verbindungen — jede einzelne darf nicht spinnen).
 
 
