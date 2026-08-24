@@ -40,8 +40,8 @@ Stand: 2026-08-18. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   überträgt der Elternprozess Environment-Variablen an ein Kind — der Block wird
   in den Kind-Adressraum an HEAP_START kopiert, `GETENVP` liefert Pointer und
   Länge. `GET_STATUS` fragt den Zustand eines Prozesses ab (running/exited/
-  unknown) ohne Capability-Berechtigung. Das Fundament für Deployment-Dienste
-  des externen Kunden: PID-gesteuertes Verhalten eines Binaries.
+  unknown) ohne Capability-Berechtigung. Das Fundament für Deployment-Dienste:
+  PID-gesteuertes Verhalten eines Binaries.
 - **Log-Streaming (LOG_READ):** jeder `WRITE`-Aufruf (fd 1 oder 2) wird
   zusätzlich in einen prozess-lokalen Ring-Buffer (64 KiB) gespiegelt. Ein
   beliebiger anderer Prozess kann diesen Puffer per `LOG_READ` auslesen und
@@ -53,7 +53,7 @@ Stand: 2026-08-18. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   Exit-Code. `WAIT_PID` blockiert (per Yield-Schleife) bis ein Kind beendet ist
   und liefert den Exit-Code zurück. PID 0 (Root) kann nicht getötet werden.
   Zusammen mit `GET_STATUS` bilden `KILL` + `WAIT_PID` das vollständige
-  Lebenszyklus-Management für den Reconciler: Prozess starten (mit ENV),
+  Lebenszyklus-Management für einen Orchestrator: Prozess starten (mit ENV),
   Status abfragen, beenden, Exit-Code abholen.
 - **Tastatur:** PS/2 über IO-APIC, blockierendes und nicht-blockierendes Lesen.
 - **Dynamischer Speicher:** wachsender User-Heap via `SBRK`.
@@ -165,9 +165,10 @@ cargo xtask run --init /pfad/zu/xos-init.elf
 
 ## Noch offen
 
-- Capabilities: Delegation (`invoke(cap, method, args)`, copy/grant zwischen
-  Prozessen), `PCI_READ` per Cap — Port-I/O, `IOMAP` und `DMA_ALLOC` sind bereits gated
-- Mehrere Prozesse + Adressraum-Trennung (dann: XMM-Save im Context-Switch)
+- Capabilities: `invoke(cap, method, args)` als generischer Aufruf und `PCI_READ`
+  per Cap — Port-I/O, `IOMAP` und `DMA_ALLOC` sind gated, Grant zwischen
+  Prozessen läuft seit 0.17
+- XMM-Save im Context-Switch (Adressraum-Trennung selbst läuft seit 0.11)
 - Timer-Frequenz in Hz (LAPIC kalibrieren)
 - `SPAWN` existiert (ein Prozess erzeugt einen anderen); `SPAWN_ENV` überträgt
   Environment-Variablen, `GET_STATUS` fragt Zustand ab, `KILL` beendet einen

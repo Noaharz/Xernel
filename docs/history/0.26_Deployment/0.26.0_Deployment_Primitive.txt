@@ -1,11 +1,11 @@
 ================================================================================
-0.26.0 — INCLOUD-PRIMITIVE: SPAWN_ENV, GET_STATUS, GETENVP, LOG_READ, KILL, WAIT_PID
+0.26.0 — DEPLOYMENT-PRIMITIVE: SPAWN_ENV, GET_STATUS, GETENVP, LOG_READ, KILL, WAIT_PID
 ================================================================================
 
 Zeitraum:      2026-08-18
-Ergebnis:      Sechs neue Syscalls für das Deployment von Diensten (externer
-               Kunde): SPAWN_ENV (25) überträgt Environment-Variablen
-               an ein Kind-Prozess, GET_STATUS (26) fragt den Prozesszustand
+Ergebnis:      Sechs neue Syscalls für das Deployment von Diensten:
+               SPAWN_ENV (25) überträgt Environment-Variablen an ein
+               Kind-Prozess, GET_STATUS (26) fragt den Prozesszustand
                ab, GETENVP (27) ruft Env-Pfad und Größe im Kind ab, LOG_READ
                (28) liest den stdout/stderr-Ring-Buffer eines jeden Prozesses,
                KILL (29) beendet einen Prozess per Signal (SIGTERM/SIGKILL),
@@ -21,16 +21,15 @@ Ergebnis:      Sechs neue Syscalls für das Deployment von Diensten (externer
 WARUM DIESES PRIMITIV
 --------------------------------------------------------------------------------
 
-Der externe Kunde braucht die Fähigkeit,
-einen.binär beliebigen Prozess über Xernel zu orchestrieren: PID anlegen,
-Umgebungsvariablen setzen (CONFIG-Pfade, Feature-Flags, Credentials), den
-Zustand abfragen, Laufzeit-Logs auslesen und Prozesse beenden. Ohne SPAWN_ENV
-müsste jedes Binary seine Konfiguration hardcoded haben; ohne GET_STATUS wüsste
-der Orchester nicht, ob ein Dienst läuft; ohne LOG_READ gäbe es keine
-Möglichkeit, Debug-Ausgabe eines anderen Prozesses einzusehen; ohne KILL könnte
-ein abgestürzter Prozess nicht gestoppt werden; ohne WAIT_PID wäre der Exit-Code
-nicht abholbar. Die sechs Syscalls zusammen bilden das universelle Fundament für
-PID-gesteuertes Deployment — universell, nicht auf den externen Kunden zugeschnitten.
+Ein orchestrierender Prozess braucht die Fähigkeit, ein beliebiges Binary über
+Xernel zu verwalten: PID anlegen, Umgebungsvariablen setzen (CONFIG-Pfade,
+Feature-Flags, Credentials), den Zustand abfragen, Laufzeit-Logs auslesen und
+Prozesse beenden. Ohne SPAWN_ENV müsste jedes Binary seine Konfiguration
+hardcoded haben; ohne GET_STATUS wüsste der Orchestrator nicht, ob ein Dienst
+läuft; ohne LOG_READ gäbe es keine Möglichkeit, Debug-Ausgabe eines anderen
+Prozesses einzusehen; ohne KILL könnte ein abgestürzter Prozess nicht gestoppt
+werden; ohne WAIT_PID wäre der Exit-Code nicht abholbar. Die sechs Syscalls
+zusammen bilden das universelle Fundament für PID-gesteuertes Deployment.
 
 
 --------------------------------------------------------------------------------
@@ -73,7 +72,7 @@ DER MECHANISMUS
 
   Wrapper:  spawn_env(), get_status(), getenvp(), log_read()
   Demo:     In combined_client() — Deployment-Sektion:
-            1) SPAWN_ENV mit zwei Variablen (BROCK_DATA_DIR=/data, RUST_LOG=info)
+            1) SPAWN_ENV mit zwei Variablen (XERNEL_DATA_DIR=/data, RUST_LOG=info)
             2) GET_STATUS(child_pid) → 0 (running)
             3) GET_STATUS(99999) → 2 (unknown)
             4) 4×YIELD (Kind laufen lassen)
@@ -92,13 +91,13 @@ DER BEWEIS (cargo xtask run --test)
 
 [init pid 2] hello — eigener Adressraum, eigener Heap
 [Client] eigene Geraete-Autoritaet? Port 0xc000: VERWEIGERT (korrekt — nur Endpoint-Caps)
-[Client] ENV: 36 Bytes ab 0x10000000
+[Client] ENV: 37 Bytes ab 0x10000000
 [Client] warte auf Service-Bereitschaft...
    log_read(pid 2): 229 Bytes
    ┌──────────────────────────────────
    │ [init pid 2] hello ... eigener Adressraum, eigener Heap
    │ [Client] eigene Geraete-Autoritaet? Port 0xc000: VERWEIGERT (korrekt ... nur Endpoint-Caps)
-   │ [Client] ENV: 36 Bytes ab 0x10000000
+   │ [Client] ENV: 37 Bytes ab 0x10000000
    │ [Client] warte auf Service-Bereitschaft...
    └──────────────────────────────────
 xtask: boot-test PASSED

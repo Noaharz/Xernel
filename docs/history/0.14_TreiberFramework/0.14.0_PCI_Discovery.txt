@@ -6,7 +6,7 @@ Zeitraum:      2026-05-31
 Kontext:       Mit Prozess-Isolation + preemptivem Multitasking (0.11-0.13) ist
                die Voraussetzung da, Treiber als eigene User-Space-Prozesse zu
                bauen — die Mikrokernel-Vision (Crash eines Treibers != Kernel-
-               Panic) und Externer Kundes Storage-Bedarf.
+               Panic) und der Storage-Bedarf des externen Kunden.
 Ergebnis:      Ein User-Space-Prozess scannt den PCI-Bus und FINDET die
                virtio-blk-Disk — der erste Schritt eines User-Space-Block-
                Treibers. Hardware-Discovery komplett ausserhalb des Kernels.

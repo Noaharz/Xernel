@@ -1994,7 +1994,7 @@ fn combined_client() -> ! {
     // 1b. Deployment-Demo — SPAWN_ENV + GET_STATUS + GETENVP
     print("[Client] Deployment-Demo: SPAWN_ENV + GET_STATUS + GETENVP\n");
     // Build an environment block: two null-terminated strings + trailing null.
-    let env1 = b"BROCK_DATA_DIR=/data\0";
+    let env1 = b"XERNEL_DATA_DIR=/data\0";
     let env2 = b"RUST_LOG=info\0";
     let env_total_len = (env1.len() + env2.len() + 1) as u64;
     // We need the env data in OUR address space to pass it to spawn_env.

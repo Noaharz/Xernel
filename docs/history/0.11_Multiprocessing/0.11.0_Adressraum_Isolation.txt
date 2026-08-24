@@ -3,7 +3,7 @@
 ================================================================================
 
 Zeitraum:      2026-05-31
-Kontext:       Mehrere Userland-Nutzer (XOS, Externer Kunde). Externer Kundes Beschwerde
+Kontext:       Mehrere Userland-Nutzer (XOS, externer Kunde). Dessen Beschwerde
                nannte u.a. "Mehrere Prozesse / Multitasking". Das ist KEIN
                Ein-User-Wunsch, sondern der Schlussstein der Mikrokernel-Vision:
                Treiber, Dateisysteme, Netz sollen als getrennte, isolierte
@@ -132,8 +132,8 @@ WARUM DAS UNIVERSELL IST (NICHT FÜR EINEN NUTZER)
 Adressraum-Isolation ist das Fundament JEDES echten OS und genau unsere
 Mikrokernel-Vision: ab hier können Treiber/FS/Netz als getrennte, abgesicherte
 User-Prozesse entstehen (Crash eines Treibers != Kernel-Panic). XOS (mehrere
-Programme), Externer Kunde (Services) und ein künftiges AR-OS (Apps) profitieren
-alle. KVM/Hypervisor (Externer Kundes Niche-Wunsch) bleibt bewusst aussen vor.
+Programme), der externe Kunde (Services) und ein künftiges AR-OS (Apps)
+profitieren alle. KVM/Hypervisor (dessen Niche-Wunsch) bleibt aussen vor.
 
 
 --------------------------------------------------------------------------------
