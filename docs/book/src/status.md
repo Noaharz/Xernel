@@ -163,6 +163,13 @@ verbunden nur durch die Syscall-ABI. Booten ohne Kernel-Eingriff:
 cargo xtask run --init /pfad/zu/xos-init.elf
 ```
 
+## Portierung
+
+Xernel ist heute **x86_64-only**. Als zweites Target ist **aarch64** (QEMU
+`virt`) beschlossen — noch keine Zeile Code, siehe [Vision](vision.md) für den
+Umfang (Boot, MMU, EL0/EL1, GIC, PL011, virtio-mmio). Bis dahin gilt jede
+Aussage in diesem Dokument ausschließlich für x86_64.
+
 ## Noch offen
 
 - Capabilities: `invoke(cap, method, args)` als generischer Aufruf und `PCI_READ`
