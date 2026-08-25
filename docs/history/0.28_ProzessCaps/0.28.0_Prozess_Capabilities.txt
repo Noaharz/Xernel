@@ -1,0 +1,196 @@
+================================================================================
+0.28.0 — PROZESSE SIND CAPABILITIES: SCHLUSS MIT AUTORITÄT AUS EINER PID
+================================================================================
+
+Zeitraum:      2026-08-25
+Ergebnis:      Ein Prozess kann einen anderen nur noch anfassen, wenn er eine
+               Process-Capability für ihn hält. SPAWN und SPAWN_ENV geben sie
+               dem Elternprozess zurück; KILL, WAIT_PID, GET_STATUS und LOG_READ
+               nehmen ab jetzt einen Cap-Slot statt einer PID. Neu dazu:
+               CAP_GRANT (31) legt eine eigene Capability direkt in die CSpace
+               eines anderen Prozesses — auch bevor der das erste Mal läuft.
+               Damit ist Ticket #7 zu. Beweis: ein Kind ohne jede Autorität
+               bekommt vom Elternprozess eine Frame-Cap hineingelegt, mappt sie
+               und liest, was der Elternprozess dort hinterlassen hat.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS EINE SCHULD WAR, KEIN FEATURE
+--------------------------------------------------------------------------------
+
+Phase 0.26.0 hat sechs Deployment-Syscalls gebracht und dabei die eigene goldene
+Regel gebrochen. Im Code stand wörtlich:
+
+    /// Any process can kill any other process (no capability needed — this is a
+    /// single-tenant OS; in a multi-tenant model this would be gated).
+
+Das ist genau die ambiente Berechtigung, die Xernel für Hardware seit 0.15
+abgeschafft hat. Port-I/O braucht eine IoPort-Cap, MMIO eine IoMem-Cap, DMA ein
+Untyped-Budget — aber einen fremden Prozess töten durfte jeder, der dessen PID
+raten konnte. Und PIDs sind fortlaufende kleine Zahlen; raten muss man da nichts.
+
+Dasselbe für LOG_READ: der stdout/stderr-Ringpuffer JEDES Prozesses war für
+jeden Prozess lesbar. In einem System, das Deployment-Dienste tragen soll, ist
+das kein Schönheitsfehler, sondern das Gegenteil der Mandanten-Isolation, für
+die man einen Mikrokernel überhaupt baut.
+
+Der zweite Teil derselben Lücke: ein frisch gespawntes Programm bekam über
+seed_caps nur das geteilte Endpoint-Paar. Es konnte weder eine Datei noch einen
+Socket öffnen, und es gab keinen Weg, ihm gezielt etwas mitzugeben. SPAWN und
+"Autorität haben" waren zwei Dinge, die man nicht verbinden konnte.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  libs/xabi/src/cap.rs:
+
+  CapType::Process = 12   NEU  Neuer Cap-Typ. Angehängt, nie umsortiert — die
+                                Zahlen sind ABI.
+
+  kernel/src/cap.rs:
+
+  CapEntry::process(pid)  NEU  Konstruktor; die PID liegt in `object`.
+  process_pid()           NEU  Liest die PID zurück, None bei jedem anderen Typ.
+                                describe() braucht keine Sonderbehandlung, der
+                                Default-Zweig liefert (12, pid, 0) — CAP_IDENTIFY
+                                zeigt Process-Caps also automatisch an.
+
+  kernel/src/process.rs:
+
+  current_process_pid()   NEU  Slot -> PID, oder None. Der einzige Weg von einem
+                                Cap-Slot zu einer PID.
+  grant_to()              NEU  Kopiert eine CapEntry in die CNode eines
+                                beliebigen Prozesses. Kein Überschreiben: ein
+                                belegter Slot lässt die Operation scheitern.
+  install_process_cap()   NEU  Legt dem Spawner das Handle auf sein Kind hin.
+                                Läuft mit gehaltenem Scheduler-Lock UND bevor
+                                das Kind eingehängt wird — ein ungültiger
+                                Ziel-Slot lässt den Spawn scheitern, statt einen
+                                Prozess zu hinterlassen, den niemand mehr
+                                erreichen kann.
+  spawn(), spawn_env()    ÄND  Zusätzlicher Parameter cap_slot.
+                                u64::MAX = bewusst kein Handle.
+
+  kernel/src/syscall.rs:
+
+  process_target()        NEU  Ein einziger Trichter: Slot -> Process-Cap -> PID,
+                                mit DENY-Zeile im Log. Dass alle
+                                Cross-Prozess-Operationen hier durchmüssen, ist
+                                der Grund, warum keine davon die Prüfung
+                                vergessen kann.
+  sys_get_status(), sys_log_read(), sys_kill(), sys_wait_pid()
+                          ÄND  Nehmen proc_slot statt pid.
+  sys_cap_grant()         NEU  SYS_CAP_GRANT (31).
+
+  userland/init/src/main.rs:
+
+  granted_child()         NEU  Rolle "granted": wartet auf eine Frame-Cap in
+                                Slot 6, mappt sie, liest den Inhalt.
+  cap_grant()             NEU  Wrapper.
+  PROC_SLOT_BASE = 10     NEU  Slots 6..9 sind die Socket-Frames, ab 10 liegen
+                                die Process-Handles.
+
+
+--------------------------------------------------------------------------------
+DIE RACE, DIE DER TESTLAUF SELBST GEZEIGT HAT
+--------------------------------------------------------------------------------
+
+Der Elternprozess muss erst spawnen (nur so bekommt er die Process-Cap) und kann
+erst danach granten. Xernel preemptet aber — das Kind kann dazwischen laufen.
+Genau das ist im Testlauf passiert, und die Ausgabe zeigt es ungeschönt:
+
+    [init pid 2] hello — eigener Adressraum, eigener Heap
+    [Grant-Kind] warte auf delegierte Frame-Cap in Slot 6
+    [cap] DENY map_frame (no Frame capability in slot 6)
+       cap_grant(Frame -> pid 2, Slot 6) = ok
+    [Grant-Kind] Frame gemappt ab 0x70001000, Inhalt: "vom Elternprozess ..."
+
+Das Kind läuft, findet nichts, gibt die CPU ab; der Elternprozess grantet; beim
+nächsten Versuch klappt es. Die Warteschleife im Kind ist bewusst begrenzt
+(200 Versuche), damit ein Kind, dem nie etwas gegeben wird, mit Exit-Code 1
+stirbt statt ewig zu drehen.
+
+Die saubere Form wäre ein Spawn, der den Prozess SUSPENDIERT erzeugt, plus ein
+RESUME: der Elternprozess rüstet in Ruhe aus und lässt das Kind dann los. Das
+ist bewusst nicht Teil dieser Phase — es steht als offener Punkt in status.md.
+Ein Retry-Loop, der ehrlich als Retry-Loop dasteht, ist besser als ein
+verstecktes Timing-Versprechen.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+ spawn: Combined-Client erzeugt, pid 1
+ Cap-Grant-Demo: Frame-Cap an ein frisches Kind delegieren
+[init pid 2] hello — eigener Adressraum, eigener Heap
+[Grant-Kind] warte auf delegierte Frame-Cap in Slot 6
+[cap] DENY map_frame (no Frame capability in slot 6)
+   cap_grant(Frame -> pid 2, Slot 6) = ok
+[Grant-Kind] Frame gemappt ab 0x70001000, Inhalt: "vom Elternprozess delegiert, nicht selbst beschafft"
+[user pid 2] exit(0)
+   Grant-Kind beendet, Exit-Code 0 (hat die delegierte Cap benutzt)
+
+[Client] Deployment-Demo: SPAWN_ENV + GET_STATUS + GETENVP
+   spawn_env: pid 3 erzeugt
+   get_status(Cap-Slot 10) = 0 (running)
+[cap] DENY get_status (no Process capability in slot 19)
+   get_status(leerer Slot) = Fehler (korrekt — keine Process-Cap)
+   log_read(pid 3): 271 Bytes
+
+[Client] Kill + Wait_PID Demo
+   kill(pid=4, SIGTERM) = 0 (ok)
+   wait_pid(pid=4) = 15 (SIGTERM — korrekt)
+   get_status(nach Kill) = 1 (exited — korrekt)
+
+[Client] Fault-Isolation-Demo: Kind faellt auf ungemappte Adresse
+[xernel] user fault: #PF at 0x50000000, code PageFaultErrorCode(USER_MODE)
+[user pid 5] killed by #PF page fault
+   wait_pid(pid=5) = 256 (EXIT_FAULT — vom Kernel getoetet, korrekt)
+
+[Client] Socket 0 TCP verbunden!
+[Client] Socket 1 TCP verbunden!
+[Client] fertig
+xtask: boot-test PASSED
+
+Die entscheidende Zeile ist die DENY-Zeile in der Mitte: derselbe Syscall, den
+der Client mit Cap in Slot 10 erfolgreich aufruft, wird auf einem leeren Slot
+abgewiesen. Vorher gab es diesen Unterschied nicht — es gab nur PIDs.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+- Immer noch nur EIN Programm-Image. SPAWN nimmt einen Index, aber nur 0
+  existiert. Eine Process-Cap auf ein Kind, das dasselbe Binary ist wie man
+  selbst, löst kein Deployment-Problem — das ist die nächste Phase.
+- Kein Spawn-suspended/Resume (siehe oben), deshalb die Warteschleife im Kind.
+- Die Process-Cap kennt keine Rechte-Bits: wer sie hat, darf töten UND das Log
+  lesen UND granten. Eine Aufteilung (kill/read/grant getrennt) wäre die
+  feinkörnige Form.
+- Eine Process-Cap auf einen beendeten Prozess bleibt gültig und liefert weiter
+  Status 1. Solange nichts aufgeräumt wird und PIDs nur wachsen, ist das
+  harmlos; sobald PIDs wiederverwendet werden, braucht die Cap eine Generation.
+- CAP_GRANT kopiert, es widerruft nichts. Eine delegierte Cap bleibt beim
+  Empfänger, bis der sie selbst löscht.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  libs/xabi/src/cap.rs      — CapType::Process = 12
+  kernel/src/cap.rs         — CapEntry::process(), process_pid()
+  kernel/src/process.rs     — current_process_pid(), grant_to(),
+                              install_process_cap(), spawn()/spawn_env() mit
+                              cap_slot
+  kernel/src/syscall.rs     — SYS_CAP_GRANT (31), process_target(),
+                              sys_get_status/log_read/kill/wait_pid auf Cap-Slots
+  userland/init/src/main.rs — cap_grant()-Wrapper, granted_child(), Cap-Grant-Demo
+                              im Root, alle Aufrufstellen auf Slots umgestellt
+  docs/book/src/syscalls.md — Zeilen 20/25/26/28/29/30 neu, Zeile 31 neu,
+                              Abschnitt "Autorität über andere Prozesse"
+  docs/book/src/status.md   — Phase 0.28, 31 Syscalls, offene Punkte neu sortiert

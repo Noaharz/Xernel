@@ -57,6 +57,23 @@ impl CapEntry {
         lo >= base && hi <= base + count
     }
 
+    /// A `Process` capability naming the process with PID `pid`. This is the
+    /// authority `SPAWN` hands back to a parent: without it a process cannot
+    /// touch another one at all. Delegable over an endpoint like any other cap,
+    /// so a supervisor can pass a worker's handle to a monitoring service.
+    pub const fn process(pid: u64) -> Self {
+        Self::new(CapType::Process, pid)
+    }
+
+    /// The PID named by a `Process` capability, or `None` for any other type.
+    pub fn process_pid(&self) -> Option<u64> {
+        if self.cap_type == CapType::Process {
+            Some(self.object)
+        } else {
+            None
+        }
+    }
+
     /// An `IoMem` capability authorizing the physical range `[base, base+len)`.
     /// Physical addresses can be 64-bit (high PCI BARs), so the range uses both
     /// fields: `object` = base, `badge` = length in bytes.
