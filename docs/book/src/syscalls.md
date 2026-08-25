@@ -58,6 +58,17 @@ wenn sie fehlt — es gibt keine ambiente Hardware-Autorität. Mit `CAP_IDENTIFY
 ein Prozess seine eigenen Capabilities aufzählen (nur die eigenen — keine
 globale Sicht).
 
+**User-Zeiger.** Jeder Zeiger, den ein Syscall entgegennimmt, wird nicht nur
+gegen den User-Adressbereich geprüft, sondern Seite für Seite gegen die
+Page-Tables: vorhanden, `USER_ACCESSIBLE`, bei schreibenden Syscalls auch
+schreibbar. Ein ungemappter oder fremder Zeiger liefert `u64::MAX` — der Kernel
+faultet nicht im Namen des Aufrufers.
+
+**Abstürze.** Löst ein Prozess eine CPU-Exception aus (`#PF`, `#GP`, `#UD`, …),
+beendet der Kernel **nur diesen Prozess** und läuft weiter. Sein Exit-Code ist
+dann `256` (`EXIT_FAULT`) — außerhalb dessen, was `EXIT` selbst übergeben kann,
+sodass `WAIT_PID` "abgestürzt" von "regulär beendet" unterscheidet.
+
 > Jeder Prozess läuft in seinem **eigenen Adressraum** (eigene Page-Table) —
 > Speicher ist zwischen Prozessen isoliert. Prozesse laufen **verzahnt**
 > (kooperatives Multitasking über `YIELD`).
