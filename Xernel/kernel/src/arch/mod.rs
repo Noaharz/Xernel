@@ -12,7 +12,8 @@ pub use self::x86_64::{
     framebuffer_info, init_syscalls, init_thread_stack, keyboard_read, keyboard_read_nb,
     keyboard_selftest, map_user, map_user_device, paging_selftest, pci_config_read, port_in,
     port_out, serial_write, set_kernel_stack, switch_context, timer_ticks, unmap_user, usable_regions,
-    user_phys, vspace_alloc_map, vspace_current, vspace_map, vspace_new, vspace_selftest,
+    user_phys, user_range_ok, vspace_alloc_map, vspace_current, vspace_map, vspace_new,
+    vspace_phys, vspace_selftest,
     vspace_switch,
 };
 #[cfg(target_arch = "x86_64")]
@@ -26,7 +27,8 @@ pub use self::aarch64::{
     framebuffer_info, init_syscalls, init_thread_stack, keyboard_read, keyboard_read_nb,
     keyboard_selftest, map_user, map_user_device, paging_selftest, pci_config_read, port_in,
     port_out, serial_write, set_kernel_stack, switch_context, timer_ticks, unmap_user, usable_regions,
-    user_phys, vspace_alloc_map, vspace_current, vspace_map, vspace_new, vspace_selftest,
+    user_phys, user_range_ok, vspace_alloc_map, vspace_current, vspace_map, vspace_new,
+    vspace_phys, vspace_selftest,
     vspace_switch,
 };
 #[cfg(target_arch = "aarch64")]
@@ -40,7 +42,8 @@ pub use self::riscv64::{
     framebuffer_info, init_syscalls, init_thread_stack, keyboard_read, keyboard_read_nb,
     keyboard_selftest, map_user, map_user_device, paging_selftest, pci_config_read, port_in,
     port_out, serial_write, set_kernel_stack, switch_context, timer_ticks, unmap_user, usable_regions,
-    user_phys, vspace_alloc_map, vspace_current, vspace_map, vspace_new, vspace_selftest,
+    user_phys, user_range_ok, vspace_alloc_map, vspace_current, vspace_map, vspace_new,
+    vspace_phys, vspace_selftest,
     vspace_switch,
 };
 #[cfg(target_arch = "riscv64")]

@@ -131,6 +131,27 @@ pub unsafe fn enter_user(entry: u64, user_stack_top: u64) -> ! {
     }
 }
 
+/// Force the GS-base pair into the canonical **"inside the kernel"** state:
+/// `GS.base = &PERCPU`, `KERNEL_GS_BASE = 0` — exactly what the entry stub's
+/// closing `swapgs` expects to undo.
+///
+/// A CPU exception does *not* `swapgs`, so a handler entered from ring 3 runs
+/// with the pair still in the "running user" state. That is harmless while the
+/// handler only reads and panics, but a handler that kills the process and
+/// switches to another one leaves the imbalance behind: the successor resumes
+/// inside the syscall it was parked in and runs that syscall's closing
+/// `swapgs`, which now moves the per-CPU pointer the wrong way. The next
+/// `syscall` then swaps in `GS.base = 0` and `mov gs:[8], rsp` faults at
+/// address 0x8 — in ring 0, taking the whole kernel down. This is the same
+/// imbalance [`enter_user`] documents, reached from the other side.
+pub fn gs_force_kernel() {
+    // SAFETY: writing the GS-base MSRs is always safe; both get known values.
+    unsafe {
+        GsBase::write(VirtAddr::new(core::ptr::addr_of!(PERCPU) as u64));
+        KernelGsBase::write(VirtAddr::new(0));
+    }
+}
+
 /// Assembly entry point installed in LSTAR. Switches to the kernel stack, saves
 /// the user register frame, calls [`dispatch`], restores, and `sysretq`s back.
 #[unsafe(naked)]

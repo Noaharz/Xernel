@@ -1900,6 +1900,58 @@ fn request(op: u64, arg: u64) -> u64 {
     r
 }
 
+/// A user address that is mapped in no process: above `HEAP_MAX` (0x2000_0000)
+/// and far below the PCI MMIO window (0xc000_0000). Used to provoke a fault.
+const UNMAPPED_VA: u64 = 0x5000_0000;
+
+/// Exit code the kernel records for a process it killed after a CPU exception
+/// (`process::EXIT_FAULT`). Outside the range a program can pass to `exit()`,
+/// so a parent can tell "crashed" from "exited with this code".
+const EXIT_FAULT: u64 = 0x100;
+
+/// Does the environment block handed to us by `SPAWN_ENV` contain `needle`?
+/// Lets the parent pick a child's role without a second boot module.
+fn env_has(needle: &[u8]) -> bool {
+    let mut info = [0u64; 2];
+    if getenvp(&mut info) != 0 || info[1] == 0 {
+        return false;
+    }
+    let base = info[0] as *const u8;
+    let len = info[1] as usize;
+    if needle.is_empty() || needle.len() > len {
+        return false;
+    }
+    for start in 0..=(len - needle.len()) {
+        let mut hit = true;
+        for j in 0..needle.len() {
+            if unsafe { core::ptr::read_volatile(base.add(start + j)) } != needle[j] {
+                hit = false;
+                break;
+            }
+        }
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// A process that deliberately dereferences an unmapped address. The kernel has
+/// to kill exactly this process (#PF from ring 3) and keep every other process
+/// running — that is what address-space isolation is *for*, and it is only a
+/// claim until something actually crashes. Never returns.
+fn crash_child() -> ! {
+    print("[Crash-Kind] lese absichtlich von 0x");
+    print_hex(UNMAPPED_VA, 8);
+    print(" (nicht gemappt) — der Kernel muss NUR mich toeten\n");
+    // read_volatile so the compiler cannot reason the load away.
+    let v = unsafe { core::ptr::read_volatile(UNMAPPED_VA as *const u8) };
+    print("[Crash-Kind] UNERREICHBAR — gelesen: ");
+    print_u64(v as u64);
+    print("\n");
+    exit(0);
+}
+
 /// The spawned client (pid != 0): it holds ONLY endpoint capabilities, no device
 /// authority — so it cannot touch the disk. It reads the filesystem entirely by
 /// asking the file-service over IPC: it learns the file count, reconstructs each
@@ -1907,6 +1959,12 @@ fn request(op: u64, arg: u64) -> u64 {
 /// proof that a client gets filesystem service without any hardware capability.
 /// Never returns.
 fn combined_client() -> ! {
+    // Role selection: every process runs this same image, so the parent picks a
+    // child's job through the environment block.
+    if env_has(b"XERNEL_ROLE=crash") {
+        crash_child();
+    }
+
     // Prove we have no device authority.
     print("[Client] eigene Geraete-Autoritaet? Port 0xc000: ");
     if syscall3(SYS_PORT_IN, 0xc000, 4, 0) == u64::MAX {
@@ -2117,6 +2175,56 @@ fn combined_client() -> ! {
             } else {
                 print(" (unerwartet)\n");
             }
+        }
+
+        // Fault-Isolation-Demo — ein Kind stuerzt ab, der Rest laeuft weiter.
+        print("[Client] Fault-Isolation-Demo: Kind faellt auf ungemappte Adresse\n");
+        let crash_env = b"XERNEL_ROLE=crash\0\0";
+        let crash_pid = spawn_env(0, crash_env.as_ptr(), crash_env.len() as u64);
+        if crash_pid == u64::MAX {
+            print("   spawn_env fuer Crash-Test: FEHLER\n");
+        } else {
+            print("   crash_child pid=");
+            print_u64(crash_pid);
+            print(" erzeugt\n");
+            // wait_pid parks us until the child is gone — either it faulted and
+            // the kernel reaped it, or nothing works and we never get here.
+            let ec = wait_pid(crash_pid);
+            print("   wait_pid(pid=");
+            print_u64(crash_pid);
+            print(") = ");
+            print_u64(ec);
+            if ec == EXIT_FAULT {
+                print(" (EXIT_FAULT — vom Kernel getoetet, korrekt)\n");
+            } else {
+                print(" (unerwartet — erwartet war 256)\n");
+            }
+            print("   Ich lebe noch: der Kernel hat nur das Kind verloren.\n");
+        }
+
+        // Bad-Pointer-Demo — ein ungemappter Zeiger IN einem Syscall. Frueher
+        // ist der Kernel dabei in Ring 0 gefaultet (Totalausfall durch einen
+        // schlechten Zeiger); jetzt muss er den Aufruf schlicht abweisen.
+        print("[Client] Bad-Pointer-Demo: write(fd=1, ptr=0x");
+        print_hex(UNMAPPED_VA, 8);
+        print(", len=16) = ");
+        let r = syscall3(SYS_WRITE, 1, UNMAPPED_VA, 16);
+        if r == u64::MAX {
+            print("Fehler (korrekt — ungemappt abgewiesen)\n");
+        } else {
+            print_u64(r);
+            print(" (?! haette abgewiesen werden muessen)\n");
+        }
+        // Same for a syscall that WRITES into a user buffer.
+        print("[Client] Bad-Pointer-Demo: getenvp(out=0x");
+        print_hex(UNMAPPED_VA, 8);
+        print(") = ");
+        let r = syscall3(SYS_GETENVP, UNMAPPED_VA, 0, 0);
+        if r == u64::MAX {
+            print("Fehler (korrekt — ungemappt abgewiesen)\n");
+        } else {
+            print_u64(r);
+            print(" (?! haette abgewiesen werden muessen)\n");
         }
     }
 

@@ -1,0 +1,270 @@
+================================================================================
+0.27.0 — FEHLERISOLATION: EIN PROZESS STIRBT, DER KERNEL LEBT
+================================================================================
+
+Zeitraum:      2026-08-25
+Ergebnis:      Ein Fehler in Ring 3 kostet ab jetzt genau einen Prozess statt
+               das ganze System. Drei zusammenhängende Löcher sind zu:
+               (1) jede CPU-Exception rief `panic!()` auf, egal ob der Kernel
+               oder ein Userland-Prozess sie ausgelöst hatte; (2) `user_slice`
+               prüfte einen User-Zeiger nur gegen einen Adressbereich, nicht
+               gegen die Page-Tables — ein ungemappter Zeiger im Syscall
+               faultete den Kernel in Ring 0; (3) `spawn_env` schrieb den
+               Env-Block an eine *virtuelle* Kind-Adresse, als wäre sie
+               physisch, und übertrug damit nie Daten (dafür fremdes RAM).
+               Beweis: ein Kind liest absichtlich von 0x5000_0000, wird mit
+               EXIT_FAULT (256) beerdigt, der Elternprozess holt den Code per
+               WAIT_PID ab — und der TCP-Test danach läuft unverändert durch.
+
+
+--------------------------------------------------------------------------------
+WARUM DAS DIE WICHTIGSTE LÜCKE WAR
+--------------------------------------------------------------------------------
+
+Der zentrale Anspruch eines Mikrokernels lautet: Treiber, Dateisystem und
+Netz-Stack laufen in Ring 3, deshalb reißt ein Absturz dort nicht das System
+mit. Xernel hat diesen Satz seit 0.11 in der Doku stehen — bewiesen war er
+nicht. Bewiesen war nur die *Trennung* der Adressräume, nicht die Reaktion auf
+ihre Verletzung. Denn `idt.rs` behandelte jede Exception gleich:
+
+    extern "x86-interrupt" fn page_fault(frame, code) {
+        panic!("CPU exception: #PF page fault at ...");
+    }
+
+Ein Nullpointer im virtio-net-Treiber und ein Nullpointer im Scheduler hatten
+damit exakt dieselbe Konsequenz: Kernel-Panic. Ein Mikrokernel, dessen
+Isolationsversprechen beim ersten Fehler zusammenbricht, ist ein Monolith mit
+Extra-Kontextwechseln.
+
+Die zweite Lücke war dieselbe Krankheit von der anderen Seite: ein Prozess
+musste nicht einmal selbst abstürzen, um den Kernel zu töten. `write(1,
+0x5000_0000, 16)` genügte — ein Zeiger, der die Bereichsprüfung besteht (unter
+USER_ADDR_MAX) aber auf nichts zeigt. Der Kernel dereferenzierte ihn im eigenen
+Namen, faultete mit CS = Ring 0, und Fall (1) machte daraus eine Panic. Jeder
+unprivilegierte Prozess konnte das System mit drei Registern anhalten.
+
+
+--------------------------------------------------------------------------------
+DER MECHANISMUS
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/idt.rs:
+
+  from_user():        NEU  Liest die RPL aus dem gesicherten CS des
+                            Interrupt-Frames. Dieses eine Bit trennt "ein
+                            Prozess benimmt sich daneben" von "der Kernel ist
+                            kaputt".
+  fatal():            NEU  Gemeinsamer Ausgang aller Traps: Ring 3 → Prozess
+                            töten und weiterlaufen; Ring 0 → panic wie bisher.
+                            Kehrt nie zur fehlerhaften Instruktion zurück, ein
+                            nicht reparierter Trap würde beim `iretq` sofort
+                            wieder feuern.
+  trap!/trap_err!:    Alle Exception-Handler laufen jetzt über fatal().
+  page_fault():       Behält den Sonderweg (CR2 ist die nützliche Hälfte des
+                            Reports), unterscheidet aber ebenfalls den Ring.
+  double_fault():     UNVERÄNDERT — bleibt Panic. An dem Punkt gibt es nichts
+                            Sicheres mehr, auf dem man weiterlaufen könnte.
+
+  kernel/src/arch/x86_64/syscall.rs:
+
+  gs_force_kernel():  NEU  Setzt GS.base/KERNEL_GS_BASE auf den Zustand, den
+                            das abschließende `swapgs` des Entry-Stubs erwartet.
+                            Siehe "DIE FALLE" unten — ohne das stirbt der
+                            nächste Syscall, nicht der Fehlerverursacher.
+
+  kernel/src/process.rs:
+
+  EXIT_FAULT (0x100): NEU  Exit-Code für "vom Kernel nach CPU-Exception
+                            getötet". Liegt außerhalb dessen, was ein Programm
+                            selbst an exit() übergeben kann, damit ein Elternteil
+                            "abgestürzt" von "mit diesem Code beendet"
+                            unterscheiden kann.
+  fault_exit():       NEU  Wie exit(), aber mit EXIT_FAULT und eigener
+                            Log-Zeile. exit()/fault_exit() teilen sich
+                            exit_inner().
+  spawn_env():        FIX  Übersetzt jede Kind-Seite über die Page-Tables des
+                            KINDES und schreibt durchs HHDM. Vorher wurde
+                            HEAP_START + hhdm_offset() geschrieben, also die
+                            virtuelle Kind-Adresse als physische gelesen.
+                            Prüft die Eltern-Quelle jetzt mit user_range_ok().
+
+  kernel/src/arch/x86_64/paging.rs:
+
+  user_range_ok():    NEU  Läuft jede 4-KiB-Seite von [virt, virt+len) durch
+                            die Page-Tables des AKTIVEN Adressraums: present?
+                            USER_ACCESSIBLE? bei Schreibzugriff auch WRITABLE?
+                            USER_ACCESSIBLE hält nebenbei Kernel-Seiten in der
+                            unteren Hälfte fern — die bestehen den Bereichstest,
+                            gehören dem Aufrufer aber nicht.
+
+  kernel/src/arch/x86_64/vspace.rs:
+
+  phys_of():          NEU  Übersetzt eine virtuelle Adresse in einem
+                            Adressraum, der NICHT aktiv sein muss. So erreicht
+                            der Kernel den Speicher eines noch nicht laufenden
+                            Prozesses.
+
+  kernel/src/syscall.rs:
+
+  user_slice(),
+  user_slice_mut():   FIX  Bereichsprüfung wie bisher, danach
+                            arch::user_range_ok(). Der veraltete
+                            SAFETY-Kommentar ("Single-process bring-up means no
+                            aliasing") ist ersetzt: die echte Begründung ist,
+                            dass SFMASK beim Syscall-Eintritt IF löscht, also
+                            kein Interrupt dazwischenfunkt.
+
+  userland/init/src/main.rs:
+
+  env_has():          NEU  Sucht einen Schlüssel im Env-Block. Damit wählt der
+                            Elternprozess die Rolle eines Kindes, ohne ein
+                            zweites Boot-Modul zu brauchen.
+  crash_child():      NEU  Liest absichtlich von UNMAPPED_VA (0x5000_0000 —
+                            über HEAP_MAX, weit unter dem PCI-MMIO-Fenster).
+  Demo:               Fault-Isolation (Kind absturz + WAIT_PID) und
+                            Bad-Pointer (write/getenvp mit ungemapptem Zeiger).
+
+
+--------------------------------------------------------------------------------
+DIE FALLE: GS-BASE (der Fehler, der erst beim Testen sichtbar wurde)
+--------------------------------------------------------------------------------
+
+Die erste Fassung tötete den Prozess korrekt — und der Kernel starb trotzdem,
+nur ein paar Instruktionen später und an ganz anderer Stelle:
+
+    [xernel] user fault: #PF at 0x50000000, code PageFaultErrorCode(USER_MODE)
+    [user pid 4] killed by #PF page fault
+    [xernel] PANIC: CPU exception: #PF page fault at 0x8, CAUSED_BY_WRITE
+             instruction_pointer: 0xffffffff8000afe3   (= syscall_entry + 3)
+             code_segment: rpl: Ring0
+             stack_pointer: 0x80f690                   (= ein USER-Stack)
+
+Die Adresse 0x8 und der Offset in syscall_entry sagen alles: `mov gs:[8], rsp`
+mit GS.base = 0. Der Grund ist eine Asymmetrie der Hardware — `syscall` und
+`sysret` tauschen die GS-Basis per `swapgs`, eine **Exception tut das nicht**.
+Ein aus Ring 3 betretener Exception-Handler läuft also noch im "User"-Zustand
+des GS-Paars. Solange er nur liest und panict, ist das egal. Sobald er den
+Prozess aufgibt und zu einem anderen wechselt, wird es tödlich: der Nachfolger
+setzt den Syscall fort, in dem er geparkt war, und führt dessen abschließendes
+`swapgs` aus — das jetzt in die falsche Richtung zeigt. Der nächste `syscall`
+tauscht GS.base = 0 ein und faultet in Ring 0.
+
+Derselbe Fehler steht seit 0.x als Kommentar in `enter_user()` — dort wird das
+GS-Paar bei jedem Eintritt in Ring 3 bewusst auf einen kanonischen Zustand
+gezwungen, weil `exit()` sein `swapgs` nie erreicht. Der neue Fehlerpfad ist
+exakt dieselbe Unwucht von der anderen Seite; `gs_force_kernel()` ist die
+Gegenbuchung.
+
+Lehre fürs Protokoll: die Isolation war nicht schon dann bewiesen, als der
+Absturz-Prozess starb. Sie war erst dann bewiesen, als *nach* dem Absturz noch
+ein kompletter TCP-Testlauf durchlief.
+
+
+--------------------------------------------------------------------------------
+NEBENBEFUND: SPAWN_ENV HAT NIE DATEN ÜBERTRAGEN
+--------------------------------------------------------------------------------
+
+Die Rollenwahl des Absturz-Kindes läuft über den Env-Block — und funktionierte
+zunächst nicht. Ursache in `spawn_env` (0.26.0):
+
+    core::ptr::write_volatile((HEAP_START + offset + arch::hhdm_offset()) ...)
+
+HEAP_START (0x1000_0000) ist eine *virtuelle* Adresse im Kind. Plus HHDM-Offset
+ergibt das die Stelle, an der die *physische* Adresse 0x1000_0000 liegt — also
+irgendein fremdes Stück RAM. Das Kind las weiterhin Nullen (seine Seiten kommen
+frisch genullt), und der Kernel überschrieb still 4 KiB Physik.
+
+Sichtbar war das nie, weil das Protokoll 0.26.0 nur die *Länge* des Env-Blocks
+abdruckte ("ENV: 37 Bytes"), nie den Inhalt. Die Ausgabe des Kindes hatte an der
+Stelle eine Lücke, die man für "keine Ausgabe nötig" halten konnte. Genau so
+sehen echte Bugs in einem Beweis aus, der nicht weit genug geht.
+
+Das Protokoll 0.26.0 bleibt unverändert — es hält fest, was damals wirklich
+lief. Der Log-Umfang des Kindes wächst durch die Reparatur von 229 auf 271
+Bytes, weil das Kind seine Env-Variablen jetzt tatsächlich ausdrucken kann.
+
+
+--------------------------------------------------------------------------------
+DER BEWEIS (cargo xtask run --test)
+--------------------------------------------------------------------------------
+
+[Client] Deployment-Demo: SPAWN_ENV + GET_STATUS + GETENVP
+   spawn_env: pid 2 erzeugt
+[init pid 2] hello — eigener Adressraum, eigener Heap
+[Client] ENV: 37 Bytes ab 0x10000000
+   XERNEL_DATA_DIR=/data          <- NEU: Inhalt kommt an, nicht nur die Länge
+   RUST_LOG=info
+   log_read(pid 2): 271 Bytes
+
+[Client] Fault-Isolation-Demo: Kind faellt auf ungemappte Adresse
+   crash_child pid=4 erzeugt
+[init pid 4] hello — eigener Adressraum, eigener Heap
+[Crash-Kind] lese absichtlich von 0x50000000 (nicht gemappt) — der Kernel muss NUR mich toeten
+[xernel] user fault: #PF at 0x50000000, code PageFaultErrorCode(USER_MODE)
+[user pid 4] killed by #PF page fault
+   wait_pid(pid=4) = 256 (EXIT_FAULT — vom Kernel getoetet, korrekt)
+   Ich lebe noch: der Kernel hat nur das Kind verloren.
+
+[Client] Bad-Pointer-Demo: write(fd=1, ptr=0x50000000, len=16) = Fehler (korrekt — ungemappt abgewiesen)
+[Client] Bad-Pointer-Demo: getenvp(out=0x50000000) = Fehler (korrekt — ungemappt abgewiesen)
+
+[Client] Netzwerk-Service: Multi-Connection-Test via IPC
+ Service-Host: Socket 0 Connect an 10.0.2.100:9
+[Client] Socket 0 TCP verbunden!
+[Client] Socket 1 TCP verbunden!
+[Client] Ready-Set per WAIT: 0x1 (Maske 0x1)
+[Client] Socket 0 Echo: "HELLO FROM SOCKET 0"
+[Client] Ready-Set per WAIT: 0x2 (Maske 0x2)
+[Client] Socket 1 Echo: "HELLO FROM SOCKET 1"
+[Client] fertig
+[xernel] boot-test: ok
+xtask: boot-test PASSED
+
+Der letzte Block ist der eigentliche Beweis: der komplette TCP-Verkehr läuft
+NACH dem Absturz durch. Der Kernel hat nicht überlebt, weil nichts mehr passiert
+ist, sondern weil er weitergearbeitet hat.
+
+
+--------------------------------------------------------------------------------
+GRENZEN
+--------------------------------------------------------------------------------
+
+- Ein getöteter Prozess gibt seine Ressourcen NICHT frei: Frames, Adressraum und
+  Capability-Space bleiben liegen. Genau wie bei einem regulären exit() — das
+  ist eine eigene Baustelle (Reaper), keine neue Schuld.
+- Ein Prozess, der ein IPC-Endpoint hält, verschwindet ohne Nachricht an seine
+  Partner. Wer auf ihn wartet, wartet weiter. Ein "Prozess gestorben"-Signal
+  über Notification fehlt.
+- KEIN SMAP/SMEP. Der Kernel darf User-Speicher weiterhin direkt anfassen; die
+  Prüfung in user_range_ok() ist Software-Disziplin, keine Hardware-Sperre.
+- user_range_ok() prüft zum Zeitpunkt des Aufrufs. Auf einem SMP-System könnte
+  ein zweiter Thread die Mappings dazwischen ändern — heute läuft Xernel
+  single-CPU, und SFMASK hält Interrupts im Handler draußen.
+- Die neuen Syscalls KILL/LOG_READ/WAIT_PID bleiben ambiente Autorität: jeder
+  Prozess darf jeden anderen töten und dessen Log lesen. Eine Process-Capability
+  ist die nächste offene Aufgabe (auch Ticket #7).
+- NMI und #DB laufen über denselben Weg wie ein #PF. Für NMI aus Ring 3 ist
+  "Prozess töten" fragwürdig, praktisch tritt der Fall in QEMU nicht auf.
+
+
+--------------------------------------------------------------------------------
+BETEILIGTE DATEIEN
+--------------------------------------------------------------------------------
+
+  kernel/src/arch/x86_64/idt.rs     — from_user(), fatal(), Ring-Unterscheidung
+                                      in allen Traps und im page_fault
+  kernel/src/arch/x86_64/syscall.rs — gs_force_kernel()
+  kernel/src/arch/x86_64/paging.rs  — user_range_ok()
+  kernel/src/arch/x86_64/vspace.rs  — phys_of()
+  kernel/src/arch/x86_64/mod.rs     — HAL-Wrapper user_range_ok(), vspace_phys()
+  kernel/src/arch/aarch64/mod.rs    — Stubs (HAL-Oberfläche vollständig halten)
+  kernel/src/arch/riscv64/mod.rs    — Stubs
+  kernel/src/arch/mod.rs            — Re-Export-Listen aller drei Architekturen
+  kernel/src/process.rs             — EXIT_FAULT, fault_exit(), exit_inner(),
+                                      spawn_env()-Fix (phys_of + user_range_ok)
+  kernel/src/syscall.rs             — user_slice()/user_slice_mut() mit
+                                      Mapping-Prüfung, korrigierte SAFETY-Texte
+  userland/init/src/main.rs         — env_has(), crash_child(), UNMAPPED_VA,
+                                      EXIT_FAULT, Fault-Isolation- und
+                                      Bad-Pointer-Demo
+  docs/book/src/status.md           — Phase 0.27, Fehlerisolation belegt

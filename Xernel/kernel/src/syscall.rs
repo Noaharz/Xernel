@@ -226,7 +226,11 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
     }
 }
 
-/// Borrow a user buffer as a slice, validating it lies wholly in user space.
+/// Borrow a user buffer as a slice, validating it lies wholly in user space
+/// **and is actually mapped there**. The range test alone would let a process
+/// pass any unmapped lower-half address; the kernel would then fault in ring 0
+/// on the caller's behalf and take the whole system down. See
+/// [`arch::user_range_ok`].
 fn user_slice(ptr: u64, len: u64) -> Option<&'static [u8]> {
     if len == 0 {
         return Some(&[]);
@@ -238,9 +242,13 @@ fn user_slice(ptr: u64, len: u64) -> Option<&'static [u8]> {
     if ptr >= USER_ADDR_MAX || end > USER_ADDR_MAX {
         return None;
     }
-    // SAFETY: user pages share the active address space, so a validated
-    // lower-half pointer is readable from ring 0 (SMAP is not enabled). The
-    // 'static lifetime is a lie we keep contained to this function.
+    if !arch::user_range_ok(ptr, len, false) {
+        return None;
+    }
+    // SAFETY: every page of the range was just verified present and
+    // user-accessible in the active address space, so the read cannot fault.
+    // The 'static lifetime is a lie we keep contained to this function: the
+    // borrow never outlives the syscall, which runs in the caller's own space.
     Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
 }
 
@@ -260,7 +268,8 @@ fn sys_write(_fd: u64, ptr: u64, len: u64) -> u64 {
     len
 }
 
-/// Validate a user buffer and borrow it mutably (for input).
+/// Validate a user buffer and borrow it mutably (for input). Like
+/// [`user_slice`], but the range must additionally be mapped **writable**.
 fn user_slice_mut(ptr: u64, len: u64) -> Option<&'static mut [u8]> {
     if len == 0 {
         return None;
@@ -272,9 +281,13 @@ fn user_slice_mut(ptr: u64, len: u64) -> Option<&'static mut [u8]> {
     if ptr >= USER_ADDR_MAX || end > USER_ADDR_MAX {
         return None;
     }
-    // SAFETY: user pages share the active address space; a validated lower-half
-    // pointer is writable from ring 0 (no SMAP). Single-process bring-up means
-    // no aliasing with concurrent kernel access.
+    if !arch::user_range_ok(ptr, len, true) {
+        return None;
+    }
+    // SAFETY: every page of the range was just verified present, user-accessible
+    // and writable in the active address space, so the write cannot fault. The
+    // syscall runs in the caller's own address space, and `SFMASK` clears IF on
+    // entry, so no interrupt can preempt us into a path that aliases the buffer.
     Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) })
 }
 

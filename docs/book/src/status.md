@@ -1,6 +1,6 @@
 # Status & Entwicklungsstand
 
-Stand: 2026-08-18. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
+Stand: 2026-08-25. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --test`
 → `boot-test PASSED`).
 
 ## Was funktioniert
@@ -10,6 +10,14 @@ Stand: 2026-08-18. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   die HHDM, Kernel-Heap.
 - **Interrupts:** GDT/TSS (IST-Stacks), IDT mit allen CPU-Exceptions, LAPIC,
   PIC abgeschaltet, periodischer LAPIC-Timer.
+- **Fehlerisolation (seit 0.27):** eine CPU-Exception aus Ring 3 tötet **nur den
+  auslösenden Prozess** (Exit-Code `EXIT_FAULT` = 256, abholbar per `WAIT_PID`);
+  der Kernel läuft weiter. Eine Exception aus Ring 0 panict weiterhin — dort ist
+  nichts Sicheres mehr übrig. Ebenso wird jeder User-Zeiger in einem Syscall
+  gegen die Page-Tables geprüft, nicht nur gegen einen Adressbereich: ein
+  ungemappter Zeiger liefert einen Fehlercode, statt den Kernel in Ring 0
+  faulten zu lassen. Beweis: ein Kind liest absichtlich von einer ungemappten
+  Adresse, stirbt allein — und der TCP-Test danach läuft unverändert durch.
 - **SSE/FPU** für Ring 3 aktiviert.
 - **Multitasking-Kern:** Context-Switch, kooperativer Scheduler, In-Kernel-IPC
   (Demo: zwei Threads tauschen Nachrichten).
@@ -152,6 +160,7 @@ Stand: 2026-08-18. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.24.0 MultiConnection | **Socket-API mit mehreren Verbindungen** (Ticket #2): der Service verwaltet 4 TCP-Sockets gleichzeitig (eigener Port, TCP-Zustand, Shared Frame je Socket); das Protokoll trägt einen Socket-Index, Empfang wird per Zielport demuxed; ein Client ohne Geräte-Caps öffnet zwei Verbindungen parallel und verifiziert je Echo |
 | 0.25.0 ReadySet | **Ready-Set / WAIT** (Ticket #3, select/epoll-Äquivalent): ein `OP_NET_GET_READY` liefert die Bitmaske der lesbaren Sockets, pro Socket wird ein Bereitschafts-Bit auf der geteilten Notification erheit — **ein `WAIT` meldet, welche von mehreren Verbindungen lesbar sind**; eingehende Frames werden gepuffert statt verworfen, `RECV` bedient zuerst den Puffer |
 | 0.26.0 Deployment | **Deployment-Primitive + Kill/Wait:** SPAWN_ENV (25), GET_STATUS (26), GETENVP (27), LOG_READ (28), KILL (29), WAIT_PID (30) — sechs neue Syscalls für PID-gesteuertes Deployment mit vollem Lebenszyklus-Management |
+| 0.27.0 Fehlerisolation | **Ein Prozess stirbt, der Kernel lebt:** CPU-Exceptions unterscheiden Ring 3 von Ring 0 (`EXIT_FAULT`), User-Zeiger werden gegen die Page-Tables geprüft statt nur gegen einen Bereich; nebenbei repariert: `SPAWN_ENV` schrieb den Env-Block an eine virtuelle Adresse, als wäre sie physisch, und übertrug nie Daten |
 
 ## XOS — das erste OS auf Xernel
 
@@ -182,5 +191,11 @@ Aussage in diesem Dokument ausschließlich für x86_64.
   Prozess, `WAIT_PID` liefert den Exit-Code. Noch offen: mehrere
   Programm-Images, Eltern/Kind-Beziehung mit `wait`/Exit-Status aus dem
   Kind-Syscall (Ticket #7), Capabilities gezielt beim Spawn mitgeben
+- `KILL`, `LOG_READ` und `WAIT_PID` sind **ambiente Autorität**: jeder Prozess
+  darf jeden anderen töten und dessen Log lesen. Eine `Process`-Capability, die
+  `SPAWN` zurückgibt, wäre die saubere Form (schließt Ticket #7 mit)
+- Aufräumen nach dem Tod eines Prozesses: Frames, Adressraum und Capability-Space
+  eines beendeten Prozesses werden nicht freigegeben (gilt für `exit` wie für
+  `EXIT_FAULT`), und wer auf sein IPC-Endpoint wartet, erfährt nichts davon
 - ELF-Loader vom Kernel in einen Root-Server verlagern
 - Tastatur: Shift/Modifier; IO-APIC-Basis aus ACPI statt hartkodiert

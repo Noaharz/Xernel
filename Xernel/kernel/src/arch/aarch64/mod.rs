@@ -102,6 +102,14 @@ pub fn user_phys(_virt: u64) -> Option<u64> {
     None
 }
 
+pub fn user_range_ok(_virt: u64, _len: u64, _writable: bool) -> bool {
+    false
+}
+
+pub fn vspace_phys(_space: u64, _virt: u64) -> Option<u64> {
+    None
+}
+
 pub fn unmap_user(_virt: u64) -> bool {
     false
 }
