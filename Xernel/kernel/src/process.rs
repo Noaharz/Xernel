@@ -283,6 +283,33 @@ pub fn current_frame_cap(slot: usize) -> Option<(u64, u64)> {
 
 /// Read (a copy of) the capability in slot `slot` of the current process, for
 /// granting it over an endpoint. `None` if the slot is empty/out of range.
+/// The PID named by the `Process` capability in slot `slot` of the current
+/// process, or `None` if that slot holds no such capability. This is the single
+/// gate for every operation one process performs on another: no capability, no
+/// authority — not even to ask whether the target is alive.
+pub fn current_process_pid(slot: usize) -> Option<u64> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    s.procs[s.current].caps.get(slot).ok()?.process_pid()
+}
+
+/// Copy `cap` into slot `dst_slot` of the process `target_pid`. Backs
+/// `SYS_CAP_GRANT`: it is how a parent equips a child with authority it did not
+/// get from `seed_caps` — before or after the child first runs, which is what
+/// makes a freshly spawned program useful at all. Returns `false` if the PID is
+/// unknown or the destination slot is occupied or out of range (capabilities
+/// are never silently overwritten).
+pub fn grant_to(target_pid: u64, cap: CapEntry, dst_slot: usize) -> bool {
+    let mut guard = SCHED.lock();
+    let Some(s) = guard.as_mut() else {
+        return false;
+    };
+    let Some(p) = s.procs.iter_mut().find(|p| p.pid == target_pid) else {
+        return false;
+    };
+    p.caps.insert(dst_slot, cap).is_ok()
+}
+
 pub fn current_cap_get(slot: usize) -> Option<CapEntry> {
     let guard = SCHED.lock();
     let s = guard.as_ref()?;
@@ -378,15 +405,32 @@ pub fn run() -> ! {
 /// image (index 0) exists, so any value loads it — but the parameter is already
 /// part of the ABI so a future root-server can resolve a name to one of several
 /// programs. Returns `None` if the image is missing or process creation fails.
-pub fn spawn(_module_index: u64) -> Option<u64> {
+pub fn spawn(_module_index: u64, cap_slot: u64) -> Option<u64> {
     let module = arch::init_module()?;
     let mut guard = SCHED.lock();
     let s = guard.as_mut()?;
     let pid = s.next_pid;
     let p = create(pid, module)?;
+    install_process_cap(s, pid, cap_slot)?;
     s.procs.push(Box::new(p));
     s.next_pid += 1;
     Some(pid)
+}
+
+/// Hand the spawning process a `Process` capability for its new child. Called
+/// with the scheduler already locked, before the child is pushed, so a bad
+/// destination slot aborts the spawn instead of leaving a process nobody holds
+/// a handle to. `cap_slot == u64::MAX` means the caller deliberately wants no
+/// handle — a fire-and-forget child it can never touch again.
+fn install_process_cap(s: &mut Scheduler, pid: u64, cap_slot: u64) -> Option<()> {
+    if cap_slot == u64::MAX {
+        return Some(());
+    }
+    let cur = s.current;
+    s.procs[cur]
+        .caps
+        .insert(cap_slot as usize, CapEntry::process(pid))
+        .ok()
 }
 
 /// Like [`spawn`], but also copies an environment block from the parent's
@@ -394,9 +438,9 @@ pub fn spawn(_module_index: u64) -> Option<u64> {
 /// **caller's** (parent's) address space; the data is copied page-by-page into
 /// the child's heap at `HEAP_START`. The child can later retrieve the pointer
 /// via `SYS_GETENVP`. Returns the new PID, or `u64::MAX` on failure.
-pub fn spawn_env(_module_index: u64, envp_ptr: u64, envp_len: u64) -> Option<u64> {
+pub fn spawn_env(_module_index: u64, envp_ptr: u64, envp_len: u64, cap_slot: u64) -> Option<u64> {
     if envp_len == 0 || envp_ptr == 0 {
-        return spawn(_module_index);
+        return spawn(_module_index, cap_slot);
     }
     let module = arch::init_module()?;
     let mut guard = SCHED.lock();
@@ -443,6 +487,7 @@ pub fn spawn_env(_module_index: u64, envp_ptr: u64, envp_len: u64) -> Option<u64
     // Adjust heap break past the environment block so SBRK starts after it.
     p.heap_break = HEAP_START + env_pages * PAGE;
 
+    install_process_cap(s, pid, cap_slot)?;
     s.procs.push(Box::new(p));
     s.next_pid += 1;
     Some(pid)
@@ -621,8 +666,8 @@ pub fn log_write(data: &[u8]) {
 
 /// Copy up to `max` bytes from the log ring buffer of the process identified by
 /// `target_pid` into `out`, returning how many bytes were copied and removing
-/// them from the buffer. Any process can read any other process's log (no
-/// capability needed — the data is non-sensitive debugging output).
+/// them from the buffer. Reaching this function at all requires a `Process`
+/// capability for the target — a process's console output is its own.
 pub fn log_read(target_pid: u64, out: &mut [u8], max: usize) -> u64 {
     let mut guard = SCHED.lock();
     let s = match guard.as_mut() {
@@ -646,8 +691,8 @@ pub fn log_read(target_pid: u64, out: &mut [u8], max: usize) -> u64 {
 /// - signal 15 (SIGTERM): mark the process as Done with exit_code 15.
 /// - signal 9  (SIGKILL): same, but exit_code 9.
 /// Returns 0 on success, `u64::MAX` if the PID is unknown or already exited.
-/// Any process can kill any other process (no capability needed — this is a
-/// single-tenant OS; in a multi-tenant model this would be gated).
+/// The caller's authority was already checked by `sys_kill`, which resolves a
+/// `Process` capability to this PID — there is no path here from a bare number.
 pub fn kill(target_pid: u64, signal: u64) -> u64 {
     let mut guard = SCHED.lock();
     let s = match guard.as_mut() {

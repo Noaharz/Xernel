@@ -93,10 +93,11 @@ pub const SYS_SEND: u64 = 18;
 /// cap / bad buffer / occupied destination slot.
 pub const SYS_RECV: u64 = 19;
 /// Spawn a new process. Arg 0 selects the program image (today only the boot
-/// init image, index 0, exists). The newcomer starts in a fresh address space
-/// with a freshly seeded capability space and is scheduled as ready. Returns the
-/// new PID, or `u64::MAX` on failure. The kernel boots only the root; every other
-/// process is created this way.
+/// init image, index 0, exists); arg 1 is the caller's CNode slot to receive the
+/// child's `Process` capability (`u64::MAX` = no handle wanted). The newcomer
+/// starts in a fresh address space with a freshly seeded capability space and is
+/// scheduled as ready. Returns the new PID, or `u64::MAX` on failure. The kernel
+/// boots only the root; every other process is created this way.
 pub const SYS_SPAWN: u64 = 20;
 /// Signal a notification: OR `bits` (arg 1) into the notification named by the
 /// `Notification` cap in `notif_slot` (arg 0). Non-blocking, never loses bits.
@@ -124,30 +125,44 @@ pub const SYS_FRAME_ALLOC: u64 = 23;
 /// shared memory: two processes that both map the same delegated Frame cap see
 /// the same RAM.
 pub const SYS_MAP_FRAME: u64 = 24;
-/// Spawn a new process with environment variables. Like `SPAWN`, but arg 1 is a
-/// pointer to the environment buffer in the caller's address space and arg 2 is
-/// its length in bytes. The kernel copies the env data into the child's heap;
-/// the child retrieves the pointer via `SYS_GETENVP`. Returns the new PID, or
-/// `u64::MAX` on failure.
+/// Spawn a new process with environment variables. Like `SPAWN`: arg 1 is a
+/// pointer to the environment buffer in the caller's address space, arg 2 its
+/// length in bytes, arg 3 the slot for the child's `Process` capability. The
+/// kernel copies the env data into the child's heap; the child retrieves the
+/// pointer via `SYS_GETENVP`. Returns the new PID, or `u64::MAX` on failure.
 pub const SYS_SPAWN_ENV: u64 = 25;
-/// Query the state of the process identified by `pid` (arg 0). Returns:
+/// Query the state of the process named by the `Process` capability in slot
+/// `args[0]`. Returns:
 ///   0 = running (Ready or Blocked),
 ///   1 = exited (Done),
-///   2 = unknown PID.
+///   `u64::MAX` = no `Process` capability in that slot.
 pub const SYS_GET_STATUS: u64 = 26;
 /// Return the environment pointer and length for the current process. Writes
 /// `[envp_user, envp_len]` (2 × u64) to `out_ptr` (arg 0). Returns 0 on
 /// success, `u64::MAX` if no environment was set or the buffer is bad.
 pub const SYS_GETENVP: u64 = 27;
-/// Read and drain up to `args[2]` bytes from process `args[0]`'s log ring buffer
-/// into user pointer `args[1]`. Returns bytes copied, 0 if empty/unknown.
+/// Read and drain up to `args[2]` bytes from the log ring buffer of the process
+/// named by the `Process` capability in slot `args[0]`, into user pointer
+/// `args[1]`. Returns bytes copied, `u64::MAX` without the capability.
 pub const SYS_LOG_READ: u64 = 28;
-/// Send a signal to a process. `args[0]` = target_pid, `args[1]` = signal
-/// (15 = SIGTERM, 9 = SIGKILL). Returns 0 on success, `u64::MAX` on error.
+/// Send a signal to the process named by the `Process` capability in slot
+/// `args[0]`. `args[1]` = signal (15 = SIGTERM, 9 = SIGKILL). Returns 0 on
+/// success, `u64::MAX` on error or without the capability.
 pub const SYS_KILL: u64 = 29;
-/// Block until `args[0]` has exited, then return its exit code. Returns
-/// `u64::MAX` if the PID is unknown or is the caller itself.
+/// Block until the process named by the `Process` capability in slot `args[0]`
+/// has exited, then return its exit code. `u64::MAX` without the capability or
+/// if the target is the caller itself.
 pub const SYS_WAIT_PID: u64 = 30;
+/// Copy one of the caller's capabilities into another process's CSpace:
+/// `args[0]` = slot holding a `Process` capability for the target, `args[1]` =
+/// the caller's slot to copy FROM, `args[2]` = the slot in the target to copy
+/// INTO. Returns 0 on success, `u64::MAX` otherwise.
+///
+/// This is what makes a spawned program useful. `seed_caps` gives a newcomer
+/// only the shared endpoint pair; every further authority — a frame, a device
+/// range, a handle on a third process — has to be delegated deliberately, and
+/// this is the delegation that does not require the child to be running yet.
+pub const SYS_CAP_GRANT: u64 = 31;
 
 /// Next free virtual address for DMA-buffer mappings (`SYS_DMA_ALLOC`).
 static NEXT_DMA_VA: Mutex<u64> = Mutex::new(0x6000_0000);
@@ -208,17 +223,20 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> u64 {
         SYS_CAP_IDENTIFY => sys_cap_identify(args[0], args[1]),
         SYS_SEND => sys_send(args[0], args[1], args[2]),
         SYS_RECV => sys_recv(args[0], args[1], args[2]),
-        SYS_SPAWN => crate::process::spawn(args[0]).unwrap_or(u64::MAX),
+        SYS_SPAWN => crate::process::spawn(args[0], args[1]).unwrap_or(u64::MAX),
         SYS_SIGNAL => sys_signal(args[0], args[1]),
         SYS_WAIT => sys_wait(args[0]),
         SYS_FRAME_ALLOC => sys_frame_alloc(args[0], args[1], args[2]),
         SYS_MAP_FRAME => sys_map_frame(args[0], args[1]),
-        SYS_SPAWN_ENV => crate::process::spawn_env(args[0], args[1], args[2]).unwrap_or(u64::MAX),
-        SYS_GET_STATUS => crate::process::get_status(args[0]),
+        SYS_SPAWN_ENV => {
+            crate::process::spawn_env(args[0], args[1], args[2], args[3]).unwrap_or(u64::MAX)
+        }
+        SYS_GET_STATUS => sys_get_status(args[0]),
         SYS_GETENVP => sys_getenvp(args[0]),
         SYS_LOG_READ => sys_log_read(args[0], args[1], args[2]),
-        SYS_KILL => crate::process::kill(args[0], args[1]),
-        SYS_WAIT_PID => crate::process::wait_pid(args[0]),
+        SYS_KILL => sys_kill(args[0], args[1]),
+        SYS_WAIT_PID => sys_wait_pid(args[0]),
+        SYS_CAP_GRANT => sys_cap_grant(args[0], args[1], args[2]),
         other => {
             println!("[user] syscall: unknown number {other}");
             u64::MAX
@@ -655,14 +673,72 @@ fn sys_getenvp(out_ptr: u64) -> u64 {
     0
 }
 
-/// Read up to `max` bytes from `target_pid`'s log ring buffer into `out_ptr`.
-/// Returns the number of bytes copied. The bytes are consumed (removed from the
-/// buffer). Any process can read any other process's log.
-fn sys_log_read(target_pid: u64, out_ptr: u64, max: u64) -> u64 {
+/// Resolve the `Process` capability in `slot` to its PID, logging the denial if
+/// there is none. Every cross-process operation goes through here — that single
+/// funnel is what keeps "authority over another process" a capability rather
+/// than something every process simply has.
+fn process_target(slot: u64, what: &str) -> Option<u64> {
+    match crate::process::current_process_pid(slot as usize) {
+        Some(pid) => Some(pid),
+        None => {
+            println!("[cap] DENY {what} (no Process capability in slot {slot})");
+            None
+        }
+    }
+}
+
+/// Query the state of the process named by the `Process` cap in `proc_slot`.
+fn sys_get_status(proc_slot: u64) -> u64 {
+    let Some(pid) = process_target(proc_slot, "get_status") else {
+        return u64::MAX;
+    };
+    crate::process::get_status(pid)
+}
+
+/// Read up to `max` bytes from the log ring buffer of the process named by the
+/// `Process` cap in `proc_slot`, into `out_ptr`. The bytes are consumed.
+fn sys_log_read(proc_slot: u64, out_ptr: u64, max: u64) -> u64 {
+    let Some(pid) = process_target(proc_slot, "log_read") else {
+        return u64::MAX;
+    };
     let max = max.min(65536) as usize; // hard cap 64 KiB per call
     let Some(buf) = user_slice_mut(out_ptr, max as u64) else {
         return u64::MAX;
     };
-    crate::process::log_read(target_pid, buf, max)
+    crate::process::log_read(pid, buf, max)
+}
+
+/// Signal the process named by the `Process` cap in `proc_slot`.
+fn sys_kill(proc_slot: u64, signal: u64) -> u64 {
+    let Some(pid) = process_target(proc_slot, "kill") else {
+        return u64::MAX;
+    };
+    crate::process::kill(pid, signal)
+}
+
+/// Block until the process named by the `Process` cap in `proc_slot` exits.
+fn sys_wait_pid(proc_slot: u64) -> u64 {
+    let Some(pid) = process_target(proc_slot, "wait_pid") else {
+        return u64::MAX;
+    };
+    crate::process::wait_pid(pid)
+}
+
+/// Copy the caller's capability in `src_slot` into slot `dst_slot` of the
+/// process named by the `Process` cap in `proc_slot`.
+fn sys_cap_grant(proc_slot: u64, src_slot: u64, dst_slot: u64) -> u64 {
+    let Some(pid) = process_target(proc_slot, "cap_grant") else {
+        return u64::MAX;
+    };
+    let Some(cap) = crate::process::current_cap_get(src_slot as usize) else {
+        println!("[cap] DENY cap_grant (nothing to grant in slot {src_slot})");
+        return u64::MAX;
+    };
+    if crate::process::grant_to(pid, cap, dst_slot as usize) {
+        0
+    } else {
+        println!("[cap] DENY cap_grant (slot {dst_slot} of pid {pid} not free)");
+        u64::MAX
+    }
 }
 

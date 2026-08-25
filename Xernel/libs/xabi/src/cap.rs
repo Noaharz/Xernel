@@ -26,4 +26,7 @@ pub enum CapType {
     IrqHandler = 9,
     IoPort = 10,
     IoMem = 11,
+    /// Authority over one process: kill it, read its log, wait for its exit,
+    /// and grant capabilities into its CSpace. Handed to the parent by `SPAWN`.
+    Process = 12,
 }

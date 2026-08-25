@@ -40,23 +40,31 @@ diese Schnittstelle — der Kernel wird **nie** von Hand verändert.
 | 17 | `CAP_IDENTIFY` | slot, out_ptr | 0 / `u64::MAX` | Beschreibt die Capability im eigenen CNode-Slot; schreibt `[type, a, b]` (3×u64, normalisiert) nach `out_ptr`. |
 | 18 | `SEND` | ep_slot, word, cap_slot | 0 / `u64::MAX` | Sendet `word` (+ optional die Cap in `cap_slot`, sonst `u64::MAX`) über den Endpoint in `ep_slot`. Nicht blockierend. |
 | 19 | `RECV` | ep_slot, out_ptr, dst_slot | 0 / `u64::MAX` | Blockiert bis eine Nachricht da ist; schreibt das Wort nach `out_ptr`, installiert eine mitgeschickte Cap in `dst_slot` (`u64::MAX` = verwerfen). |
-| 20 | `SPAWN` | module | pid / `u64::MAX` | Erzeugt einen neuen Prozess aus Programm-Image `module` (heute nur 0 = init-Image): eigener Adressraum, frisch gesäte Caps, als bereit eingehängt. Der Kernel bootet nur den Root; jeder weitere Prozess entsteht so. |
+| 20 | `SPAWN` | module, cap_slot | pid / `u64::MAX` | Erzeugt einen neuen Prozess aus Programm-Image `module` (heute nur 0 = init-Image): eigener Adressraum, frisch gesäte Caps, als bereit eingehängt. Legt eine **`Process`-Capability** für das Kind in `cap_slot` des Aufrufers (`u64::MAX` = kein Handle) — ohne dieses Handle kann der Elternprozess sein Kind später nicht anfassen. |
 | 21 | `SIGNAL` | notif_slot, bits | 0 / `u64::MAX` | Signalisiert eine Notification: ODER-t `bits` in ihr Signal-Wort (nicht blockierend, akkumuliert). Braucht eine `Notification`-Capability in `notif_slot`. |
 | 22 | `WAIT` | notif_slot | bits (≠0) / 0 | Blockiert, bis die Notification in `notif_slot` Bits ≠ 0 hat, gibt sie zurück und löscht sie. Das Readiness-Primitiv (epoll/kqueue-Form): ein `WAIT` deckt viele Quellen ab. `0` = keine Cap. |
 | 23 | `FRAME_ALLOC` | pages, cap_slot, out_ptr | 0 / `u64::MAX` | Allokiert `pages` physisch-zusammenhängende, genullte Seiten, mappt sie in den Aufrufer, legt eine `Frame`-Capability in `cap_slot` und schreibt die User-Adresse nach `out_ptr`. **Gated:** verrechnet gegen das `Untyped`-Budget. Die Frame-Cap lässt sich per `SEND` granten → geteilter Speicher. |
 | 24 | `MAP_FRAME` | cap_slot, out_ptr | 0 / `u64::MAX` | Mappt den von der `Frame`-Cap in `cap_slot` benannten Speicher in den Aufrufer und schreibt die User-Adresse nach `out_ptr`. Keine Budget-Verrechnung — die empfangende Hälfte von Shared Memory: zwei Prozesse, die dieselbe delegierte Frame-Cap mappen, sehen denselben RAM. |
-| 25 | `SPAWN_ENV` | module, envp, len | pid / `u64::MAX` | Wie `SPAWN`, aber überträgt einen Environment-Block (`envp`, `len` Bytes) an den Kind-Prozess. Der Kind-Prozess ruft `GETENVP` ab, um den Pointer und die Länge abzurufen. Die Env-Daten werden in den Kind-Adressraum an HEAP_START kopiert. |
-| 26 | `GET_STATUS` | pid | status / `u64::MAX` | Fragt den Zustand eines Prozesses ab: `0` = running, `1` = exited, `2` = unknown. Funktioniert für jeden Prozess (kein Capability nötig — nur Status-Abfrage). |
+| 25 | `SPAWN_ENV` | module, envp, len, cap_slot | pid / `u64::MAX` | Wie `SPAWN`, überträgt zusätzlich einen Environment-Block (`envp`, `len` Bytes) an das Kind, das ihn per `GETENVP` abruft. Die Env-Daten werden in den Kind-Adressraum an HEAP_START kopiert. |
+| 26 | `GET_STATUS` | proc_slot | status / `u64::MAX` | Fragt den Zustand des Prozesses ab, den die `Process`-Cap in `proc_slot` benennt: `0` = running, `1` = exited. **Gated:** ohne `Process`-Cap `u64::MAX`. |
 | 27 | `GETENVP` | out_ptr | 0 / `u64::MAX` | Schreibt `[envp, len]` (2×u64) des aktuellen Prozesses nach `out_ptr`. `envp` ist die User-Adresse des Environment-Blocks (bei `SPAWN_ENV` gesetzt, `0` wenn kein Env vorhanden), `len` ist die Größe in Bytes. |
-| 28 | `LOG_READ` | pid, out_ptr, max | bytes / 0 | Liest und konsumiert bis zu `max` Bytes (max. 64 KiB) aus dem Log-Ring-Buffer des Prozesses `pid` nach `out_ptr`. Jeder Prozess kann das Log jedes anderen lesen (kein Capability nötig — Debug-Ausgabe). `0` = nichts gepuffert. |
-| 29 | `KILL` | pid, signal | 0 / `u64::MAX` | Sendet ein Signal an den Prozess `pid`: `15` = SIGTERM (graceful), `9` = SIGKILL (hard). Markiert den Prozess als beendet mit dem entsprechenden Exit-Code. Kein Capability nötig. `u64::MAX` wenn PID unbekannt oder bereits beendet. PID 0 (Root) kann nicht getötet werden. |
-| 30 | `WAIT_PID` | pid | exit_code / `u64::MAX` | Blockiert (mit Yield-Schleife) bis der Prozess `pid` beendet ist, gibt seinen Exit-Code zurück. `u64::MAX` wenn PID unbekannt oder der Aufrufer sich selbst erwartet. |
+| 28 | `LOG_READ` | proc_slot, out_ptr, max | bytes / `u64::MAX` | Liest und konsumiert bis zu `max` Bytes (max. 64 KiB) aus dem Log-Ringpuffer des Prozesses, den die `Process`-Cap in `proc_slot` benennt. **Gated.** |
+| 29 | `KILL` | proc_slot, signal | 0 / `u64::MAX` | Sendet ein Signal an den Prozess, den die `Process`-Cap in `proc_slot` benennt: `15` = SIGTERM, `9` = SIGKILL. Markiert ihn als beendet mit dem entsprechenden Exit-Code. **Gated.** PID 0 (Root) kann nicht getötet werden. |
+| 30 | `WAIT_PID` | proc_slot | exit_code / `u64::MAX` | Blockiert (mit Yield-Schleife) bis der Prozess beendet ist, den die `Process`-Cap in `proc_slot` benennt, und gibt seinen Exit-Code zurück (`256` = vom Kernel nach CPU-Exception getötet). **Gated.** |
+| 31 | `CAP_GRANT` | proc_slot, src_slot, dst_slot | 0 / `u64::MAX` | Kopiert die eigene Capability aus `src_slot` in Slot `dst_slot` der CSpace des Prozesses, den die `Process`-Cap in `proc_slot` benennt. **Gated.** Die Delegation, die *kein* Handshake mit dem Kind braucht: ein frisch gespawntes Programm bekommt damit genau die Autorität, die es braucht — vorher hat es nur das geteilte Endpoint-Paar aus `seed_caps`. |
 
-Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16, 23, 25) prüfen
+Unbekannte Nummern liefern `u64::MAX`. Die **gated** Syscalls (13–16, 23, 26, 28–31) prüfen
 eine Capability des aufrufenden Prozesses und liefern `u64::MAX` ohne Wirkung,
 wenn sie fehlt — es gibt keine ambiente Hardware-Autorität. Mit `CAP_IDENTIFY` kann
 ein Prozess seine eigenen Capabilities aufzählen (nur die eigenen — keine
 globale Sicht).
+
+**Autorität über andere Prozesse.** Ein Prozess kann einen anderen nur anfassen,
+wenn er eine **`Process`-Capability** für ihn hält — `SPAWN`/`SPAWN_ENV` geben sie
+dem Elternprozess zurück. Es gibt keinen Weg, aus einer PID Autorität zu machen:
+`KILL`, `WAIT_PID`, `GET_STATUS`, `LOG_READ` und `CAP_GRANT` nehmen alle einen
+Cap-Slot, keine PID. Wie jede Capability lässt sie sich per `SEND` weiterreichen —
+so bekommt ein Monitoring-Dienst ein Handle, ohne selbst spawnen zu müssen.
 
 **User-Zeiger.** Jeder Zeiger, den ein Syscall entgegennimmt, wird nicht nur
 gegen den User-Adressbereich geprüft, sondern Seite für Seite gegen die

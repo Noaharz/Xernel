@@ -29,8 +29,16 @@ Stand: 2026-08-25. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
   System-Port wie CMOS, das Mappen von echtem RAM und unbegrenzte DMA-Allokation
   werden verweigert). Ein Prozess kann seine **eigene** Capability-Tabelle per
   `CAP_IDENTIFY` aufzählen (keine globale Sicht).
+- **Prozesse sind Capabilities (seit 0.28):** `SPAWN`/`SPAWN_ENV` geben dem
+  Elternprozess eine **`Process`-Capability** für das Kind zurück. `KILL`,
+  `WAIT_PID`, `GET_STATUS`, `LOG_READ` und `CAP_GRANT` nehmen einen Cap-Slot,
+  keine PID — aus einer erratenen Zahl entsteht keine Autorität mehr. Mit
+  `CAP_GRANT` legt ein Elternprozess einem Kind gezielt Rechte in die CSpace,
+  **bevor** es das erste Mal läuft; das ist die Antwort darauf, dass ein frisch
+  gespawntes Programm sonst nur das geteilte Endpoint-Paar besitzt und weder
+  Datei noch Socket öffnen könnte.
 - **User-Space:** Ring-3-Übergang via `syscall`/`sysret`, ELF-Loader (lädt ein
-  Programm als Limine-Modul), 30 Syscalls (siehe [Syscall-ABI](syscalls.md)).
+  Programm als Limine-Modul), 31 Syscalls (siehe [Syscall-ABI](syscalls.md)).
 - **Mehrere Prozesse** mit isolierten Adressräumen (eigene Page-Tables),
   **preemptiv** verzahnt (timer-getrieben) — plus kooperatives `YIELD`.
 - **Echtes Blockieren (Wait-Queues):** ein Prozess, der auf eine Nachricht
@@ -161,6 +169,7 @@ Stand: 2026-08-25. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.25.0 ReadySet | **Ready-Set / WAIT** (Ticket #3, select/epoll-Äquivalent): ein `OP_NET_GET_READY` liefert die Bitmaske der lesbaren Sockets, pro Socket wird ein Bereitschafts-Bit auf der geteilten Notification erheit — **ein `WAIT` meldet, welche von mehreren Verbindungen lesbar sind**; eingehende Frames werden gepuffert statt verworfen, `RECV` bedient zuerst den Puffer |
 | 0.26.0 Deployment | **Deployment-Primitive + Kill/Wait:** SPAWN_ENV (25), GET_STATUS (26), GETENVP (27), LOG_READ (28), KILL (29), WAIT_PID (30) — sechs neue Syscalls für PID-gesteuertes Deployment mit vollem Lebenszyklus-Management |
 | 0.27.0 Fehlerisolation | **Ein Prozess stirbt, der Kernel lebt:** CPU-Exceptions unterscheiden Ring 3 von Ring 0 (`EXIT_FAULT`), User-Zeiger werden gegen die Page-Tables geprüft statt nur gegen einen Bereich; nebenbei repariert: `SPAWN_ENV` schrieb den Env-Block an eine virtuelle Adresse, als wäre sie physisch, und übertrug nie Daten |
+| 0.28.0 ProzessCaps | **Prozesse als Capabilities** (Ticket #7): `SPAWN` gibt eine `Process`-Cap zurück, `KILL`/`WAIT_PID`/`GET_STATUS`/`LOG_READ` sind darauf gegated statt auf eine PID; neu `CAP_GRANT` (31) — ein Elternprozess legt einem Kind Autorität in die CSpace, bevor es läuft |
 
 ## XOS — das erste OS auf Xernel
 
@@ -186,14 +195,13 @@ Aussage in diesem Dokument ausschließlich für x86_64.
   Prozessen läuft seit 0.17
 - XMM-Save im Context-Switch (Adressraum-Trennung selbst läuft seit 0.11)
 - Timer-Frequenz in Hz (LAPIC kalibrieren)
-- `SPAWN` existiert (ein Prozess erzeugt einen anderen); `SPAWN_ENV` überträgt
-  Environment-Variablen, `GET_STATUS` fragt Zustand ab, `KILL` beendet einen
-  Prozess, `WAIT_PID` liefert den Exit-Code. Noch offen: mehrere
-  Programm-Images, Eltern/Kind-Beziehung mit `wait`/Exit-Status aus dem
-  Kind-Syscall (Ticket #7), Capabilities gezielt beim Spawn mitgeben
-- `KILL`, `LOG_READ` und `WAIT_PID` sind **ambiente Autorität**: jeder Prozess
-  darf jeden anderen töten und dessen Log lesen. Eine `Process`-Capability, die
-  `SPAWN` zurückgibt, wäre die saubere Form (schließt Ticket #7 mit)
+- **Nur ein Programm-Image.** `SPAWN` nimmt einen Image-Index entgegen, aber es
+  existiert nur Index 0 (das Boot-Init). Solange das so ist, kann Xernel kein
+  fremdes Programm starten — das ist der größte offene Punkt, alles andere hängt
+  daran. Nötig: mehrere Boot-Module und ein Loader, der einen Index auflöst
+- **Spawn ohne Suspend.** Xernel preemptet, also kann ein Kind laufen, bevor der
+  Elternprozess `CAP_GRANT` aufgerufen hat. Heute wartet das Kind in einer
+  Schleife; ein Spawn-suspended/Resume-Paar wäre die saubere Form
 - Aufräumen nach dem Tod eines Prozesses: Frames, Adressraum und Capability-Space
   eines beendeten Prozesses werden nicht freigegeben (gilt für `exit` wie für
   `EXIT_FAULT`), und wer auf sein IPC-Endpoint wartet, erfährt nichts davon
