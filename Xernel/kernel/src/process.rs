@@ -404,40 +404,38 @@ pub fn spawn_env(_module_index: u64, envp_ptr: u64, envp_len: u64) -> Option<u64
     let pid = s.next_pid;
     let mut p = create(pid, module)?;
 
-    // Copy the environment from the parent's address space into the child's
-    // freshly created heap. We map pages on demand and do a byte-by-byte copy
-    // through the HHDM (both address spaces share kernel memory).
+    // The source is a user pointer in the PARENT's (active) address space, so it
+    // gets the same treatment as any other: in range AND actually mapped.
+    let parent_end = envp_ptr.checked_add(envp_len)?;
+    if parent_end >= USER_ADDR_MAX || !arch::user_range_ok(envp_ptr, envp_len, false) {
+        return None;
+    }
+
+    // Copy the environment into the child's freshly created heap. The child is
+    // not running yet, so its heap address is meaningless as a CPU address here:
+    // each page has to be translated through the CHILD's tables and written
+    // through the HHDM. (Treating the child's virtual address as physical is
+    // what 0.26.0 did — it scribbled over whatever RAM sat at that physical
+    // address and the child read zeros.)
     let env_pages = envp_len.div_ceil(PAGE);
     for i in 0..env_pages {
         let child_va = HEAP_START + i * PAGE;
         if !arch::vspace_alloc_map(p.space, child_va, true, false) {
             return None; // couldn't map child page
         }
-    }
-    // Zero the region first.
-    // SAFETY: we just mapped these pages in the child's address space; they are
-    // accessible from ring 0 through the HHDM.
-    unsafe {
-        core::ptr::write_bytes(
-            (HEAP_START + arch::hhdm_offset()) as *mut u8,
-            0,
-            (env_pages * PAGE) as usize,
-        );
-    }
-    // Copy byte-by-byte from parent to child through the HHDM. The parent's
-    // pages are in the current address space (active CR3).
-    // SAFETY: `envp_ptr` came from userspace; we validate it fits.
-    let parent_end = envp_ptr.checked_add(envp_len)?;
-    if parent_end >= USER_ADDR_MAX {
-        return None;
-    }
-    for offset in 0..envp_len {
-        let byte = unsafe { core::ptr::read_volatile((envp_ptr + offset) as *const u8) };
-        unsafe {
-            core::ptr::write_volatile(
-                (HEAP_START + offset + arch::hhdm_offset()) as *mut u8,
-                byte,
-            );
+        // `vspace_alloc_map` hands back a zeroed frame, so only the bytes we
+        // actually have need copying; the rest of the page stays zero.
+        let dst = arch::vspace_phys(p.space, child_va)? + arch::hhdm_offset();
+        let start = i * PAGE;
+        let n = (envp_len - start).min(PAGE);
+        for off in 0..n {
+            // SAFETY: the source page was verified mapped in the active address
+            // space; the destination is the child's own frame, reached through
+            // the HHDM, which maps all physical memory.
+            unsafe {
+                let byte = core::ptr::read_volatile((envp_ptr + start + off) as *const u8);
+                core::ptr::write_volatile((dst + off) as *mut u8, byte);
+            }
         }
     }
     p.envp_user = HEAP_START;
@@ -546,15 +544,39 @@ pub fn wake(reason: BlockReason) {
     }
 }
 
+/// Exit code recorded for a process the kernel terminated after a fatal
+/// user-mode CPU exception. Outside the range a program can pass to `exit()`,
+/// so `WAIT_PID` can tell "crashed" from "chose to exit with this code".
+pub const EXIT_FAULT: u64 = 0x100;
+
 /// Terminate the current process and run the next. Never returns.
 pub fn exit(code: u64) -> ! {
+    exit_inner(code, None)
+}
+
+/// Terminate the current process because it took a fatal CPU exception **in
+/// ring 3**, and keep the kernel running. This is what makes "a driver crash is
+/// not a kernel panic" true rather than aspirational: the faulting process is
+/// the only casualty, its parent observes [`EXIT_FAULT`] through `WAIT_PID`.
+///
+/// Only ever called for a fault whose saved `CS` says ring 3 — a ring-0 fault
+/// is a kernel bug and must still panic, because the kernel's own invariants
+/// are already broken at that point.
+pub fn fault_exit(what: &str) -> ! {
+    exit_inner(EXIT_FAULT, Some(what))
+}
+
+fn exit_inner(code: u64, fault: Option<&str>) -> ! {
     let next_ksp = {
         let mut guard = SCHED.lock();
         let s = guard.as_mut().expect("no scheduler");
         let pid = s.procs[s.current].pid;
         s.procs[s.current].exit_code = code;
         s.procs[s.current].state = State::Done;
-        println!("[user pid {pid}] exit({code})");
+        match fault {
+            Some(what) => println!("[user pid {pid}] killed by {what}"),
+            None => println!("[user pid {pid}] exit({code})"),
+        }
         pick_next(s).map(|i| activate(s, i))
     };
     if let Some(ksp) = next_ksp {

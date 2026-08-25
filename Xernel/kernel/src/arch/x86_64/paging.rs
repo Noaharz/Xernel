@@ -9,7 +9,7 @@
 
 use spin::Once;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::{MapToError, Translate};
+use x86_64::structures::paging::mapper::{MapToError, Translate, TranslateResult};
 use x86_64::structures::paging::{
     FrameAllocator as X86FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
     PhysFrame, Size4KiB,
@@ -144,6 +144,45 @@ pub fn map_user(
 /// really points at the frame it claims before unmapping it.
 pub fn user_phys(virt: u64) -> Option<u64> {
     mapper().translate_addr(VirtAddr::new(virt)).map(|p| p.as_u64())
+}
+
+/// Whether every 4 KiB page covering `[virt, virt + len)` is present in the
+/// ACTIVE address space AND user-accessible — plus writable when `writable`.
+///
+/// A range check alone ("the pointer is below `USER_ADDR_MAX`") says nothing
+/// about whether a page is actually *there*. Without this, a ring-3 process can
+/// hand the kernel any unmapped lower-half address and the resulting #PF hits
+/// with `CS = ring 0`, which is a kernel fault, not a user fault — the whole
+/// system dies for one bad pointer. Walking the tables up front turns that into
+/// an ordinary error return.
+pub fn user_range_ok(virt: u64, len: u64, writable: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(last) = virt.checked_add(len - 1) else {
+        return false;
+    };
+    let m = mapper();
+    let last_page = last & !0xfff;
+    let mut page = virt & !0xfff;
+    loop {
+        let flags = match m.translate(VirtAddr::new(page)) {
+            TranslateResult::Mapped { flags, .. } => flags,
+            _ => return false,
+        };
+        // USER_ACCESSIBLE also keeps a lower-half kernel page out of reach: the
+        // address passes the range test but is not the caller's to hand us.
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return false;
+        }
+        if writable && !flags.contains(PageTableFlags::WRITABLE) {
+            return false;
+        }
+        if page >= last_page {
+            return true;
+        }
+        page += 4096;
+    }
 }
 
 /// Unmap a single 4 KiB page from the ACTIVE address space and flush the TLB.

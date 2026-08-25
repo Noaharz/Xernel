@@ -12,6 +12,7 @@
 //! through the HHDM, so mapping into a not-yet-active process works.
 
 use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::mapper::Translate;
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
 };
@@ -51,6 +52,17 @@ pub fn new() -> Option<u64> {
 fn mapper(l4_phys: u64) -> OffsetPageTable<'static> {
     // SAFETY: HHDM offset is correct and `l4_phys` points at a valid PML4.
     unsafe { OffsetPageTable::new(table_mut(l4_phys), VirtAddr::new(paging::hhdm_offset())) }
+}
+
+/// Physical address that `virt` maps to in address space `l4_phys` — which need
+/// NOT be the active one. This is how the kernel reaches a *not yet running*
+/// process's memory: translate through its tables, then write through the HHDM.
+/// Using the child's virtual address as if it were physical instead is a silent
+/// corruption of whatever RAM happens to sit at that physical address.
+pub fn phys_of(l4_phys: u64, virt: u64) -> Option<u64> {
+    mapper(l4_phys)
+        .translate_addr(VirtAddr::new(virt))
+        .map(|p| p.as_u64())
 }
 
 /// Map a user page into address space `l4_phys` (not necessarily the active

@@ -160,6 +160,12 @@ pub unsafe fn vspace_switch(space: u64) {
 }
 
 /// Handle of the currently active address space.
+/// Physical address `virt` maps to inside address space `space` (which need not
+/// be active), or `None` if it is unmapped there.
+pub fn vspace_phys(space: u64, virt: u64) -> Option<u64> {
+    vspace::phys_of(space, virt)
+}
+
 pub fn vspace_current() -> u64 {
     vspace::current()
 }
@@ -221,6 +227,13 @@ pub fn map_user(virt: u64, phys: u64, writable: bool, executable: bool) -> bool 
 /// Physical address `virt` maps to in the active address space, or `None`.
 pub fn user_phys(virt: u64) -> Option<u64> {
     paging::user_phys(virt)
+}
+
+/// Whether `[virt, virt + len)` is fully mapped and user-accessible in the
+/// active address space (and writable when `writable`). Used to validate every
+/// user pointer before the kernel dereferences it.
+pub fn user_range_ok(virt: u64, len: u64, writable: bool) -> bool {
+    paging::user_range_ok(virt, len, writable)
 }
 
 /// Unmap one user page from the active address space (TLB flushed). Returns

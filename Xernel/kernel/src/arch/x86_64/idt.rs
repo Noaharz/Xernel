@@ -8,6 +8,7 @@
 //! [`super::apic`]; this module owns only the architectural exception vectors.
 
 use spin::Once;
+use x86_64::PrivilegeLevel;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::registers::control::Cr2;
 
@@ -61,10 +62,42 @@ pub fn init() {
     idt.load();
 }
 
+/// Did the fault happen in user mode? The saved `CS` selector carries the
+/// privilege level of the interrupted code, and that single bit decides
+/// everything below: a ring-3 fault is *one process misbehaving* and must cost
+/// only that process, while a ring-0 fault means the kernel's own invariants
+/// are broken and there is nothing safe left to continue with.
+fn from_user(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == PrivilegeLevel::Ring3
+}
+
+/// Report a fatal exception: kill the process if it faulted in ring 3, panic if
+/// the kernel itself faulted. Never returns to the faulting instruction — a
+/// trap that the handler cannot repair would just fire again on `iretq`.
+fn fatal(frame: &InterruptStackFrame, msg: &str, code: Option<u64>) -> ! {
+    if from_user(frame) {
+        crate::println!(
+            "[xernel] user fault: {} (error code {:#x}) at rip={:#x} rsp={:#x}",
+            msg,
+            code.unwrap_or(0),
+            frame.instruction_pointer,
+            frame.stack_pointer
+        );
+        // Leave the GS pair as the syscall path expects before abandoning
+        // this process (see `syscall::gs_force_kernel`).
+        super::syscall::gs_force_kernel();
+        crate::process::fault_exit(msg);
+    }
+    match code {
+        Some(code) => panic!("CPU exception: {} (error code {:#x})\n{:#?}", msg, code, frame),
+        None => panic!("CPU exception: {}\n{:#?}", msg, frame),
+    }
+}
+
 macro_rules! trap {
     ($name:ident, $msg:literal) => {
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
-            panic!("CPU exception: {}\n{:#?}", $msg, frame);
+            fatal(&frame, $msg, None);
         }
     };
 }
@@ -72,7 +105,7 @@ macro_rules! trap {
 macro_rules! trap_err {
     ($name:ident, $msg:literal) => {
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame, code: u64) {
-            panic!("CPU exception: {} (error code {:#x})\n{:#?}", $msg, code, frame);
+            fatal(&frame, $msg, Some(code));
         }
     };
 }
@@ -103,5 +136,14 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let addr = Cr2::read().map(|a| a.as_u64()).unwrap_or(u64::MAX);
+    if from_user(&frame) {
+        // A ring-3 page fault is a normal, expected event in a system with
+        // address-space isolation: the process touched something that is not
+        // its own. Print the faulting address (that is the useful half of the
+        // report) and let the process die alone.
+        crate::println!("[xernel] user fault: #PF at {addr:#x}, code {code:?}");
+        super::syscall::gs_force_kernel();
+        crate::process::fault_exit("#PF page fault");
+    }
     panic!("CPU exception: #PF page fault at {addr:#x}, code {code:?}\n{frame:#?}");
 }
