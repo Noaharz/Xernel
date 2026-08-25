@@ -38,6 +38,7 @@ const SYS_GETENVP: u64 = 27;
 const SYS_LOG_READ: u64 = 28;
 const SYS_KILL: u64 = 29;
 const SYS_WAIT_PID: u64 = 30;
+const SYS_CAP_GRANT: u64 = 31;
 
 /// Endpoint capability slots (seeded by the kernel): `EP_SLOT` carries requests
 /// from a client to the file-service, `REPLY_EP_SLOT` carries replies back.
@@ -93,6 +94,17 @@ const NET_SOCK_BIT: u64 = 2;
 /// endpoints, 5 the notification — slot 6 is the first free one. Socket `i`
 /// uses slot `SHM_FRAME_SLOT + i`.
 const SHM_FRAME_SLOT: u64 = 6;
+
+/// First CNode slot used for `Process` capabilities handed back by SPAWN.
+/// Slots 6..9 hold the per-socket frame caps, so process handles start at 10.
+const PROC_SLOT_BASE: u64 = 10;
+
+/// Slot in a granted child where the parent parks a delegated `Frame` cap.
+const GRANTED_FRAME_SLOT: u64 = 6;
+/// Root's slot for the `Process` cap of the cap-grant demo child.
+const GRANT_PROC_SLOT: u64 = PROC_SLOT_BASE + 1;
+/// Root's slot holding the `Frame` cap it delegates to that child.
+const GRANT_SRC_SLOT: u64 = PROC_SLOT_BASE + 2;
 
 const STDOUT: u64 = 1;
 
@@ -1239,6 +1251,8 @@ fn net_resolve(n: &mut Net, ip: [u8; 4]) -> Option<[u8; 6]> {
 
 /// Send an ICMP echo request to `dst_ip` (reachable at `dst_mac`) and wait for
 /// the echo reply — a real ping, all in Ring 3. Returns true on a valid reply.
+#[allow(dead_code)] // Referenz-Implementierung: der Service-Host geht heute
+// ueber IPC, dieser direkte Pfad bleibt als Vorlage fuer neue Netz-Clients.
 fn net_ping(n: &mut Net, dst_mac: [u8; 6], dst_ip: [u8; 4]) -> bool {
     const PAYLOAD: usize = 32;
     let icmp_len = 8 + PAYLOAD;
@@ -1449,6 +1463,8 @@ fn net_connect(n: &mut Net, tcp: &mut TcpState) -> bool {
 /// Open a TCP connection to `dip` (reachable at `dmac`), send a line, and verify
 /// the echo server sends it back — a real three-way handshake, data stream and
 /// close, all in Ring 3. Returns true if the echo matched.
+#[allow(dead_code)] // Referenz-Implementierung: der Service-Host geht heute
+// ueber IPC, dieser direkte Pfad bleibt als Vorlage fuer neue Netz-Clients.
 fn net_tcp_echo(n: &mut Net, dmac: [u8; 6], dip: [u8; 4]) -> bool {
     let (sport, dport) = (49152u16, 9u16);
     let isn = 0x0000_1000u32;
@@ -1592,6 +1608,8 @@ fn net_dhcp(n: &mut Net) -> Option<[u8; 4]> {
 /// Networking demo: get an IP via DHCP (UDP), resolve the gateway's MAC via ARP,
 /// then ping it. Proof that a user-space driver speaks Ethernet, ARP, IPv4, UDP
 /// and ICMP with the outside.
+#[allow(dead_code)] // Referenz-Implementierung: der Service-Host geht heute
+// ueber IPC, dieser direkte Pfad bleibt als Vorlage fuer neue Netz-Clients.
 fn net_demo(n: &mut Net) {
     match net_dhcp(n) {
         Some(ip) => {
@@ -1842,24 +1860,34 @@ fn ipc_recv(ep_slot: u64, out: *mut u64, dst_slot: u64) -> u64 {
     syscall3(SYS_RECV, ep_slot, out as u64, dst_slot)
 }
 
-/// Spawn a new process from program image `module` (0 = the init image). Returns
-/// the new PID, or `u64::MAX` on failure. The kernel boots only the root; the
-/// root creates every other process itself through this call.
-fn spawn(module: u64) -> u64 {
-    syscall3(SYS_SPAWN, module, 0, 0)
+/// Spawn a new process from program image `module` (0 = the init image) and
+/// receive a `Process` capability for it in `cap_slot` — that handle is the ONLY
+/// way to touch the child afterwards. Pass `u64::MAX` to spawn without one.
+/// Returns the new PID, or `u64::MAX` on failure.
+fn spawn(module: u64, cap_slot: u64) -> u64 {
+    syscall3(SYS_SPAWN, module, cap_slot, 0)
 }
 
 /// Spawn a new process with environment variables. `envp` is a pointer to a
-/// sequence of null-terminated strings terminated by a final null byte.
+/// sequence of null-terminated strings terminated by a final null byte; the
+/// child's `Process` capability lands in `cap_slot`.
 /// Returns the new PID, or `u64::MAX` on failure.
-fn spawn_env(module: u64, envp: *const u8, envp_len: u64) -> u64 {
-    syscall3(SYS_SPAWN_ENV, module, envp as u64, envp_len)
+fn spawn_env(module: u64, envp: *const u8, envp_len: u64, cap_slot: u64) -> u64 {
+    syscall4(SYS_SPAWN_ENV, module, envp as u64, envp_len, cap_slot)
 }
 
-/// Query the state of process `pid`. Returns:
-///   0 = running, 1 = exited, 2 = unknown.
-fn get_status(pid: u64) -> u64 {
-    syscall3(SYS_GET_STATUS, pid, 0, 0)
+/// Copy our own capability in `src_slot` into slot `dst_slot` of the process
+/// named by the `Process` cap in `proc_slot`. This is how a parent equips a
+/// child with authority — it works before the child has ever run, so a program
+/// can start with exactly the rights it needs and nothing more.
+fn cap_grant(proc_slot: u64, src_slot: u64, dst_slot: u64) -> u64 {
+    syscall3(SYS_CAP_GRANT, proc_slot, src_slot, dst_slot)
+}
+
+/// Query the state of the process named by the `Process` cap in `proc_slot`.
+/// Returns 0 = running, 1 = exited, `u64::MAX` = no such capability.
+fn get_status(proc_slot: u64) -> u64 {
+    syscall3(SYS_GET_STATUS, proc_slot, 0, 0)
 }
 
 /// Retrieve the environment pointer and length for the current process.
@@ -1868,22 +1896,22 @@ fn getenvp(out: &mut [u64; 2]) -> u64 {
     syscall3(SYS_GETENVP, out.as_mut_ptr() as u64, 0, 0)
 }
 
-/// Read and drain up to `max` bytes from `target_pid`'s log ring buffer into
-/// `out`. Returns the number of bytes copied (0 = nothing buffered).
-fn log_read(target_pid: u64, out: &mut [u8], max: u64) -> u64 {
-    syscall3(SYS_LOG_READ, target_pid, out.as_mut_ptr() as u64, max)
+/// Read and drain up to `max` bytes from the log ring buffer of the process
+/// named by the `Process` cap in `proc_slot`. Returns bytes copied.
+fn log_read(proc_slot: u64, out: &mut [u8], max: u64) -> u64 {
+    syscall3(SYS_LOG_READ, proc_slot, out.as_mut_ptr() as u64, max)
 }
 
-/// Send a signal to a process. signal=15 (SIGTERM), signal=9 (SIGKILL).
-/// Returns 0 on success, u64::MAX on error.
-fn kill(target_pid: u64, signal: u64) -> u64 {
-    syscall3(SYS_KILL, target_pid, signal, 0)
+/// Signal the process named by the `Process` cap in `proc_slot`. signal=15
+/// (SIGTERM), signal=9 (SIGKILL). Returns 0 on success, u64::MAX on error.
+fn kill(proc_slot: u64, signal: u64) -> u64 {
+    syscall3(SYS_KILL, proc_slot, signal, 0)
 }
 
-/// Block until `target_pid` has exited, then return its exit code.
-/// Returns u64::MAX on error.
-fn wait_pid(target_pid: u64) -> u64 {
-    syscall3(SYS_WAIT_PID, target_pid, 0, 0)
+/// Block until the process named by the `Process` cap in `proc_slot` has
+/// exited, then return its exit code. Returns u64::MAX on error.
+fn wait_pid(proc_slot: u64) -> u64 {
+    syscall3(SYS_WAIT_PID, proc_slot, 0, 0)
 }
 
 /// Client helper: send one request to the file-service and block for its
@@ -1936,6 +1964,48 @@ fn env_has(needle: &[u8]) -> bool {
     false
 }
 
+/// A child that starts with nothing and is handed authority by its parent: it
+/// waits for a `Frame` capability to appear in its CSpace, maps it and reads
+/// what the parent left there. `seed_caps` gives a newcomer only the shared
+/// endpoint pair — everything beyond that has to be delegated on purpose, and
+/// `CAP_GRANT` is the delegation that needs no handshake with the child.
+///
+/// The retry loop is not decoration: Xernel preempts, so a freshly spawned
+/// child can run before its parent gets to `cap_grant`. A spawn-suspended /
+/// resume pair would remove the race; until then, waiting is the honest form.
+/// Never returns.
+fn granted_child() -> ! {
+    print("[Grant-Kind] warte auf delegierte Frame-Cap in Slot ");
+    print_u64(GRANTED_FRAME_SLOT);
+    print("\n");
+    let mut va = 0u64;
+    let mut mapped = false;
+    for _ in 0..200 {
+        if map_frame(GRANTED_FRAME_SLOT, &mut va) == 0 {
+            mapped = true;
+            break;
+        }
+        syscall3(SYS_YIELD, 0, 0, 0);
+    }
+    if !mapped {
+        print("[Grant-Kind] keine Frame-Cap erhalten — ohne Delegation kein Zugriff\n");
+        exit(1);
+    }
+    print("[Grant-Kind] Frame gemappt ab 0x");
+    print_hex(va, 8);
+    print(", Inhalt: \"");
+    let base = va as *const u8;
+    for i in 0..96 {
+        let c = unsafe { core::ptr::read_volatile(base.add(i)) };
+        if c == 0 {
+            break;
+        }
+        write(&[c]);
+    }
+    print("\"\n");
+    exit(0);
+}
+
 /// A process that deliberately dereferences an unmapped address. The kernel has
 /// to kill exactly this process (#PF from ring 3) and keep every other process
 /// running — that is what address-space isolation is *for*, and it is only a
@@ -1963,6 +2033,9 @@ fn combined_client() -> ! {
     // child's job through the environment block.
     if env_has(b"XERNEL_ROLE=crash") {
         crash_child();
+    }
+    if env_has(b"XERNEL_ROLE=granted") {
+        granted_child();
     }
 
     // Prove we have no device authority.
@@ -2054,7 +2127,6 @@ fn combined_client() -> ! {
     // Build an environment block: two null-terminated strings + trailing null.
     let env1 = b"XERNEL_DATA_DIR=/data\0";
     let env2 = b"RUST_LOG=info\0";
-    let env_total_len = (env1.len() + env2.len() + 1) as u64;
     // We need the env data in OUR address space to pass it to spawn_env.
     // Use a stack buffer and copy.
     let mut env_buf = [0u8; 128];
@@ -2069,7 +2141,8 @@ fn combined_client() -> ! {
     }
     env_buf[off] = 0; // trailing null
     off += 1;
-    let child_pid = spawn_env(0, env_buf.as_ptr(), off as u64);
+    let child_slot = PROC_SLOT_BASE;
+    let child_pid = spawn_env(0, env_buf.as_ptr(), off as u64, child_slot);
     if child_pid == u64::MAX {
         print("   spawn_env: FEHLER\n");
     } else {
@@ -2077,9 +2150,9 @@ fn combined_client() -> ! {
         print_u64(child_pid);
         print(" erzeugt\n");
         // Check status of the child — it should be running (0).
-        let st = get_status(child_pid);
-        print("   get_status(pid ");
-        print_u64(child_pid);
+        let st = get_status(child_slot);
+        print("   get_status(Cap-Slot ");
+        print_u64(child_slot);
         print(") = ");
         print_u64(st);
         if st == 0 {
@@ -2087,14 +2160,15 @@ fn combined_client() -> ! {
         } else {
             print(" (unexpected)\n");
         }
-        // Check status of a non-existent PID.
-        let st_bad = get_status(99999);
-        print("   get_status(99999) = ");
-        print_u64(st_bad);
-        if st_bad == 2 {
-            print(" (unknown — korrekt)\n");
+        // Ohne Process-Cap gibt es keine Autoritaet ueber einen Prozess — auch
+        // nicht die, seinen Zustand zu erfragen. Ein leerer Slot wird abgewiesen.
+        let st_bad = get_status(PROC_SLOT_BASE + 9);
+        print("   get_status(leerer Slot) = ");
+        if st_bad == u64::MAX {
+            print("Fehler (korrekt — keine Process-Cap)\n");
         } else {
-            print(" (unexpected)\n");
+            print_u64(st_bad);
+            print(" (?! haette abgewiesen werden muessen)\n");
         }
         // Log-Streaming: the child writes via SYS_WRITE (captured in ring buffer),
         // we read it here via SYS_LOG_READ. Give the child a moment to produce
@@ -2105,7 +2179,7 @@ fn combined_client() -> ! {
             syscall3(SYS_YIELD, 0, 0, 0);
         }
         let mut log_buf = [0u8; 512];
-        let n = log_read(child_pid, &mut log_buf, 512);
+        let n = log_read(child_slot, &mut log_buf, 512);
         if n > 0 {
             print("   log_read(pid ");
             print_u64(child_pid);
@@ -2134,7 +2208,8 @@ fn combined_client() -> ! {
 
         // Kill + Wait_PID Demo — spawn a short-lived child, kill it, verify exit code.
         print("[Client] Kill + Wait_PID Demo\n");
-        let kill_child = spawn(0);
+        let kill_slot = PROC_SLOT_BASE + 1;
+        let kill_child = spawn(0, kill_slot);
         if kill_child == u64::MAX {
             print("   spawn für Kill-Test: FEHLER\n");
         } else {
@@ -2145,7 +2220,7 @@ fn combined_client() -> ! {
             syscall3(SYS_YIELD, 0, 0, 0);
             syscall3(SYS_YIELD, 0, 0, 0);
             // Kill it with SIGTERM (15).
-            let kr = kill(kill_child, 15);
+            let kr = kill(kill_slot, 15);
             print("   kill(pid=");
             print_u64(kill_child);
             print(", SIGTERM) = ");
@@ -2156,7 +2231,7 @@ fn combined_client() -> ! {
                 print(" (fehlgeschlagen)\n");
             }
             // Reap: wait_pid returns the exit code.
-            let ec = wait_pid(kill_child);
+            let ec = wait_pid(kill_slot);
             print("   wait_pid(pid=");
             print_u64(kill_child);
             print(") = ");
@@ -2167,7 +2242,7 @@ fn combined_client() -> ! {
                 print(" (unerwartet)\n");
             }
             // Verify: status should now be "exited" (1).
-            let st = get_status(kill_child);
+            let st = get_status(kill_slot);
             print("   get_status(nach Kill) = ");
             print_u64(st);
             if st == 1 {
@@ -2180,7 +2255,8 @@ fn combined_client() -> ! {
         // Fault-Isolation-Demo — ein Kind stuerzt ab, der Rest laeuft weiter.
         print("[Client] Fault-Isolation-Demo: Kind faellt auf ungemappte Adresse\n");
         let crash_env = b"XERNEL_ROLE=crash\0\0";
-        let crash_pid = spawn_env(0, crash_env.as_ptr(), crash_env.len() as u64);
+        let crash_slot = PROC_SLOT_BASE + 2;
+        let crash_pid = spawn_env(0, crash_env.as_ptr(), crash_env.len() as u64, crash_slot);
         if crash_pid == u64::MAX {
             print("   spawn_env fuer Crash-Test: FEHLER\n");
         } else {
@@ -2189,7 +2265,7 @@ fn combined_client() -> ! {
             print(" erzeugt\n");
             // wait_pid parks us until the child is gone — either it faulted and
             // the kernel reaped it, or nothing works and we never get here.
-            let ec = wait_pid(crash_pid);
+            let ec = wait_pid(crash_slot);
             print("   wait_pid(pid=");
             print_u64(crash_pid);
             print(") = ");
@@ -2402,6 +2478,8 @@ fn getpid() -> u64 {
     syscall3(SYS_GETPID, 0, 0, 0)
 }
 
+#[allow(dead_code)] // Wrapper der Vollstaendigkeit halber; die Demos rufen
+// SYS_YIELD direkt auf.
 fn yield_now() {
     syscall3(SYS_YIELD, 0, 0, 0);
 }
@@ -2487,7 +2565,7 @@ pub extern "C" fn _start() -> ! {
     // Become the combined service host.
     if let (Some(mut blk), Some(mut net)) = (service_blk, service_net) {
         if fs_setup(&mut blk) {
-            let client = spawn(0);
+            let client = spawn(0, PROC_SLOT_BASE);
             if client == u64::MAX {
                 print(" spawn: FEHLER\n");
             } else {
@@ -2495,6 +2573,49 @@ pub extern "C" fn _start() -> ! {
                 print_u64(client);
                 print("\n");
             }
+            // Cap-Grant-Demo — ein Kind bekommt Autoritaet, die seed_caps ihm
+            // nicht gibt. Das ist die Antwort auf "ein gespawntes Programm
+            // startet ohne Rechte": der Elternprozess legt sie ihm hinein.
+            print(" Cap-Grant-Demo: Frame-Cap an ein frisches Kind delegieren\n");
+            let mut grant_va = 0u64;
+            if frame_alloc(1, GRANT_SRC_SLOT, &mut grant_va) == 0 {
+                let msg = b"vom Elternprozess delegiert, nicht selbst beschafft";
+                for (i, &b) in msg.iter().enumerate() {
+                    // SAFETY: frame_alloc mapped a full page at grant_va.
+                    unsafe { core::ptr::write_volatile((grant_va as *mut u8).add(i), b) };
+                }
+                // SAFETY: same page, one byte past the message.
+                unsafe { core::ptr::write_volatile((grant_va as *mut u8).add(msg.len()), 0u8) };
+
+                let genv = b"XERNEL_ROLE=granted\0\0";
+                let gpid = spawn_env(0, genv.as_ptr(), genv.len() as u64, GRANT_PROC_SLOT);
+                if gpid == u64::MAX {
+                    print("   spawn_env fuer Grant-Test: FEHLER\n");
+                } else {
+                    let r = cap_grant(GRANT_PROC_SLOT, GRANT_SRC_SLOT, GRANTED_FRAME_SLOT);
+                    print("   cap_grant(Frame -> pid ");
+                    print_u64(gpid);
+                    print(", Slot ");
+                    print_u64(GRANTED_FRAME_SLOT);
+                    print(") = ");
+                    if r == 0 {
+                        print("ok\n");
+                    } else {
+                        print("FEHLER\n");
+                    }
+                    let ec = wait_pid(GRANT_PROC_SLOT);
+                    print("   Grant-Kind beendet, Exit-Code ");
+                    print_u64(ec);
+                    if ec == 0 {
+                        print(" (hat die delegierte Cap benutzt)\n");
+                    } else {
+                        print(" (unerwartet)\n");
+                    }
+                }
+            } else {
+                print("   frame_alloc fuer Grant-Test: FEHLER\n");
+            }
+
             // Signal readiness for both services.
             notify(NOTIF_SLOT, READY_BIT | NET_READY_BIT);
             print(" Service-Host: Bereitschaft signalisiert (notify)\n");

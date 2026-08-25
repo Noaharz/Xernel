@@ -145,11 +145,9 @@ pub unsafe fn enter_user(entry: u64, user_stack_top: u64) -> ! {
 /// address 0x8 — in ring 0, taking the whole kernel down. This is the same
 /// imbalance [`enter_user`] documents, reached from the other side.
 pub fn gs_force_kernel() {
-    // SAFETY: writing the GS-base MSRs is always safe; both get known values.
-    unsafe {
-        GsBase::write(VirtAddr::new(core::ptr::addr_of!(PERCPU) as u64));
-        KernelGsBase::write(VirtAddr::new(0));
-    }
+    // Both writes get known values; `enter_user` sets the mirror image of this.
+    GsBase::write(VirtAddr::new(core::ptr::addr_of!(PERCPU) as u64));
+    KernelGsBase::write(VirtAddr::new(0));
 }
 
 /// Assembly entry point installed in LSTAR. Switches to the kernel stack, saves
