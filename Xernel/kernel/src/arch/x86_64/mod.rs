@@ -91,15 +91,55 @@ pub fn paging_selftest() -> bool {
     paging::selftest()
 }
 
-/// Bytes of the `init` boot module (the first user program), if Limine loaded
-/// one. Picks the module whose path ends in `init.elf`, else the first module.
+/// Last path component of a boot module — the name userland knows it by.
+fn basename(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => path,
+    }
+}
+
+/// The boot modules in a **stable, defined order**, so an image index means the
+/// same program on every boot.
+///
+/// Limine hands them over in config order, but nothing in the protocol promises
+/// that, and the ISO builder is free to reorder `MODULE_PATH` lines. So the
+/// order is imposed here instead of inherited: `init.elf` is always index 0
+/// (the kernel boots it before any userland exists to ask), everything else
+/// follows sorted by name. Adding a module therefore never renumbers the ones
+/// already there — unless its name sorts in between, which is why userland
+/// should resolve names via `SYS_IMAGE_NAME` rather than hard-code indices.
+fn ordered() -> alloc::vec::Vec<&'static limine::file::File> {
+    let Some(response) = MODULES.response() else {
+        return alloc::vec::Vec::new();
+    };
+    let mut v: alloc::vec::Vec<&'static limine::file::File> = response.modules().iter().copied().collect();
+    v.sort_unstable_by_key(|f| {
+        let name = basename(f.path());
+        (name != "init.elf", name)
+    });
+    v
+}
+
+/// How many program images the bootloader handed us.
+pub fn module_count() -> usize {
+    ordered().len()
+}
+
+/// Bytes of the boot module at `index` in the stable order, if it exists.
+pub fn module_by_index(index: usize) -> Option<&'static [u8]> {
+    ordered().get(index).map(|f| f.data())
+}
+
+/// Name (last path component) of the boot module at `index`.
+pub fn module_name(index: usize) -> Option<&'static str> {
+    ordered().get(index).map(|f| basename(f.path()))
+}
+
+/// Bytes of the `init` boot module — image index 0, the program the kernel
+/// starts before any userland exists to choose one.
 pub fn init_module() -> Option<&'static [u8]> {
-    let modules = MODULES.response()?.modules();
-    let chosen = modules
-        .iter()
-        .find(|f| f.path().ends_with("init.elf"))
-        .or_else(|| modules.first())?;
-    Some(chosen.data())
+    module_by_index(0)
 }
 
 /// Bring up the interrupt controller and unmask interrupts. Must run *after*

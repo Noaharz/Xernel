@@ -1,0 +1,63 @@
+==========XERNEL=========
+0.29.0 — MULTI-IMAGE-LOADER
+==========XERNEL=========
+
+Zeitraum:   2026-11-08
+Ergebnis:   Der Kernel kann jetzt mehrere Boot-Module unterscheiden und einen
+            stabilen Index für jedes Programm definieren. init.elf ist immer
+            Index 0, andere Programme folgen sortiert nach Name. SPAWN kann
+            gezielt ein Programm auswählen statt immer init.elf zu laden.
+
+--- WARUM DIESES PRIMITIV ---
+Ticket #5 (Server-Crates füllen) braucht mehrere Program-Images: die Server-
+Crates (vfs, netstack, ...) sollen eigene ELF-Images sein, die der Root über
+SPAWN startet. Bis heute ignorierte SPAWN den module_index-Parameter und lud
+immer nur das Boot-Init (Index 0). Damit mehrere Images zuverlässig geladen
+werden können, muss die Reihenfolge stabil sein (kein Zufall aus Limine) und
+die HAL muss count() und lookup() nach Index anbieten.
+
+--- DER MECHANISMUS ---
+arch/x86_64/mod.rs:
+- Neue Funktion ordered() sortiert alle Limine-Module: init.elf immer zuerst,
+  der Rest nach Name (basename). Das garantiert, dass ein Index immer dasselbe
+  Programm bedeutet, unabhängig von der Reihenfolge im Config.
+- module_count() liefert die Anzahl der Module.
+- module_by_index(index) liefert die Bytes des Moduls am Index.
+- module_name(index) liefert den Namen (basename) des Moduls.
+- init_module() ist jetzt nur noch ein Wrapper um module_by_index(0).
+
+arch/aarch64/mod.rs, arch/riscv64/mod.rs:
+- Stubs für module_count(), module_by_index(), module_name() (geben 0/None zurück).
+
+arch/mod.rs:
+- Exportiert die neuen Funktionen für alle Architekturen.
+
+process.rs:
+- spawn() nutzt jetzt arch::module_by_index(module_index) statt arch::init_module().
+- spawn_env() dasselbe.
+- Debug-Output beim Boot listet alle geladenen Module mit Index, Name und Größe.
+
+--- DER BEWEIS (cargo xtask run --test) ---
+[xernel] hello, xernel — arch=x86_64, build=release
+[xernel] init module: 296968 bytes
+[xernel] image 0: init.elf (296968 bytes)
+xtask: boot-test PASSED
+
+(Der Test läuft durch, weil immer noch nur ein Modul geladen wird — die
+Erweiterung ist rückwärtskompatibel.)
+
+--- GRENZEN ---
+- Die Sortierung nach Name ist ein pragmatischer Kompromiss: ein neuer Modul-
+  Name, der alphabetisch dazwischenfällt, verschiebt alle nachfolgenden Indizes.
+  Userland sollte daher über einen noch zu implementierenden SYS_IMAGE_NAME-
+  Syscall Namen auflösen statt Indizes hart zu kodieren.
+- Es gibt noch kein SYS_IMAGE_NAME-Syscall, also kann Userland heute noch keine
+  Namen auflösen — das ist der nächste Schritt, sobald ein zweites ELF-Image
+  im Build-System existiert.
+
+--- BETEILIGTE DATEIEN ---
+kernel/src/arch/x86_64/mod.rs  -> sortierte ordered(), count/lookup/name-Funktionen
+kernel/src/arch/aarch64/mod.rs  -> Stubs für count/lookup/name
+kernel/src/arch/riscv64/mod.rs  -> Stubs für count/lookup/name
+kernel/src/arch/mod.rs          -> Export der neuen Funktionen
+kernel/src/process.rs           -> spawn/spawn_env nutzen module_index, Debug-Output

@@ -170,6 +170,7 @@ Stand: 2026-08-25. Alles Folgende ist in QEMU verifiziert (`cargo xtask run --te
 | 0.26.0 Deployment | **Deployment-Primitive + Kill/Wait:** SPAWN_ENV (25), GET_STATUS (26), GETENVP (27), LOG_READ (28), KILL (29), WAIT_PID (30) — sechs neue Syscalls für PID-gesteuertes Deployment mit vollem Lebenszyklus-Management |
 | 0.27.0 Fehlerisolation | **Ein Prozess stirbt, der Kernel lebt:** CPU-Exceptions unterscheiden Ring 3 von Ring 0 (`EXIT_FAULT`), User-Zeiger werden gegen die Page-Tables geprüft statt nur gegen einen Bereich; nebenbei repariert: `SPAWN_ENV` schrieb den Env-Block an eine virtuelle Adresse, als wäre sie physisch, und übertrug nie Daten |
 | 0.28.0 ProzessCaps | **Prozesse als Capabilities** (Ticket #7): `SPAWN` gibt eine `Process`-Cap zurück, `KILL`/`WAIT_PID`/`GET_STATUS`/`LOG_READ` sind darauf gegated statt auf eine PID; neu `CAP_GRANT` (31) — ein Elternprozess legt einem Kind Autorität in die CSpace, bevor es läuft |
+| 0.29.0 MultiImage | **Multi-Image-Loader** (Ticket #5): die HAL liefert `module_count()`, `module_by_index()`, `module_name()` mit stabil sortierter Reihenfolge (init.elf ist immer Index 0); `SPAWN` nutzt den `module_index` statt immer init.elf zu laden — Fundament für mehrere Program-Images |
 
 ## XOS — das erste OS auf Xernel
 

@@ -367,6 +367,14 @@ pub fn run() -> ! {
     arch::init_syscalls();
     let module = arch::init_module().expect("init boot module missing");
     println!("[xernel] init module: {} bytes", module.len());
+    for i in 0..arch::module_count() {
+        println!(
+            "[xernel] image {}: {} ({} bytes)",
+            i,
+            arch::module_name(i).unwrap_or("?"),
+            arch::module_by_index(i).map(|m| m.len()).unwrap_or(0)
+        );
+    }
 
     let mut procs = Vec::new();
     for pid in 0..NUM_PROCESSES {
@@ -401,12 +409,15 @@ pub fn run() -> ! {
 /// (`seed_caps`); it is picked up by the round-robin scheduler the next time the
 /// caller yields, blocks, or exits.
 ///
-/// `_module_index` selects which program to launch. Today only the boot init
-/// image (index 0) exists, so any value loads it — but the parameter is already
-/// part of the ABI so a future root-server can resolve a name to one of several
-/// programs. Returns `None` if the image is missing or process creation fails.
-pub fn spawn(_module_index: u64, cap_slot: u64) -> Option<u64> {
-    let module = arch::init_module()?;
+/// `module_index` selects which program to launch: an index into the boot
+/// modules in the stable order the HAL defines (`arch::module_by_index`), where
+/// 0 is always the boot init image. An index nobody loaded is a failure, not a
+/// silent fallback to init — a caller that asks for a program Xernel does not
+/// have must find that out, not get a different program.
+///
+/// Returns `None` if the image is missing or process creation fails.
+pub fn spawn(module_index: u64, cap_slot: u64) -> Option<u64> {
+    let module = arch::module_by_index(module_index as usize)?;
     let mut guard = SCHED.lock();
     let s = guard.as_mut()?;
     let pid = s.next_pid;
@@ -438,11 +449,11 @@ fn install_process_cap(s: &mut Scheduler, pid: u64, cap_slot: u64) -> Option<()>
 /// **caller's** (parent's) address space; the data is copied page-by-page into
 /// the child's heap at `HEAP_START`. The child can later retrieve the pointer
 /// via `SYS_GETENVP`. Returns the new PID, or `u64::MAX` on failure.
-pub fn spawn_env(_module_index: u64, envp_ptr: u64, envp_len: u64, cap_slot: u64) -> Option<u64> {
+pub fn spawn_env(module_index: u64, envp_ptr: u64, envp_len: u64, cap_slot: u64) -> Option<u64> {
     if envp_len == 0 || envp_ptr == 0 {
-        return spawn(_module_index, cap_slot);
+        return spawn(module_index, cap_slot);
     }
-    let module = arch::init_module()?;
+    let module = arch::module_by_index(module_index as usize)?;
     let mut guard = SCHED.lock();
     let s = guard.as_mut()?;
     let pid = s.next_pid;
