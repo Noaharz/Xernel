@@ -33,6 +33,18 @@ pub fn init_module() -> Option<&'static [u8]> {
     None
 }
 
+pub fn module_count() -> usize {
+    0
+}
+
+pub fn module_by_index(_index: usize) -> Option<&'static [u8]> {
+    None
+}
+
+pub fn module_name(_index: usize) -> Option<&'static str> {
+    None
+}
+
 pub fn keyboard_read(_buf: &mut [u8]) -> usize {
     0
 }
